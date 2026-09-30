@@ -77,13 +77,11 @@ crontab -l >"$CRONTAB_REAL_ANTES" 2>/dev/null || : >"$CRONTAB_REAL_ANTES"
 
 # dublar_uname_amd64 <diretório bin do sandbox>
 #
-# O `_common.sh` recusa, logo que é carregado, todo install.sh/update.sh que não
-# roda em amd64 — a imagem publicada é só linux/amd64. Os cenários que executam
-# esses scripts de verdade medem o INSTALADOR, não o processador de quem roda a
-# suíte: sem este dublê, num Mac Apple Silicon (`arm64`) todos eles paravam na
-# guarda (medido: 22 asserções vermelhas, a maioria "inconclusivo"). A recusa de
-# ARM tem prova própria em tests/shell/arquitetura-kit.test.sh. Só `uname -m` é
-# dublado; qualquer outro uso vai ao `uname` real.
+# Os cenários abaixo medem o instalador, não o processador de quem roda a
+# suíte. Fixamos o ambiente em x86_64 para que os fixtures e valores de imagem
+# desses casos permaneçam determinísticos; a aceitação de ARM64 tem prova
+# própria em tests/shell/arquitetura-kit.test.sh. Só `uname -m` é dublado;
+# qualquer outro uso vai ao `uname` real.
 UNAME_REAL="$(command -v uname)"
 dublar_uname_amd64() {
   cat > "$1/uname" <<STUB
@@ -428,7 +426,7 @@ TMP3="$(mktemp -d)"
 (
   MARCA="$TMP3/executou"
   mkdir -p "$TMP3/bin" "$TMP3/proj"
-  cp install.sh _common.sh "$TMP3/"
+  cp install.sh _common.sh _i18n.sh "$TMP3/"
   : > "$TMP3/proj/docker-compose.prod.yml"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$TMP3/bin/docker"; chmod +x "$TMP3/bin/docker"
   dublar_uname_amd64 "$TMP3/bin"
@@ -568,6 +566,10 @@ sim_ok "sim por extenso"         sim "sim"
 sim_ok "SIM em caixa alta"       sim "SIM"
 sim_ok "y (teclado em inglês)"   sim "y"
 sim_ok "yes"                     sim "yes"
+sim_ok "si (español)"            sim "si"
+sim_ok "sí com acento"           sim "sí"
+sim_ok "Sí maiúsculo"            sim "Sí"
+sim_ok "SÍ em caixa alta"        sim "SÍ"
 sim_ok "espaço em volta"         sim "  s  "
 sim_ok "Enter (vazio) é não"     nao ""
 sim_ok "n"                       nao "n"
@@ -593,6 +595,7 @@ gemea_ok() {  # gemea_ok <arquivo> <entrada> <sim|nao>
 for arquivo in install.sh _common.sh; do
   gemea_ok "$arquivo" "S"      sim
   gemea_ok "$arquivo" "sim"    sim
+  gemea_ok "$arquivo" "sí"     sim
   gemea_ok "$arquivo" "nao"    nao
   gemea_ok "$arquivo" ""       nao
 done
@@ -1721,7 +1724,7 @@ montar_vps() {
   # topo, igual ao `_common.sh`. Sem eles aqui, o script morre na LINHA 21 — antes
   # de qualquer mensagem — e todo cenario reporta "o update.sh nao chegou ao
   # banco / ao fim / ao up -d", que le como defeito do produto e e cenario faltando.
-  cp install.sh update.sh backup.sh _common.sh marca-emails.sh manutencao.sh "$raiz/"
+  cp install.sh update.sh backup.sh _common.sh _i18n.sh marca-emails.sh manutencao.sh "$raiz/"
   cp -R manutencao "$raiz/"
   : > "$VPS_PROJ/docker-compose.prod.yml"
   cat > "$raiz/bin/docker"
@@ -3399,7 +3402,7 @@ TMP_SITEURL="$(mktemp -d)"
   mkdir -p "$TMP_SITEURL/../supabase/templates" 2>/dev/null
   # Os modelos moram em ../supabase/templates relativo ao script.
   mkdir -p "$TMP_SITEURL/kit" "$TMP_SITEURL/supabase/templates"
-  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$TMP_SITEURL/kit/"
+  cp "$KIT_AQUI/marca-emails.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_i18n.sh" "$TMP_SITEURL/kit/"
   cp "$KIT_AQUI/../supabase/templates/confirmation.html" \
      "$KIT_AQUI/../supabase/templates/recovery.html" "$TMP_SITEURL/supabase/templates/" || exit 1
 
@@ -3488,7 +3491,7 @@ TMP_RASCUNHO="$(mktemp -d)"
 (
   KIT_AQUI="$PWD"
   cd "$TMP_RASCUNHO" || exit 1
-  cp "$KIT_AQUI/install.sh" "$KIT_AQUI/_common.sh" . || exit 1
+  cp "$KIT_AQUI/install.sh" "$KIT_AQUI/_common.sh" "$KIT_AQUI/_i18n.sh" . || exit 1
   INSTALL_SH_LIB=1 . ./install.sh >/dev/null 2>&1
   set +e   # o install.sh liga `set -e`; aqui as sondas precisam poder sair != 0
 
