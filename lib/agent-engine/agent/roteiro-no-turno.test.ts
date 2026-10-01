@@ -10,7 +10,7 @@ import type pg from 'pg';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { FlowGraph } from '@/lib/followup/graph-schema';
-import { garantirPerguntaDoRoteiro, prepararRoteiroDoTurno, type ValidarResposta } from './roteiro-no-turno';
+import { garantirPerguntaDoRoteiro, perguntaDoRoteiroPodeSair, prepararRoteiroDoTurno, type RoteiroDoTurno, type ValidarResposta } from './roteiro-no-turno';
 
 const GRAFO: FlowGraph = {
   nodes: [
@@ -50,6 +50,8 @@ function banco(
     mensagem?: { body: string | null; media_derived_text?: string | null } | null;
     /** Perguntas já feitas ao cliente (eventos `roteiro_pergunta_feita`). */
     perguntasFeitas?: string[];
+    /** Tentativas por pergunta (eventos `roteiro_tentativa`) — no teto, a pergunta esgota. */
+    tentativas?: Record<string, number>;
     /** O LOTE inteiro (rajada): vence `mensagem` quando presente. */
     lote?: Array<{ id: string; body: string | null; media_derived_text?: string | null }>;
   } = {},
@@ -96,7 +98,10 @@ function banco(
       return { rows: [{ id: 'enr-1' }], rowCount: 1 };
     }
     if (/event_type in \('roteiro_tentativa', 'roteiro_pergunta_feita'\)/.test(sql)) {
-      const linhas = (opts.perguntasFeitas ?? []).map((campo) => ({ tipo: 'roteiro_pergunta_feita', campo, n: 1 }));
+      const linhas = [
+        ...(opts.perguntasFeitas ?? []).map((campo) => ({ tipo: 'roteiro_pergunta_feita', campo, n: 1 })),
+        ...Object.entries(opts.tentativas ?? {}).map(([campo, n]) => ({ tipo: 'roteiro_tentativa', campo, n })),
+      ];
       return { rows: linhas, rowCount: linhas.length };
     }
     if (/from messages/.test(sql)) {
@@ -295,6 +300,59 @@ describe('revisão adversarial do PR 2 — dado inventado', () => {
     expect(validar).toHaveBeenCalledWith(expect.objectContaining({ perguntaAtual: 'tem_cnh' }));
   });
 
+  it('⭐ RESPOSTA TARDIA (#1130, @vgamkt): a pergunta esgotada vai ao validador, e o que ele leu é gravado', async () => {
+    // Duas perguntas: `cidade` já bateu no teto (3 de 3) e está ENCERRADA; a
+    // CNH segue pendente, então o roteiro continua vivo.
+    const grafo: FlowGraph = {
+      ...GRAFO,
+      nodes: [
+        GRAFO.nodes[0]!,
+        {
+          id: 'c1',
+          type: 'collect',
+          label: 'Cidade',
+          position: { x: 0, y: 0 },
+          config: { key: 'cidade', label: 'Cidade', type: 'text', required: true, permite_correcao: false },
+        },
+        {
+          id: 'c2',
+          type: 'collect',
+          label: 'CNH',
+          position: { x: 0, y: 0 },
+          config: { key: 'tem_cnh', label: 'Tem CNH', type: 'boolean', required: true, permite_correcao: false },
+        },
+        GRAFO.nodes[2]!,
+      ],
+      edges: [
+        { id: 'a', source: 't', target: 'c1', priority: 0, condition: { type: 'always' } },
+        { id: 'b', source: 'c1', target: 'c2', priority: 0, condition: { type: 'always' } },
+        { id: 'c', source: 'c2', target: 'e', priority: 0, condition: { type: 'always' } },
+      ],
+    };
+    const b = banco({
+      roteiroJaExiste: true,
+      grafo,
+      mensagem: { body: 'ah, eu moro em Campinas' },
+      perguntasFeitas: ['cidade', 'tem_cnh'],
+      tentativas: { cidade: 3 },
+    });
+    const validar = vi.fn<ValidarResposta>(async () => ({
+      resultado: 'respondeu',
+      respostas: [{ campo: 'cidade', valor: 'Campinas' }],
+    }));
+    await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar, log: log() as never },
+      { ...turno, texto: 'ah, eu moro em Campinas' },
+    );
+
+    const args = validar.mock.calls[0]![0];
+    expect(args.perguntas.map((p) => p.key)).toEqual(['tem_cnh']);
+    expect(args.esgotados?.map((p) => p.key)).toEqual(['cidade']);
+    const gravacao = b.query.mock.calls.find(([sql]) => /update contacts/.test(sql));
+    expect(gravacao, 'a resposta tardia precisa chegar ao contato').toBeDefined();
+    expect(gravacao![1]).toEqual(expect.arrayContaining(['cidade', 'Campinas']));
+  });
+
   it('⭐ rajada "oi" + "meu cpf é 529.982.247-25": o validador lê o LOTE, e o retry não relê', async () => {
     const b = banco({
       roteiroJaExiste: true,
@@ -342,6 +400,65 @@ describe('garantirPerguntaDoRoteiro', () => {
       { organizationId: 'org', roteiro, corposEnviados: ['Temos várias opções de financiamento.'], enviar },
     );
     expect(enviar).toHaveBeenCalledWith('Nome completo?');
+  });
+});
+
+describe('#1943 — turno descartado como resposta obsoleta não emite a pergunta do roteiro', () => {
+  async function roteiroAtivoComDescarte(): Promise<{ roteiro: RoteiroDoTurno; b: ReturnType<typeof banco> }> {
+    const b = banco({ roteiroJaExiste: true });
+    const roteiro = await prepararRoteiroDoTurno(
+      { pool: b.pool, moduloLigado: async () => true, validar: semLeitura, log: log() as never },
+      { ...turno, messageId: null },
+    );
+    return { roteiro: roteiro!, b };
+  }
+
+  it('perguntaDoRoteiroPodeSair: turno descartado veta, teto de envios segue valendo', () => {
+    expect(perguntaDoRoteiroPodeSair({ turnoDescartado: true, seq: 0, maxSendsPerTurn: 5 })).toBe(false);
+    expect(perguntaDoRoteiroPodeSair({ turnoDescartado: true, seq: 4, maxSendsPerTurn: 5 })).toBe(false);
+    // Sem descarte, o teto de mensagens físicas (F2-15b) continua sendo o guard.
+    expect(perguntaDoRoteiroPodeSair({ turnoDescartado: false, seq: 0, maxSendsPerTurn: 5 })).toBe(true);
+    expect(perguntaDoRoteiroPodeSair({ turnoDescartado: false, seq: 5, maxSendsPerTurn: 5 })).toBe(false);
+  });
+
+  it('⭐ num turno descartado, garantirPerguntaDoRoteiro NÃO manda a pergunta nem registra roteiro_pergunta_feita', async () => {
+    const { roteiro, b } = await roteiroAtivoComDescarte();
+    // O `enviar` do turno é quem leva o descarte (ver `perguntaDoRoteiroPodeSair`
+    // no inbound-turn.ts): no turno obsoleto ele devolve false, então a trava
+    // "a pergunta saiu?" não envia nada e o evento não é registrado — a pergunta
+    // segue pendente para o turno da mensagem nova.
+    const enviar = vi.fn(async () =>
+      perguntaDoRoteiroPodeSair({ turnoDescartado: true, seq: 0, maxSendsPerTurn: 5 }),
+    );
+    await garantirPerguntaDoRoteiro(
+      { pool: b.pool, log: log() as never },
+      { organizationId: 'org', roteiro, corposEnviados: [], enviar },
+    );
+    expect(enviar).toHaveBeenCalledTimes(1);
+    expect(await enviar.mock.results[0]!.value).toBe(false);
+    const eventos = b.query.mock.calls
+      .filter(([sql]) => /insert into followup_enrollment_events/.test(String(sql)))
+      .map(([, params]) => (params as unknown[])[3]);
+    expect(eventos).not.toContain('roteiro_pergunta_feita');
+    // A pergunta continua pendente: roteiro_pergunta_feita NÃO foi registrado.
+    expect(roteiro.estado.situacao.pendentes.map((n) => n.config.key)).toEqual(['nome_completo']);
+  });
+
+  it('fiado no turno: a guarda liga o descarte e o enviar do roteiro veta por ele', () => {
+    const src = readFileSync(join(process.cwd(), 'lib/agent-engine/agent/inbound-turn.ts'), 'utf8');
+    const guarda = src.indexOf("code: 'resposta_obsoleta'");
+    // Uso no `enviar` do roteiro — o import (com `} perguntaDoRoteiroPodeSair,`)
+    // vem antes da guarda e enganaria um `indexOf` simples no nome.
+    const enviaRoteiro = src.indexOf('!perguntaDoRoteiroPodeSair(');
+    const marcaDescarte = src.indexOf('turnoDescartado = true');
+    expect(marcaDescarte).toBeGreaterThan(0);
+    // Uma só atribuição, e DENTRO da guarda: depois da chamada da régua.
+    expect(src.split('turnoDescartado = true').length - 1).toBe(1);
+    expect(marcaDescarte).toBeGreaterThan(src.indexOf('await respostaFicouObsoleta('));
+    expect(marcaDescarte).toBeLessThan(guarda); // liga ANTES de devolver resposta_obsoleta
+    expect(enviaRoteiro).toBeGreaterThan(guarda); // o enviar do roteiro lê o descarte
+    const tornoDoEnviar = src.slice(enviaRoteiro, enviaRoteiro + 200);
+    expect(tornoDoEnviar).toContain('turnoDescartado');
   });
 });
 
