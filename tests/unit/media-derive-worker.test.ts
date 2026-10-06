@@ -60,7 +60,20 @@ vi.mock("@/lib/supabase/admin", () => ({
         },
         update: (patch: Record<string, unknown>) => {
           updateEqMock(patch);
-          return { eq: () => ({ eq: async () => ({ error: null }) }) };
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const chain: any = new Proxy(
+            {
+              eq: () => chain,
+              neq: () => chain,
+              select: () => chain,
+              then: (onFulfilled: (v: unknown) => void, onRejected?: (e: unknown) => void) => {
+                const p = Promise.resolve({ data: [messageRow], error: null });
+                return p.then(onFulfilled, onRejected);
+              },
+            },
+            { get: (alvo, prop) => (prop in alvo ? alvo[prop as keyof typeof alvo] : () => chain) },
+          );
+          return chain;
         },
         then: (resolve: (v: unknown) => unknown) =>
           Promise.resolve({ data: linha ? [linha] : [], error: null }).then(resolve),
@@ -91,6 +104,7 @@ vi.mock("@/lib/agent-engine/edge/llm/credentials", () => ({
     enabledModels: [],
     orcamento: { modo: "off", tetoCents: 0, efetivoEm: null, limiarPct: 80 },
     orcamentoIndisponivelPorque: null,
+    baseUrl: null,
   })),
 }));
 
@@ -109,6 +123,9 @@ function configResolvida(over: Partial<OrgLlmConfig> = {}): OrgLlmConfig {
     enabledModels: [],
     orcamento: { modo: "off", tetoCents: 0, efetivoEm: null, limiarPct: 80 },
     orcamentoIndisponivelPorque: null,
+    // Coluna nova da credencial do provedor personalizado (#1642): nula aqui
+    // como é em todo provedor nativo.
+    baseUrl: null,
     ...over,
   };
 }
