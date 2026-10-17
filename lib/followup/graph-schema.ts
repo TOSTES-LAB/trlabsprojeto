@@ -247,6 +247,13 @@ export const actionConfigSchema = z.discriminatedUnion('mode', [
   z.strictObject({
     mode: z.literal('text'),
     body: z.string().min(1).max(4000),
+    /**
+     * #2734 — MÍDIA OPCIONAL (imagem ou PDF) por URL. Presente, o `body` vira a
+     * LEGENDA. Opcional de propósito: os grafos publicados não têm a chave e
+     * continuam válidos byte a byte (o `strictObject` só recusa o que ELE não
+     * conhece; um campo novo e opcional é aceito pelos antigos).
+     */
+    media_url: z.string().url().max(2000).optional(),
   }),
   z.strictObject({
     mode: z.literal('ai_message'),
@@ -293,9 +300,14 @@ export const internalTaskConfigSchema = z.strictObject({
  * (`flowGraphSchema`) e o nó nasce sem destino — quem exige etapa escolhida é o
  * `validate-publish` (`etapa_destino_ausente`), como a condição com regra em
  * branco.
+ *
+ * `lost_reason` é opcional para não invalidar grafo já publicado: quem montou
+ * o fluxo antes desta régua continua válido, e quem publica com destino em
+ * etapa de perda precisa preenchê-lo (`motivo_da_perda_ausente`).
  */
 export const moveLeadConfigSchema = z.strictObject({
   stage_id: z.string().max(64),
+  lost_reason: z.string().max(500).optional(),
 });
 
 /**
