@@ -157,8 +157,10 @@ function db(): AvisoDeAgendamentoDb {
       }
       return n;
     },
-    houveAvisoEnviado: async (_o, appointmentId) =>
-      [...mundo.entregas.values()].some((e) => e.appointment_id === appointmentId && e.status === "enviado"),
+    houveAvisoEnviado: async (_o, appointmentId, alvo) =>
+      [...mundo.entregas.values()].some(
+        (e) => e.appointment_id === appointmentId && e.alvo === alvo && (e.status === "enviado" || e.status === "no_resumo"),
+      ),
     agendaEntre: async () => (mundo.agendamento ? [mundo.agendamento] : []),
     represadasParaOResumo: async (_o, alvo) =>
       [...mundo.entregas.values()]
@@ -442,6 +444,26 @@ describe("aviso também no grupo do WhatsApp", () => {
     expect(r.status).toBe("ok");
     expect(mundo.para).toEqual([NUMERO, GRUPO, NUMERO, GRUPO]);
     expect(mundo.enviadas[3]).toContain("agendamento cancelado");
+  });
+
+  it("cancelado quando só o número tinha recebido: o grupo não recebe cancelamento de horário que não viu", async () => {
+    mundo.grupoFalha = true;
+    const primeiro = await aplicaAvisoDeAgendamento(deps(TARDE), evento("appointment.created", "ev1", TARDE));
+    expect(primeiro.status).toBe("retry");
+    expect(mundo.para).toEqual([NUMERO]);
+
+    mundo.grupoFalha = false;
+    mundo.agendamento = { ...mundo.agendamento!, status: "cancelled" };
+    const depois = new Date(TARDE.getTime() + 3 * 60 * 1000);
+    const cancel = await aplicaAvisoDeAgendamento(deps(depois), evento("appointment.cancelled", "ev2", depois));
+    expect(cancel.status).toBe("ok");
+    expect(cancel.detail).toContain("grupo:cancelado=1:nada_a_avisar");
+    expect(mundo.para).toEqual([NUMERO, NUMERO]);
+    expect(mundo.enviadas[1]).toContain("agendamento cancelado");
+
+    // A retomada do primeiro evento acha a entrega do grupo cancelada e não envia.
+    await aplicaAvisoDeAgendamento(deps(depois), evento("appointment.created", "ev1", TARDE));
+    expect(mundo.para).toEqual([NUMERO, NUMERO]);
   });
 
   it("só o grupo, sem número: o aviso sai para o grupo", async () => {

@@ -186,7 +186,8 @@ export interface AvisoDeAgendamentoDb
   atualizaEntrega(orgId: string, entregaId: string, patch: PatchDaEntregaDeAgendamento): Promise<void>;
   /** `pendente` e `para_o_resumo` do agendamento viram `cancelado`; devolve quantas. */
   cancelaPendentesDoAgendamento(orgId: string, appointmentId: string, excetoEventId: string): Promise<number>;
-  houveAvisoEnviado(orgId: string, appointmentId: string): Promise<boolean>;
+  /** Algum aviso deste agendamento já saiu (ou entrou no resumo) para ESTE destino. */
+  houveAvisoEnviado(orgId: string, appointmentId: string, alvo: AlvoDaEntregaDeAgendamento): Promise<boolean>;
   /** A agenda do dia, `pending`/`confirmed`, entre os dois instantes. */
   agendaEntre(orgId: string, inicio: Date, fim: Date): Promise<AgendamentoDoAviso[]>;
   /** As entregas `para_o_resumo` DESTE destino ainda não contadas, com o agendamento de cada uma. */
@@ -332,16 +333,12 @@ export async function aplicaAvisoDeAgendamento(
     // Marcou e cancelou antes do dreno chegar: o cancelamento é a notícia.
     return skipped(`agendamento_${agendamento.status}`);
   }
-  if (evento === "appointment.cancelled" && canceladas > 0 && !(await deps.db.houveAvisoEnviado(orgId, appointmentId))) {
-    // O dono nunca soube deste horário: avisar que ele foi cancelado é ruído.
-    return { status: "ok", detail: `cancelado=${canceladas}:nada_a_avisar` };
-  }
 
   // ── 4. Madrugada: vai no resumo das 7h ───────────────────────────────────
   const fuso = await deps.db.fusoDaOrganizacao(orgId);
   const madrugada = ehMadrugada(partesNoFuso(agora, fuso).hora);
 
-  const ctx = { row, evento, orgId, appointmentId, agendamento, channelSessionId, fuso, madrugada, agora };
+  const ctx = { row, evento, orgId, appointmentId, agendamento, channelSessionId, fuso, madrugada, agora, canceladas };
   return await porDestino(destinos, agora, (d) => avisaUmDestino(deps, { ...ctx, ...d }));
 }
 
@@ -358,10 +355,18 @@ async function avisaUmDestino(
     fuso: string;
     madrugada: boolean;
     agora: Date;
+    canceladas: number;
   },
 ): Promise<DesfechoDoAvisoDeAgendamento> {
-  const { row, evento, orgId, appointmentId, agendamento, channelSessionId, fuso, madrugada, agora, alvo, destino } =
+  const { row, evento, orgId, appointmentId, agendamento, channelSessionId, fuso, madrugada, agora, alvo, destino, canceladas } =
     ctx;
+
+  // Este destino nunca soube do horário (o aviso dele ainda estava na fila e o
+  // cancelamento o segurou): avisar que ele foi cancelado é ruído. A pergunta é
+  // POR DESTINO — o número pode ter recebido o "marcado" e o grupo não.
+  if (evento === "appointment.cancelled" && canceladas > 0 && !(await deps.db.houveAvisoEnviado(orgId, appointmentId, alvo))) {
+    return { status: "ok", detail: `cancelado=${canceladas}:nada_a_avisar` };
+  }
 
   // ── 5. REIVINDICA antes de tocar a rede ──────────────────────────────────
   const { criada, entrega } = await deps.db.reivindicaAviso({
@@ -871,12 +876,13 @@ export function createSupabaseAvisoDeAgendamentoDb(
       return (data ?? []).length;
     },
 
-    async houveAvisoEnviado(orgId, appointmentId) {
+    async houveAvisoEnviado(orgId, appointmentId, alvo) {
       const { data, error } = await admin
         .from("entregas_de_aviso_de_agendamento")
         .select("id")
         .eq("organization_id", orgId)
         .eq("appointment_id", appointmentId)
+        .eq("alvo", alvo)
         .in("status", ["enviado", "no_resumo"])
         .limit(1);
       if (error) throw new Error(error.message);
