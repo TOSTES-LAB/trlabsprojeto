@@ -19,7 +19,9 @@ import {
   JANELA_MAXIMA_HORAS,
   TEXTO_MAXIMO,
 } from "@/lib/inbox/rascunho-sugerido";
+import { VALIDADE_DO_LINK_DE_MIDIA_S } from "@/lib/messaging/media/link-temporario";
 import { getQueuePositions } from "@/lib/routing/queue";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { resolveUserNames } from "./_users";
 import type { McpToolDefinition } from "../types";
 
@@ -175,22 +177,29 @@ export const crmGetConversation: McpToolDefinition<typeof getInputShape> = {
   requiresRole: "agent",
   requiresScope: "mcp:read",
   handler: async (input, ctx) => {
-    const conv = await getConversationHandler(
-      ctx.supabase,
-      {
-        organization_id: ctx.organizationId,
-        actor: ctx.actor,
-        requestId: ctx.requestId,
-      },
-      input.conversation_id,
-    ).catch((e: unknown) => {
+    let conv: Awaited<ReturnType<typeof getConversationHandler>> | null = null;
+    try {
+      conv = await getConversationHandler(
+        ctx.supabase,
+        {
+          organization_id: ctx.organizationId,
+          actor: ctx.actor,
+          requestId: ctx.requestId,
+        },
+        input.conversation_id,
+      );
+    } catch (e: unknown) {
       // Com turno, o `404` (não existe, ou é de outra organização) vira a
       // MESMA recusa da conversa de outro cliente, como no histórico: um uuid
       // não ganha veredito sobre existência. Sem turno, sobe como antes; erro
       // que não é `404` sobe sempre.
-      if (ctx.contatoDoTurno && e instanceof ApiError && e.status === 404) return null;
-      throw e;
-    });
+      if (!(e instanceof ApiError) || e.status !== 404) throw e;
+      if (ctx.contatoDoTurno) {
+        conv = null;
+      } else {
+        throw e;
+      }
+    }
     // ── A CONVERSA DE QUEM NÃO É DESTA CONVERSA NÃO ABRE AQUI (#2178) ────────
     //
     // RECUSA, e não tradução: trocar o uuid pedido pelo da conversa do turno
@@ -251,6 +260,72 @@ const historyInputShape = {
   limit: z.number().int().min(1).max(100).default(20),
   cursor: z.string().optional(),
 };
+
+const MEDIA_BUCKET = "whatsapp-media";
+
+export type MediaDoHistorico = {
+  /**
+   * `ready`: arquivo guardado; `pending`: a mensagem tem mídia mas o worker
+   * ainda não a guardou (ou o link falhou) — quem consome tenta de novo depois;
+   * `expired`: apagada pela retenção (o mesmo marcador que faz a rota de mídia
+   * responder 410); ausente no mapa = mensagem sem mídia.
+   */
+  status: "ready" | "pending" | "expired";
+  signedUrl: string | null;
+};
+
+type MensagemComMidia = {
+  id: string;
+  media_url?: string | null;
+  media_storage_path?: string | null;
+  metadata?: Record<string, unknown> | null;
+};
+
+/** A mesma régua da rota de mídia: sem arquivo, sem endereço e com o marcador da retenção. */
+const expirou = (m: MensagemComMidia) =>
+  !m.media_storage_path && !m.media_url && m.metadata?.media_status === "expired";
+
+/**
+ * Para cada mensagem do histórico que carrega mídia, diz o estado e, com
+ * `comLink`, gera o link temporário do arquivo guardado. Nunca lança: falha ao
+ * assinar vira `pending` (a conversa continua legível). Só toca no storage se
+ * houver link a assinar.
+ */
+export async function resolverMidiasDoHistorico(
+  messages: ReadonlyArray<MensagemComMidia>,
+  { comLink = true }: { comLink?: boolean } = {},
+): Promise<Map<string, MediaDoHistorico>> {
+  const out = new Map<string, MediaDoHistorico>();
+  const comMidia = messages.filter((m) => m.media_storage_path || m.media_url || expirou(m));
+  if (comMidia.length === 0) return out;
+
+  const aAssinar: Array<{ id: string; caminho: string }> = [];
+  for (const m of comMidia) {
+    if (expirou(m)) out.set(m.id, { status: "expired", signedUrl: null });
+    else if (!m.media_storage_path) out.set(m.id, { status: "pending", signedUrl: null });
+    else if (!comLink) out.set(m.id, { status: "ready", signedUrl: null });
+    else aAssinar.push({ id: m.id, caminho: m.media_storage_path });
+  }
+  if (aAssinar.length === 0) return out;
+
+  const storage = createAdminClient().storage.from(MEDIA_BUCKET);
+  await Promise.all(
+    aAssinar.map(async (m) => {
+      try {
+        const { data, error } = await storage.createSignedUrl(m.caminho, VALIDADE_DO_LINK_DE_MIDIA_S);
+        out.set(
+          m.id,
+          error || !data?.signedUrl
+            ? { status: "pending", signedUrl: null }
+            : { status: "ready", signedUrl: data.signedUrl },
+        );
+      } catch {
+        out.set(m.id, { status: "pending", signedUrl: null });
+      }
+    }),
+  );
+  return out;
+}
 
 export const crmGetConversationHistory: McpToolDefinition<typeof historyInputShape> = {
   name: "crm_get_conversation_history",
@@ -317,16 +392,26 @@ export const crmGetConversationHistory: McpToolDefinition<typeof historyInputSha
         };
       }
     }
-    const result = await listMessagesHandler(
-      ctx.supabase,
-      {
-        organization_id: ctx.organizationId,
-        actor: ctx.actor,
-        requestId: ctx.requestId,
-      },
-      input.conversation_id,
-      { limit: input.limit, cursor: input.cursor },
-    );
+    let result: Awaited<ReturnType<typeof listMessagesHandler>>;
+    try {
+      result = await listMessagesHandler(
+        ctx.supabase,
+        {
+          organization_id: ctx.organizationId,
+          actor: ctx.actor,
+          requestId: ctx.requestId,
+        },
+        input.conversation_id,
+        { limit: input.limit, cursor: input.cursor },
+      );
+    } catch (e: unknown) {
+      throw e;
+    }
+    // No turno do agente de atendimento o link NÃO sai: ele vale como portador
+    // por 1h para foto ou áudio de cliente, iria para o provedor de IA e para os
+    // registros da rodada, e o agente não tem como abri-lo. Tipo e estado ficam.
+    // Pela API (sem contato do turno) o link sai normalmente.
+    const media = await resolverMidiasDoHistorico(result.messages, { comLink: !ctx.contatoDoTurno });
     return {
       messages: result.messages.map((m) => ({
         id: m.id,
@@ -334,6 +419,13 @@ export const crmGetConversationHistory: McpToolDefinition<typeof historyInputSha
         type: m.type,
         body: m.body,
         media_url: m.media_url,
+        // Mídia utilizável por quem consome pela API: tipo, tamanho e um link
+        // temporário do arquivo já guardado (`media_url` é o endereço interno do
+        // gateway e não serve fora dele). Ver `resolverMidiasDoHistorico`.
+        media_mime: m.media_mime ?? null,
+        media_size_bytes: m.media_size_bytes ?? null,
+        media_status: media.get(m.id)?.status ?? "none",
+        media_signed_url: media.get(m.id)?.signedUrl ?? null,
         sent_via: m.sent_via,
         sent_at: m.sent_at,
         status: m.status,

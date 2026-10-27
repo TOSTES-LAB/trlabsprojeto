@@ -19,7 +19,7 @@
 [![CI](https://github.com/melgarafael/DeskcommCRM/actions/workflows/ci.yml/badge.svg)](https://github.com/melgarafael/DeskcommCRM/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-[**⚡ Instalar**](#-instalar-na-sua-vps-o-caminho-principal) · [**🔄 Atualizar**](#-atualizar) · [**🧭 Visão**](VISION.md) · [**🏗️ Arquitetura**](ARCHITECTURE.md) · [**🤝 Contribuir**](CONTRIBUTING.md) · [**🗺️ Roadmap**](#%EF%B8%8F-roadmap)
+[**⚡ Instalar**](#-instalar-na-sua-vps-o-caminho-principal) · [**📖 Curso visual**](https://deskcomm.com.br/curso) · [**🔄 Atualizar**](#-atualizar) · [**🧭 Visão**](VISION.md) · [**🏗️ Arquitetura**](ARCHITECTURE.md) · [**🤝 Contribuir**](CONTRIBUTING.md) · [**🗺️ Roadmap**](#%EF%B8%8F-roadmap)
 
 </div>
 
@@ -131,6 +131,10 @@ Abra `https://<seu-domínio>` (o cadeado leva ~1 min pra aparecer), entre com o 
 **Google Authenticator** ou **Authy** à mão *se* você quiser ligar a verificação em duas etapas — ela é **opcional** e fica em Configurações › Segurança; o primeiro login **não** a exige. No onboarding,
 escaneie o QR code com o WhatsApp do seu número.
 
+> **Já instalou?** Continue no [**curso visual gratuito**](https://deskcomm.com.br/curso):
+> telas reais e indicações de onde clicar para aprender a usar a Inbox, organizar o funil e
+> configurar seus agentes de IA, no seu ritmo.
+
 ### 🤖 Prefere que uma IA instale pra você?
 
 O repositório traz **guias do assistente** que carregam sozinhos no Claude Code, Codex, Cursor,
@@ -205,9 +209,10 @@ ruído e mostra `✓ banco atualizado`. Se o banco estiver ocupado com o CRM ate
 novo sozinho (até 3 passadas) e conta isso na tela — isso vale a partir da atualização seguinte à
 que instalar esta correção. Se aparecer `⚠ Apareceram avisos no banco que NÃO são os esperados`, aí sim guarde a
 mensagem: o **fim** da saída diz o que fazer em cada caso (repetir com `--force` quando foi o banco
-ocupado, declarar `SUPABASE_DB_ADMIN_URL` quando foi permissão). Restaurar o backup é o último recurso.
+ocupado, declarar `SUPABASE_DB_ADMIN_URL` quando foi permissão).
 
-**Deu ruim?** `bash hostgator-setup-kit/restore.sh` volta pro backup.
+**Deu ruim?** Guarde a mensagem e peça ajuda. O `restore.sh` **não** volta o backup por cima do
+banco em uso: ele só restaura num banco vazio (ver [`hostgator-setup-kit/README.md`](hostgator-setup-kit/README.md)).
 **Quer só diagnosticar?** `bash hostgator-setup-kit/healthcheck.sh`.
 
 > ⚠️ **Numa instalação antiga que ainda não tem o agente da tela**, rode `update.sh` **duas
