@@ -178,6 +178,16 @@ export interface PontoDeIa {
   };
 }
 
+/**
+ * Ids dos dois pontos que gravam em `llm_calls` FORA do seam, por insert direto
+ * do worker de mídia — constante, para o `purpose` gravado e o id daqui não
+ * divergirem (a tela de Execuções rotula a linha pelo id). As entradas abaixo
+ * seguem com o id LITERAL, porque testes ancoram o recorte do ponto nele;
+ * `midia-grava-custo-em-llm-calls` confere que cada constante casa com uma entrada.
+ */
+export const PONTO_TRANSCRICAO_DE_AUDIO = "transcricao_de_audio";
+export const PONTO_VISAO_DE_IMAGEM = "visao_de_imagem";
+
 export const PONTOS_DE_IA: readonly PontoDeIa[] = [
   {
     id: "agent_preview",
@@ -452,6 +462,27 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     registraEm: "llm_calls",
   },
 
+  {
+    // A conferência de fato (#2231): o ponto é dela (o Jev responde por aqui, e
+    // a credencial é a que resolve), não uma IA de sempre reservada — quem
+    // decide é só o Jev, e sem resposta a frase segue como está (fail-open).
+    id: "afirmacao_de_fato",
+    rotulo: "Conferir afirmações de fato na resposta",
+    oQueFaz:
+      "Lê a resposta que o assistente vai enviar e confere, nas evidências consultadas neste turno, se o que ele afirma sobre o negócio está escrito ali — ou se o material diz o contrário.",
+    papel: "proteger",
+    exige: {},
+    emissor: "lib/ai/decisao/afirmacao-de-fato.ts",
+    sintomaDeFalha:
+      "O agente diz ao cliente um horário, um preço ou um endereço que não está em nenhum material, e a pessoa vai até a loja ou à recepção por algo que não é verdade.",
+    registraEm: "llm_calls",
+    decisaoRapida: {
+      primitiva: "noul",
+      oQueOJevFaz:
+        "Lê a resposta que o assistente vai enviar e confere, nas evidências consultadas neste turno, se o que ele afirma sobre o negócio está escrito ali — ou se o material diz o contrário.",
+    },
+  },
+
   // ─────────────────────────── Lembrar e buscar ────────────────────────────
   {
     id: "compaction",
@@ -536,7 +567,7 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     emissor: "lib/messaging/media/transcription.ts",
     fixo: {
       razao:
-        "Este ponto não tem modelo escolhido no painel: quem ouve o áudio é a escada de transcrição, e ela decide a cada nota de voz. Primeiro o serviço desta instalação (TRANSCRIPTION_API_KEY); na falta dele, a chave OpenAI com o modelo de transcrição de sempre (whisper-1, ou o que TRANSCRIPTION_MODEL trouxer); e quando não há chave OpenAI nenhuma, o modelo de conversa da organização — desde que ele declare a capacidade de áudio, que é como uma organização só com Gemini transcreve. Sem nenhum dos três, o áudio não vira texto, e o motivo aparece aqui. Por isso fixar um provedor aqui apagaria os degraus seguintes.",
+        "Este ponto não tem modelo escolhido no painel: quem ouve o áudio é a escada de transcrição, e ela decide a cada nota de voz. Primeiro o serviço desta instalação (TRANSCRIPTION_API_KEY); na falta dele, a chave OpenAI com o modelo de transcrição de sempre (whisper-1, ou o que TRANSCRIPTION_MODEL trouxer); se a conversa da organização for OpenRouter, a própria OpenRouter transcreve com a mesma chave; e quando não há chave OpenAI nenhuma, o modelo de conversa da organização — desde que ele declare a capacidade de áudio, que é como uma organização só com Gemini transcreve. Sem nenhum dos quatro, o áudio não vira texto, e o motivo aparece aqui. Por isso fixar um provedor aqui apagaria os degraus seguintes.",
       // ⚠️ POR QUE NÃO HÁ MAIS um par fixo (provider "openai" + "whisper-1")
       // neste ponto (#2190): o objeto `fixo` vive sem o campo que declarava
       // esse par.
@@ -559,7 +590,7 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     },
     sintomaDeFalha:
       "O cliente manda áudio e o agente responde como se não tivesse recebido nada.",
-    registraEm: "nenhum",
+    registraEm: "llm_calls",
   },
   {
     id: "visao_de_imagem",
@@ -571,7 +602,7 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     emissor: "workers/media-derive-worker.ts",
     sintomaDeFalha:
       "O cliente manda uma foto do produto ou um comprovante e o agente age como se a imagem não existisse.",
-    registraEm: "nenhum",
+    registraEm: "llm_calls",
   },
 
   // ────────────────────────── Melhorar e testar ────────────────────────────

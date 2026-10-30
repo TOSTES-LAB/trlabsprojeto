@@ -58,6 +58,12 @@ export interface ConferenciaDeSaida {
   /** Por que não se desliga. Vazio quando há escolha. */
   porQueNaoSeDesliga: string;
   /**
+   * Sem interruptor NESTA tela, mas com escolha em outra (a conferência de fato
+   * liga no cartão do Jev). Toma o lugar do "Isto não se desliga.", que ali
+   * seria mentira.
+   */
+  escolhaEmOutraTela?: string;
+  /**
    * A chave da camada em `org_guardrail_layers`, quando há escolha.
    *
    * São DOIS vocabulários e eles não coincidem: aqui o nome é o do gate na cadeia
@@ -66,7 +72,7 @@ export interface ConferenciaDeSaida {
    * a tela deixa de encontrar o estado e mostra "carregando…" para sempre —
    * aconteceu ao escrever isto, e o teste de componente pegou.
    */
-  camada: "promessa_semantica" | "jailbreak" | "afirmacao_clinica" | null;
+  camada: "promessa_semantica" | "jailbreak" | "afirmacao_clinica" | "restricao_comercial" | null;
 }
 
 /**
@@ -142,6 +148,17 @@ export const CONFERENCIAS_DE_SAIDA: readonly ConferenciaDeSaida[] = [
     camada: "promessa_semantica",
   },
   {
+    nome: "factual_claim",
+    rotulo: "Conferir afirmações de fato na resposta",
+    oQueProtege:
+      "Confere se o que o assistente afirma sobre o negócio (horário, preço, endereço) está no material que ele consultou para responder.",
+    escolha: null,
+    escolhaEmOutraTela: "Liga-se no cartão do Jev, em Provedores de IA.",
+    porQueNaoSeDesliga:
+      "Vem desligada. Nesta versão ela só anota o que encontrou e não barra nenhuma mensagem; ligada, custa +1 consulta ao Jev por resposta.",
+    camada: null,
+  },
+  {
     nome: "case_promise",
     rotulo: "Não prometer atendimento humano que não existe",
     oQueProtege:
@@ -177,6 +194,22 @@ export const CONFERENCIAS_DE_SAIDA: readonly ConferenciaDeSaida[] = [
     camada: "afirmacao_clinica",
   },
   {
+    nome: "commercial_restriction",
+    rotulo: "Deixar valores e negociação com a equipe",
+    oQueProtege:
+      "Quando ligada, o assistente não fala de preço, desconto, parcelamento nem forma de " +
+      "pagamento: o pedido vai direto para uma pessoa da equipe, o cliente é avisado, e a " +
+      "resposta do assistente que tocar nesses assuntos não sai.",
+    escolha: {
+      custo:
+        "Não custa nada e reconhece frases em português e espanhol. Vale para a organização " +
+        "inteira, e pode mandar à equipe uma pergunta que não era sobre preço.",
+      consultaModelo: false,
+    },
+    porQueNaoSeDesliga: "",
+    camada: "restricao_comercial",
+  },
+  {
     nome: "agenda_stall",
     rotulo: "Não prometer checar a agenda sem checar de verdade",
     oQueProtege:
@@ -186,6 +219,18 @@ export const CONFERENCIAS_DE_SAIDA: readonly ConferenciaDeSaida[] = [
     porQueNaoSeDesliga:
       "É a mesma promessa vazia do 'vou pedir pro responsável', só que sobre agenda: o cliente " +
       "fica esperando uma confirmação que nunca foi checada. Regra fixa, sem custo.",
+    camada: null,
+  },
+  {
+    nome: "registro_sem_efeito",
+    rotulo: "Conferir a escrita antes de afirmar registro",
+    oQueProtege:
+      "Recusa a confirmação de registro quando a ferramenta não confirmou nenhuma escrita " +
+      "neste turno. O controle ainda não identifica a qual item cada escrita se refere.",
+    escolha: null,
+    porQueNaoSeDesliga:
+      "É a mesma promessa vazia do 'vou pedir pro responsável': o cliente fica esperando um " +
+      "contato que nunca acontece. Regra fixa, sem custo.",
     camada: null,
   },
   {
