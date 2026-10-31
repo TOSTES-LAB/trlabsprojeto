@@ -41,7 +41,7 @@ export interface ConfigDoAvisoDeAgendamentoNaTela {
   channel_session_id: string | null;
   /** O número inteiro: é o campo que a pessoa está editando. */
   telefone: string | null;
-  /** O `chatId` do grupo que também recebe os avisos (migration 0775). */
+  /** O `chatId` do grupo que também recebe os avisos (migration 9060). */
   grupo: string | null;
   ligado: boolean;
   atualizado_em: string;

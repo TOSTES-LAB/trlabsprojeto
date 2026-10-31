@@ -1,6 +1,6 @@
 -- manifest: aviso de agendamento também num grupo do WhatsApp — `config_aviso_de_agendamento.grupo_destino` (chatId de um grupo da mesma conexão, destino extra), `entregas_de_aviso_de_agendamento.alvo` ('numero' | 'grupo') com as duas `unique` passando a ser por destino, e `fn_definir_aviso_de_agendamento` ganha `p_grupo`; aditiva, linhas antigas viram `alvo = 'numero'`.
 -- ═══════════════════════════════════════════════════════════════════════════
--- 0775 — O aviso de agendamento também vai para um grupo do WhatsApp.
+-- 9060 — O aviso de agendamento também vai para um grupo do WhatsApp.
 --
 -- Quem trabalha em equipe quer ver a agenda num grupo da empresa, sem repassar
 -- mensagem. O grupo é destino EXTRA: o número continua como era, e cada
@@ -30,14 +30,16 @@ alter table public.entregas_de_aviso_de_agendamento
   add constraint entregas_de_aviso_de_agendamento_alvo_check
   check (alvo in ('numero', 'grupo'));
 
-drop index if exists public.entregas_de_aviso_de_agendamento_evento_unico;
-drop index if exists public.entregas_de_aviso_de_agendamento_resumo_unico;
+-- As chaves novas nascem ANTES de as antigas saírem: o update.sh roda sem
+-- ON_ERROR_STOP, e a ordem inversa deixaria uma janela sem unique.
 create unique index if not exists entregas_de_aviso_de_agendamento_evento_alvo_unico
   on public.entregas_de_aviso_de_agendamento (organization_id, event_id, alvo)
   where event_id is not null;
 create unique index if not exists entregas_de_aviso_de_agendamento_resumo_alvo_unico
   on public.entregas_de_aviso_de_agendamento (organization_id, dia, alvo)
   where tipo = 'resumo';
+drop index if exists public.entregas_de_aviso_de_agendamento_evento_unico;
+drop index if exists public.entregas_de_aviso_de_agendamento_resumo_unico;
 
 -- A assinatura muda (`p_grupo` no fim, com default): a de seis argumentos sai,
 -- senão ficariam duas portas de escrita para a mesma tabela.

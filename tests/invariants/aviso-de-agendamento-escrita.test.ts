@@ -254,7 +254,7 @@ describe("0707 — fn_definir_aviso_de_agendamento é a única porta", () => {
   });
 });
 
-describe("0775 — o grupo é destino extra, com entrega própria", () => {
+describe("9060 — o grupo é destino extra, com entrega própria", () => {
   const GRUPO = "120363000000000001@g.us";
   const EVENTO = "07670000-4444-4000-8000-000000000001";
   const definirComGrupo = (grupo: string | null) =>

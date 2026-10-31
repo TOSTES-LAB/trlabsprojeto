@@ -60047,7 +60047,7 @@ alter table public.entregas_de_aviso_de_agendamento
 
 -- AS DUAS CHAVES DA IDEMPOTÊNCIA. O `23505` delas é o sinal que o handler lê
 -- para REIVINDICAR a entrega antes de tocar a rede.
--- Desde a 0775 as duas chaves são por destino (`alvo`), e o bloco da 0775
+-- Desde a 9060 as duas chaves são por destino (`alvo`), e o bloco da 9060
 -- apaga estas. Na reaplicação do `update.sh` a coluna já existe: recriar a
 -- chave estreita aqui falharia sobre um evento entregue ao número E ao grupo.
 do $$
@@ -61330,9 +61330,9 @@ $$;
 revoke execute on function public.fn_casos_parados_para_lembrar(integer) from public, anon, authenticated;
 grant execute on function public.fn_casos_parados_para_lembrar(integer) to service_role;
 
--- ---- aviso de agendamento também em grupo do WhatsApp (migration 0775) ----
+-- ---- aviso de agendamento também em grupo do WhatsApp (migration 9060) ----
 -- ═══════════════════════════════════════════════════════════════════════════
--- 0775 — O aviso de agendamento também vai para um grupo do WhatsApp.
+-- 9060 — O aviso de agendamento também vai para um grupo do WhatsApp.
 --
 -- Quem trabalha em equipe quer ver a agenda num grupo da empresa, sem repassar
 -- mensagem. O grupo é destino EXTRA: o número continua como era, e cada
@@ -61362,14 +61362,16 @@ alter table public.entregas_de_aviso_de_agendamento
   add constraint entregas_de_aviso_de_agendamento_alvo_check
   check (alvo in ('numero', 'grupo'));
 
-drop index if exists public.entregas_de_aviso_de_agendamento_evento_unico;
-drop index if exists public.entregas_de_aviso_de_agendamento_resumo_unico;
+-- As chaves novas nascem ANTES de as antigas saírem: o update.sh roda sem
+-- ON_ERROR_STOP, e a ordem inversa deixaria uma janela sem unique.
 create unique index if not exists entregas_de_aviso_de_agendamento_evento_alvo_unico
   on public.entregas_de_aviso_de_agendamento (organization_id, event_id, alvo)
   where event_id is not null;
 create unique index if not exists entregas_de_aviso_de_agendamento_resumo_alvo_unico
   on public.entregas_de_aviso_de_agendamento (organization_id, dia, alvo)
   where tipo = 'resumo';
+drop index if exists public.entregas_de_aviso_de_agendamento_evento_unico;
+drop index if exists public.entregas_de_aviso_de_agendamento_resumo_unico;
 
 -- A assinatura muda (`p_grupo` no fim, com default): a de seis argumentos sai,
 -- senão ficariam duas portas de escrita para a mesma tabela.
