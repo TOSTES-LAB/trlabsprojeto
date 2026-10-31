@@ -4,11 +4,8 @@ import type {
   ConversationsFilters,
   ConversationWithContact,
 } from "@/hooks/inbox/useConversationsRealtime";
-import {
-  comandoDaConversa,
-  STATUS_ENCERRADOS,
-  type ComandoDoBanco,
-} from "@/lib/inbox/comando-da-conversa";
+import { comandoDaConversa, type ComandoDoBanco } from "@/lib/inbox/comando-da-conversa";
+import { CONVERSATION_TERMINAL_STATUSES } from "@/lib/schemas/messaging";
 import { marcadoresEscolhidos } from "@/lib/inbox/marcador-da-conversa";
 
 /**
@@ -149,10 +146,9 @@ export type Julgamento = "fica" | "sai" | "indecidivel";
  * A conversa ainda pertence a esta lista depois da atualização?
  *
  * A régua é a MESMA dos filtros que a rota pede ao banco, e é aplicada sobre o
- * par (linha em cache, evento). Para `assigned_to: "me"` a pergunta é feita ao
- * contrário de propósito: a linha já estava nesta lista porque era minha, então
- * "continua sendo minha?" é `assigned_to_user_id` não mudou — e não exige saber
- * quem é o usuário logado aqui.
+ * par (linha em cache, evento). Para `assigned_to: "me"`, dono que não mudou
+ * "fica" sem precisar saber quem é o usuário logado; dono que mudou é
+ * `indecidivel`, porque a aba também traz conversa por participação (#2848).
  */
 export function julgarAtualizacao(
   anterior: ConversationWithContact,
@@ -177,12 +173,16 @@ export function julgarAtualizacao(
       typeof filtros.status === "string" ? [filtros.status] : filtros.status;
     if (!aceitos.includes(atual.status)) return "sai";
   }
-  if (filtros.exclude_finished && STATUS_ENCERRADOS.has(atual.status)) return "sai";
+  // A régua do `exclude_finished` é a da rota (`CONVERSATION_TERMINAL_STATUSES`),
+  // não `STATUS_ENCERRADOS`: esse responde "quem manda" e inclui `resolved`, que a
+  // rota NÃO esconde — tirar aqui seria sumir com a linha até o próximo refetch.
+  const terminais: readonly string[] = CONVERSATION_TERMINAL_STATUSES;
+  if (filtros.exclude_finished && terminais.includes(atual.status)) return "sai";
 
   if (filtros.assigned_to === "me") {
-    // Ver o comentário acima: a lista já era a minha, então o que tira a conversa
-    // dela é o dono TER MUDADO.
-    if (atual.assigned_to_user_id !== anterior.assigned_to_user_id) return "sai";
+    // A lista já era a minha. Dono trocado não decide daqui: "Minhas" também traz
+    // a conversa de que eu PARTICIPO (#2848), e quem sabe disso é a rota.
+    if (atual.assigned_to_user_id !== anterior.assigned_to_user_id) return "indecidivel";
   } else if (filtros.assigned_to === "unassigned") {
     if (atual.assigned_to_user_id !== null) return "sai";
   } else if (filtros.assigned_to) {
