@@ -10,7 +10,7 @@
  * da instalação (`/admin/marca`) nunca teve o problema porque passa os dois.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 vi.mock("@/hooks/i18n/useT", () => ({ useT: () => (texto: string) => texto }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn() }) }));
@@ -65,6 +65,7 @@ describe("marca da organização: a prévia escura usa o logo escuro gravado", (
   });
   afterEach(() => {
     cleanup();
+    vi.unstubAllGlobals();
     delete (window as unknown as { __PUBLIC_ENV__?: Record<string, string> }).__PUBLIC_ENV__;
   });
 
@@ -72,6 +73,8 @@ describe("marca da organização: a prévia escura usa o logo escuro gravado", (
     pintar({ logo_path: CLARO, logo_dark_path: ESCURO });
     expect(imagem("claro")!.getAttribute("src")).toBe(urlClara);
     expect(imagem("escuro")!.getAttribute("src")).toBe(urlEscura);
+    // A arte escura própria dispensa a moldura branca de proteção de contraste.
+    expect(imagem("escuro")!.parentElement?.className ?? "").not.toContain("bg-white");
   });
 
   it("oferece 'Remover logo escuro' quando há logo escuro gravado", () => {
@@ -83,5 +86,26 @@ describe("marca da organização: a prévia escura usa o logo escuro gravado", (
     pintar({ logo_path: CLARO, logo_dark_path: null });
     expect(imagem("escuro")!.getAttribute("src")).toBe(urlClara);
     expect(screen.queryByText("Remover logo escuro")).toBeNull();
+    // Logo único no tema escuro mantém a proteção de contraste do #659.
+    expect(imagem("escuro")!.parentElement?.className ?? "").toContain("bg-white");
+  });
+
+  it("o botão de remover apaga de fato: some, e a prévia escura volta ao logo claro", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue({ ok: true, json: async () => ({ data: { logo_url: null } }) });
+    vi.stubGlobal("fetch", fetchMock);
+
+    pintar({ logo_path: CLARO, logo_dark_path: ESCURO });
+    fireEvent.click(screen.getByRole("button", { name: "Remover logo escuro" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/v1/marca/logo?escopo=organizacao&tema=escuro",
+        { method: "DELETE" },
+      ),
+    );
+    await waitFor(() => expect(screen.queryByText("Remover logo escuro")).toBeNull());
+    expect(imagem("escuro")!.getAttribute("src")).toBe(urlClara);
   });
 });
