@@ -139,6 +139,8 @@ export interface EntregaDeAgendamento {
   organization_id: string;
   appointment_id: string | null;
   evento: string | null;
+  /** O número ou o grupo: sem isto, a falha de um e a do outro se leem iguais. */
+  alvo: AlvoDaEntregaDeAgendamento;
   destino: string;
   status: StatusDaEntregaDeAgendamento | string;
   tentativas: number;
@@ -656,7 +658,7 @@ async function entrega_(
     action: "agenda.aviso_whatsapp_enviado",
     organizationId: orgId,
     resourceId: entrega.appointment_id ?? entrega.id,
-    metadata: { entrega_id: entrega.id, evento: entrega.evento, canal: channelSessionId, tentativas },
+    metadata: { entrega_id: entrega.id, evento: entrega.evento, alvo: entrega.alvo, canal: channelSessionId, tentativas },
   });
   return { status: "ok", detail: `enviado canal=${channelSessionId} tentativas=${tentativas}` };
 }
@@ -683,6 +685,7 @@ async function condena(
     metadata: {
       entrega_id: entrega.id,
       evento: entrega.evento,
+      alvo: entrega.alvo,
       erro_codigo: codigo,
       destino_mascarado: mascara(entrega.destino),
       quando: agora.toISOString(),
@@ -696,7 +699,7 @@ async function condena(
 // ---------------------------------------------------------------------------
 
 const COLUNAS_DA_ENTREGA =
-  "id, organization_id, appointment_id, evento, destino, status, tentativas, created_at, updated_at";
+  "id, organization_id, appointment_id, evento, alvo, destino, status, tentativas, created_at, updated_at";
 const COLUNAS_DO_AGENDAMENTO =
   "id, status, starts_at, contact_id, owner_user_id, event_type_id, title, created_by_kind";
 

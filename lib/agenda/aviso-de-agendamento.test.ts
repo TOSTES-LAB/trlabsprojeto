@@ -47,6 +47,8 @@ interface Mundo {
   /** O grupo recusa o envio (saiu do grupo, grupo apagado). */
   grupoFalha: boolean;
   auditadas: string[];
+  /** O `metadata` de cada auditoria, na mesma ordem de `auditadas`. */
+  auditMeta: Array<Record<string, unknown>>;
   envioFalha: boolean;
   /** O relógio da rodada, visível ao fake da reivindicação. */
   relogio: Date;
@@ -80,6 +82,7 @@ function novoMundo(): Mundo {
     para: [],
     grupoFalha: false,
     auditadas: [],
+    auditMeta: [],
     envioFalha: false,
     relogio: TARDE,
   };
@@ -97,6 +100,7 @@ function db(): AvisoDeAgendamentoDb {
       organization_id: ORG,
       appointment_id: null,
       evento: null,
+      alvo: "numero" as const,
       destino: "+5531999998888",
       status: "pendente",
       tentativas: 0,
@@ -194,6 +198,7 @@ function deps(agora: Date, origem: "worker" | "request" = "worker"): AvisoDeAgen
     origemDoDreno: () => origem,
     audita: (a) => {
       mundo.auditadas.push(a.action);
+      mundo.auditMeta.push(a.metadata);
     },
   };
 }
@@ -433,6 +438,7 @@ describe("aviso também no grupo do WhatsApp", () => {
       expect(segunda.status).toBe("skipped");
       expect(mundo.para).toHaveLength(2);
       expect([...mundo.entregas.values()].map((e) => e.alvo)).toEqual(["numero", "grupo"]);
+      expect(mundo.auditMeta.map((m) => m.alvo)).toEqual(["numero", "grupo"]);
     },
   );
 
@@ -516,6 +522,9 @@ describe("aviso também no grupo do WhatsApp", () => {
     expect(r.status).toBe("ok");
     expect(r.detail).toContain("grupo:falhou:destino_invalido");
     expect(mundo.para).toEqual([NUMERO]);
+    // A falha do grupo se distingue da do número no registro.
+    expect(mundo.auditadas).toEqual(["agenda.aviso_whatsapp_enviado", "agenda.aviso_whatsapp_falhou"]);
+    expect(mundo.auditMeta.map((m) => m.alvo)).toEqual(["numero", "grupo"]);
   });
 
   it("leitura que lança no caminho do grupo vira retry do grupo, nunca `error`", async () => {
