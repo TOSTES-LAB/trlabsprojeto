@@ -242,9 +242,10 @@ export function useConversationsRealtime(
    * `aplicarAtualizacaoNaLista` resolve o caso comum — `UPDATE` de uma conversa
    * que está na tela — mesclando a linha no lugar, sem rede e sem estado de
    * carregamento. Ele devolve `false` só quando a resposta não está no evento:
-   * conversa nova, conversa fora da lista (pode ter entrado no filtro), lista
-   * ainda sem dado, ou filtro que depende do join do contato (busca/etiqueta).
-   * Aí a recarga agrupada continua, como antes.
+   * conversa nova, conversa fora da lista (pode ter entrado no filtro), evento
+   * que muda a POSIÇÃO da linha (reordenar é da rota), lista ainda sem dado, ou
+   * filtro que depende do join do contato (busca/etiqueta). Aí a recarga
+   * agrupada continua, como antes.
    */
   const onChange = useCallback(
     (payload: unknown) => {
