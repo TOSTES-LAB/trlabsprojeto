@@ -100,7 +100,9 @@ describe("updatePlatformTheme", () => {
   });
 
   it("entrada que não é texto nem null não vira consulta ao banco", async () => {
-    for (const entrada of [42, { id: INSTALACAO }, "", "x".repeat(201)]) {
+    // `undefined` incluso de propósito: só `null` significa "Nenhum", e um
+    // payload sem o campo não pode apagar a escolha da instalação.
+    for (const entrada of [42, { id: INSTALACAO }, "", "x".repeat(201), undefined]) {
       expect((await updatePlatformTheme(entrada)).ok).toBe(false);
     }
     expect(mocks.conferirTemaDaPlataforma).not.toHaveBeenCalled();

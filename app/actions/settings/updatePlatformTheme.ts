@@ -61,14 +61,10 @@ export async function updatePlatformTheme(input: unknown): Promise<UpdatePlatfor
     return { ok: false, error: "Saia do acompanhamento administrativo antes de mudar a marca." };
   }
 
-  // `null` é escolha legítima ("Nenhum"); qualquer outra coisa fora de texto
-  // curto é payload inválido, e não vira consulta.
-  const parsed = z
-    .string()
-    .min(1)
-    .max(200)
-    .nullable()
-    .safeParse(input ?? null);
+  // `null` é escolha legítima ("Nenhum") e APAGA a linha; por isso `undefined`
+  // NÃO cai em "Nenhum": um payload que nem trouxe o campo não pode desligar o
+  // tema de uma instalação. `undefined` é payload inválido, e não vira consulta.
+  const parsed = z.union([z.string().min(1).max(200), z.null()]).safeParse(input);
   if (!parsed.success)
     return { ok: false, error: "Escolha um tema da lista de extensões instaladas." };
   const escolhido = parsed.data;
