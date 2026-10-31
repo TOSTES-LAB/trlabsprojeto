@@ -1,5 +1,5 @@
 ---
-impacto: sem_acao
+impacto: nada_mudou
 secao: corrigido
 titulo: A lista do Inbox não pisca mais quando uma automação atualiza a conversa
 ---

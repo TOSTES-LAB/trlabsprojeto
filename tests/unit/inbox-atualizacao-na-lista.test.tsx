@@ -98,9 +98,15 @@ vi.mock("@/lib/api/client", () => ({
   },
 }));
 
+/**
+ * Só o TIPO vem estaticamente (é apagado na compilação, não atrapalha o
+ * `vi.mock`): o hook em si é importado depois dos dublês, para o módulo já
+ * enxergar os mocks.
+ */
+import type { ConversationsFilters } from "@/hooks/inbox/useConversationsRealtime";
+
 const { ConversationList } = await import("@/components/inbox/ConversationList");
 const { useConversationsRealtime } = await import("@/hooks/inbox/useConversationsRealtime");
-type ConversationsFilters = import("@/hooks/inbox/useConversationsRealtime").ConversationsFilters;
 
 /** Uma linha de resposta, com os campos que a linha da lista lê. */
 function conversa(id: string, extras: Record<string, unknown> = {}) {
