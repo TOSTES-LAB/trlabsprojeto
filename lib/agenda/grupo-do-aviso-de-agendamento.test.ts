@@ -7,6 +7,7 @@ import { confereGrupoDaConexao } from "./grupo-do-aviso-de-agendamento";
 
 const ORG = "11111111-1111-4111-8111-111111111111";
 const CONEXAO = "22222222-2222-4222-8222-222222222222";
+const OUTRA_CONEXAO = "33333333-3333-4333-8333-333333333333";
 const DA_CONEXAO = "120363000000000001@g.us";
 const DE_OUTRO_NUMERO = "120363000000000002@g.us";
 const QUE_O_NUMERO_SAIU = "120363000000000003@g.us";
@@ -33,7 +34,7 @@ function deps(opts: { canalFora?: boolean } = {}): DepsDeGrupos {
   };
 }
 
-const base = { organizationId: ORG, channelSessionId: CONEXAO, grupoAtual: null };
+const base = { organizationId: ORG, channelSessionId: CONEXAO, grupoAtual: null, conexaoAtual: null };
 
 describe("confereGrupoDaConexao", () => {
   it("aceita um grupo em que o número da conexão está", async () => {
@@ -50,10 +51,28 @@ describe("confereGrupoDaConexao", () => {
 
   it("o grupo já salvo passa sem perguntar ao canal", async () => {
     const d = deps({ canalFora: true });
-    expect(await confereGrupoDaConexao(d, { ...base, grupo: QUE_O_NUMERO_SAIU, grupoAtual: QUE_O_NUMERO_SAIU })).toBe(
-      "ok",
-    );
+    expect(
+      await confereGrupoDaConexao(d, {
+        ...base,
+        grupo: QUE_O_NUMERO_SAIU,
+        grupoAtual: QUE_O_NUMERO_SAIU,
+        conexaoAtual: CONEXAO,
+      }),
+    ).toBe("ok");
     expect(d.listGroups).not.toHaveBeenCalled();
+  });
+
+  it("o mesmo grupo com OUTRA conexão consulta a lista da conexão nova", async () => {
+    const d = deps();
+    expect(
+      await confereGrupoDaConexao(d, {
+        ...base,
+        grupo: QUE_O_NUMERO_SAIU,
+        grupoAtual: QUE_O_NUMERO_SAIU,
+        conexaoAtual: OUTRA_CONEXAO,
+      }),
+    ).toBe("fora_da_conexao");
+    expect(d.listGroups).toHaveBeenCalled();
   });
 
   it("canal que não responde nunca vira `ok`", async () => {

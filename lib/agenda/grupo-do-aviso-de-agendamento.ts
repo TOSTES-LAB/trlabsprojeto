@@ -6,8 +6,10 @@
  * Esta conferência mora na rota, antes do RPC, e pergunta ao mesmo serviço que
  * a tela usa para listar os grupos (`listarGruposDoNumero`), com a mesma régua
  * da tela: vale o grupo em que o número está (`presente`), e o grupo já salvo
- * passa sem nova pergunta — salvar outro campo não pode exigir que o número
- * continue num grupo de que saiu; isso o envio trata, só para o grupo.
+ * NA MESMA CONEXÃO passa sem nova pergunta — salvar outro campo não pode exigir
+ * que o número continue num grupo de que saiu; isso o envio trata, só para o
+ * grupo. Trocou a conexão, o mesmo grupo é pergunta nova: ele foi conferido
+ * contra o número de antes, não contra o que vai enviar.
  *
  * Canal que não responde vira `sem_resposta`, nunca `ok`: gravar um grupo novo
  * sem conferir é o que esta peça existe para impedir.
@@ -18,10 +20,17 @@ export type ConferenciaDoGrupo = "ok" | "fora_da_conexao" | "sem_resposta";
 
 export async function confereGrupoDaConexao(
   deps: DepsDeGrupos,
-  e: { organizationId: string; channelSessionId: string | null; grupo: string; grupoAtual: string | null },
+  e: {
+    organizationId: string;
+    channelSessionId: string | null;
+    grupo: string;
+    grupoAtual: string | null;
+    /** A conexão que enviava quando `grupoAtual` foi salvo. */
+    conexaoAtual: string | null;
+  },
 ): Promise<ConferenciaDoGrupo> {
-  if (e.grupo === e.grupoAtual) return "ok";
   if (!e.channelSessionId) return "fora_da_conexao";
+  if (e.grupo === e.grupoAtual && e.channelSessionId === e.conexaoAtual) return "ok";
   try {
     const grupos = await listarGruposDoNumero(deps, {
       organizationId: e.organizationId,

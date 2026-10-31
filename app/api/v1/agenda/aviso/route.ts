@@ -166,6 +166,13 @@ export async function PUT(req: NextRequest): Promise<Response> {
       channelSessionId: conexao,
       grupo: dados.grupo,
       grupoAtual: antes.config?.grupo ?? null,
+      // A conexão EFETIVA de quando o grupo foi salvo: com o número do aviso
+      // de caso, é a conexão dele, não a coluna (que fica nula).
+      conexaoAtual: antes.config
+        ? antes.config.usa_numero_do_aviso_de_caso
+          ? (antes.aviso_de_caso?.channel_session_id ?? null)
+          : antes.config.channel_session_id
+        : null,
     });
     if (conferencia === "fora_da_conexao") {
       const recusa = RECUSAS_DO_RPC.aviso_de_agendamento_grupo_invalido;
