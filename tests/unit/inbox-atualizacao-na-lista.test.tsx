@@ -266,6 +266,28 @@ describe("a automação atualiza a conversa sem refazer a busca da lista (#2366)
     expect(esqueleto()).toBe(0);
   });
 
+  it("o que muda a ORDEM da lista continua pedindo o servidor (a conversa que recebeu sobe)", async () => {
+    montar({ status: "open" });
+    await entregar(0, [conversa("c1"), conversa("c2")]);
+    await waitFor(() => expect(screen.getByText(/^c2\|/)).toBeInTheDocument());
+
+    // Mensagem nova numa conversa que já estava na lista: `last_message_at` muda,
+    // e com ele a POSIÇÃO. Quem sabe reordenar (e desempatar por `id`) é a rota.
+    await entregarEvento(
+      evento("UPDATE", {
+        id: "c2",
+        status: "open",
+        last_message_at: "2026-10-31T18:00:00.000Z",
+        last_message_preview: "mensagem nova",
+        tags: [],
+      }),
+    );
+    await waitFor(() => expect(chamadas).toHaveLength(2), { timeout: 3000 });
+
+    await entregar(1, [conversa("c2", { last_message_preview: "mensagem nova" }), conversa("c1")]);
+    await waitFor(() => expect(linhas()[0]).toMatch(/^c2\|/));
+  });
+
   it("rajada de eventos da mesma conversa não multiplica busca", async () => {
     montar({ status: "open" });
     await entregar(0, [conversa("c1")]);

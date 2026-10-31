@@ -37,7 +37,10 @@ import { marcadoresEscolhidos } from "@/lib/inbox/marcador-da-conversa";
  *    `julgarAtualizacao` — a mesma régua de campos que o filtro pede ao banco;
  *  - filtro que o evento não consegue responder (busca livre, etiqueta do
  *    CONTATO): `indecidivel`, e a decisão volta para a recarga. Chutar "fica"
- *    aqui seria a tela afirmando um estado que não é o do servidor.
+ *    aqui seria a tela afirmando um estado que não é o do servidor;
+ *  - evento que muda a POSIÇÃO da linha (`CAMPOS_DA_ORDEM`): a lista é ordenada
+ *    no servidor, e a conversa que acabou de receber mensagem tem de subir para
+ *    o topo — mesclar no lugar a deixaria com o texto novo na posição velha.
  *
  * ─── O que o evento NÃO traz, e por isso não pode apagar ────────────────────
  * `contacts`, `channel_sessions` e `assigned_to_user_name` não são colunas de
@@ -56,6 +59,40 @@ type ListaEmCache = InfiniteData<PaginaDaLista>;
 
 /** Campos que a ROTA resolve e o evento de `conversations` não carrega. */
 const RESOLVIDOS_NA_ROTA = new Set(["contacts", "channel_sessions", "assigned_to_user_name"]);
+
+/**
+ * OS CAMPOS QUE DÃO A POSIÇÃO DE CADA LINHA — e que, por isso, a mescla NÃO
+ * pode assumir que "fica onde estava".
+ *
+ * A lista é ordenada no servidor: por `last_message_at` desc fora da Fila, e por
+ * `awaiting_since` asc na Fila (`ORDEM_DA_ESPERA`). Quando um destes muda, a
+ * linha pode ter de ANDAR — e é exatamente o que a tela precisa mostrar: a
+ * conversa que acabou de receber mensagem vai para o topo (é o que o e2e
+ * `inbox-tempo-real` assere no PRIMEIRO item, e o que a pílula "Aguardando há…"
+ * promete). Mesclar no lugar deixaria a conversa com o texto novo na posição
+ * velha — uma lista plausível e desordenada, que é pior que a piscada.
+ *
+ * Quem sabe reordenar (com o desempate por `id` e a paginação por cursor) é o
+ * servidor: mudou a ordem, o evento vira recarga.
+ */
+const CAMPOS_DA_ORDEM = [
+  "last_message_at",
+  "awaiting_since",
+  "last_inbound_at",
+  "last_outbound_at",
+] as const;
+
+/** A atualização muda onde a linha deveria estar? */
+export function mudouAOrdem(
+  anterior: ConversationWithContact,
+  atualizacao: Record<string, unknown>,
+): boolean {
+  return CAMPOS_DA_ORDEM.some((campo) => {
+    const valor = atualizacao[campo];
+    if (valor === undefined) return false;
+    return valor !== (anterior as unknown as Record<string, unknown>)[campo];
+  });
+}
 
 /**
  * A linha de `conversations` que um evento do Realtime entrega — só para
@@ -229,6 +266,8 @@ export function aplicarAtualizacaoNaLista(
   const ativa = qc.getQueryData<ListaEmCache>(chaveAtiva);
   const naAtiva = ativa?.pages.flatMap((p) => p.data).find((c) => c.id === id);
   if (!naAtiva) return false;
+  // A posição da linha mudou: reordenar é do servidor (ver `CAMPOS_DA_ORDEM`).
+  if (mudouAOrdem(naAtiva, atualizacao)) return false;
   if (julgarAtualizacao(naAtiva, atualizacao, filtrosAtivos) === "indecidivel") return false;
 
   qc.setQueryData<ListaEmCache>(chaveAtiva, (listas) =>
