@@ -7,6 +7,7 @@ import { toast } from "sonner";
 import { updatePlatformTheme } from "@/app/actions/settings/updatePlatformTheme";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
+import { Label } from "@/components/ui/label";
 import {
   Select,
   SelectContent,
@@ -83,9 +84,7 @@ export function TemaDaPlataforma({
           </p>
         ) : (
           <div className="space-y-2">
-            <label htmlFor="tema-da-plataforma-escolha" className="text-sm font-medium">
-              {t("Tema")}
-            </label>
+            <Label htmlFor="tema-da-plataforma-escolha">{t("Tema")}</Label>
             <Select value={valor} onValueChange={setValor} disabled={isPending}>
               <SelectTrigger
                 id="tema-da-plataforma-escolha"
