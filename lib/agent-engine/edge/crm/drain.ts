@@ -9,7 +9,8 @@
  *     (organization_id, source_event_id) em job_queue com captura de 23505;
  *   - coalescência de rajada: mensagens do MESMO contato dentro da janela de
  *     debounce viram UM job (o turno lê o histórico completo e responde a todas);
- *   - grupos @g.us: skip (regra dura nº 12) — evento marcado done sem job;
+ *   - grupos @g.us: skip (regra dura nº 12), exceto quando a chave POR GRUPO
+ *     `ia_responde` liberou a IA (#2729) — evento marcado done sem job;
  *   - eventos 'processing' órfãos (crash do worker) voltam a 'pending' por timeout.
  */
 import { z } from 'zod';
@@ -19,6 +20,7 @@ import { loadConversationAgentConfig } from '../../agent/agent-config';
 import { insertInboxItem } from '../../db/repository';
 import type { Logger } from '../../obs/logger';
 import { enqueueJob } from '../../queue/queue';
+import { janelaDeRespostaAberta, soltarAdiadoPelaJanela } from '../../pacing/adiados-da-janela';
 import { decidirRajada, debounceEfetivo } from './debounce';
 import { avisoDeEventoMorto, IA_QUE_NAO_RESPONDEU } from '@/lib/event-log/aviso-de-evento-morto';
 import { canalDesativado } from '@/lib/channels/desativado';
@@ -26,6 +28,7 @@ import { TIPOS_DERIVAVEIS, DERIVACAO_TERMINADA } from '@/lib/messaging/media/der
 import { haQuemAtendaASessao } from '@/lib/ai/agents/quem-atende-a-sessao';
 import { decidirElegibilidadeDaConversa } from '@/lib/ai/elegibilidade/consulta-pg';
 import { deveCederTurnoAoRetorno } from '@/lib/followup/ceder-turno-ao-retorno';
+import { grupoLiberaIa } from '@/lib/grupos/ia-no-grupo';
 import { ehOperante } from '@/lib/organizacao/operante';
 
 const DRAIN_CONSUMER = 'agent-engine';
@@ -61,6 +64,14 @@ export interface DrainKnobs {
    * testes que não exercitam o gate — o default de 21 dias em ms é aplicado.
    */
   allowlistTtlMs?: number;
+  /**
+   * Relógio da janela de RESPOSTA (#3383). Só é usado na pergunta "a janela
+   * está aberta AGORA?" que o drain faz quando achar um job adiado esperando
+   * carona — e é justamente aí que o teste precisa fixar a hora (22h11 para a
+   * janela 7h–22h fechada) sem depender do relógio de parede do runner.
+   * Ausente = `new Date()`.
+   */
+  clock?: () => Date;
 }
 
 /** Default de `allowlistTtlMs` (21 dias) para testes que omitem o knob. */
@@ -68,7 +79,9 @@ const ALLOWLIST_TTL_MS_PADRAO = 21 * 24 * 60 * 60 * 1000;
 
 /** Um tick do drain: claima um lote de eventos e os transforma em jobs. */
 export async function drainTick(pool: pg.Pool, knobs: DrainKnobs, log: Logger): Promise<number> {
-  // Reaper de eventos órfãos — barato (update indexado), roda a cada tick.
+  // Reaper de eventos órfãos, a cada tick. Quem o serve é o parcial
+  // `event_log_processing_por_tipo_idx` (event_type where status='processing',
+  // migration 0585); o `= any(consumed_by)` é filtro e não usa o GIN.
   await pool.query(
     `update event_log set status = 'pending', updated_at = now()
      where event_type = 'ai_agent.dispatch_requested'
@@ -290,14 +303,35 @@ async function processEvent(
     }
   }
 
-  // Grupos: skip, sem exceção (regra dura nº 12).
-  const { rows: convRows } = await pool.query<{ is_group: boolean }>(
-    'select is_group from conversations where organization_id = $1 and id = $2',
+  // Grupos: skip, com UMA exceção estreita (regra dura nº 12 + #2729) — o
+  // evento marcado done sem job continua sendo o padrão de 100% das
+  // instalações.
+  // A consulta já traz a chave POR GRUPO (`channel_session_groups.ia_responde`)
+  // junto do `is_group`, por um LEFT JOIN no MESMO select: é a leitura que o
+  // ingest do grupo também faz, e a régua que decide é a MESMA função
+  // (`grupoLiberaIa`, `=== true`, falha fechada) — divergência entre as duas
+  // leituras é como a régua local do worker já passou a discordar da tela em
+  // produção (ver `pos-entrada.ts`). Conversa sem linha na fila (LEFT JOIN sem
+  // par) chega com `ia_responde` nulo, que é "não sei se liberaram" — e não sei
+  // não responde.
+  const { rows: convRows } = await pool.query<{ is_group: boolean; ia_responde: boolean | null }>(
+    `select c.is_group, g.ia_responde
+       from conversations c
+       left join channel_session_groups g
+         on g.organization_id = c.organization_id
+        and g.channel_session_id = c.channel_session_id
+        and g.group_chat_id = c.group_chat_id
+      where c.organization_id = $1 and c.id = $2`,
     [event.organization_id, p.conversation_id],
   );
   if (convRows[0]?.is_group !== false) {
-    log.info('drain: conversa de grupo ou inexistente — evento pulado', { event_id: event.id });
-    return 'processado';
+    if (!grupoLiberaIa(convRows[0]?.ia_responde)) {
+      log.info('drain: conversa de grupo sem a chave da IA liberada — evento pulado', { event_id: event.id });
+      return 'processado';
+    }
+    log.info('drain: grupo liberado pela chave por grupo (#2729) — turno segue o caminho normal', {
+      event_id: event.id,
+    });
   }
 
   // Ninguém para atender: NÃO gastar. Sem agente publicado para esta sessão e
@@ -512,6 +546,16 @@ async function processEvent(
     pool,
     { organizationId: event.organization_id, contactId: p.contact_id },
     await debounceDoEvento(pool, event, p, knobs.debounceMs, log),
+    Date.now(),
+    // Só é chamada quando o candidato à carona está adiado pela janela (#3383),
+    // uma consulta por mensagem nesse caso — nenhum custo no caminho comum.
+    () =>
+      janelaDeRespostaAberta(pool, {
+        organizationId: event.organization_id,
+        channelSessionId: p.channel_session_id,
+        agora: knobs.clock?.() ?? new Date(),
+        log,
+      }),
   );
   if (rajada.tipo === 'coalescido') {
     log.info('drain: rajada coalescida em job pendente', {
@@ -519,6 +563,31 @@ async function processEvent(
       job_id: rajada.jobId,
     });
     return 'processado';
+  }
+  // #3383 — a janela JÁ ABRIU e este job ainda dormia até o horário antigo:
+  // ele não recebe a mensagem de carona (acima) e não continua adiado. O MESMO
+  // job acorda (`run_after = now()`), sem inserir nada — o turno dele roda uma
+  // vez, e a mensagem nova enfileira o próprio job logo abaixo.
+  //
+  // Falhar aqui NÃO derruba o evento: a mensagem nova continua sendo
+  // enfileirada e respondida; o adiado fica para o próximo acordamento (ou
+  // para a abertura calculada), com o warn dizendo o que não aconteceu.
+  if (rajada.caronaRecusadaEm !== undefined) {
+    let acordado = false;
+    try {
+      acordado = await soltarAdiadoPelaJanela(pool, rajada.caronaRecusadaEm);
+    } catch (err) {
+      log.warn('drain: não consegui acordar o job adiado com a janela aberta', {
+        event_id: event.id,
+        job_id: rajada.caronaRecusadaEm,
+        error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
+      });
+    }
+    log.info('drain: job adiado pela janela não recebe carona — mensagem enfileirada à parte', {
+      event_id: event.id,
+      job_id: rajada.caronaRecusadaEm,
+      acordado,
+    });
   }
 
   const runAfter = rajada.runAfter;
@@ -539,6 +608,66 @@ async function processEvent(
   return 'processado';
 }
 
+/**
+ * Quantos ciclos OCIOSOS sem um tick CONCLUÍDO contam como "laço parado"
+ * (issue #2505).
+ *
+ * O default da instalação é `idle = 15s`, então 20 ciclos = **5 minutos**. A
+ * folga é dupla de propósito: o carimbo é do FIM do tick (um tick de lote cheio
+ * demora mais que o intervalo) e o custo de um falso positivo é um `/healthz`
+ * vermelho, que o operador investiga — contra o custo do falso negativo, que
+ * foi o do caso real: DOIS DIAS de laço travado com o worker dizendo `ok`
+ * (#2501), enquanto as mensagens se acumulavam com `attempts=0`.
+ */
+export const TICKS_PARA_PARADO = 20;
+
+/**
+ * O carimbo de vida do laço, lido de FORA dele (hoje: o `/healthz` do worker).
+ *
+ * `ultimoTickEm = null` significa "o laço ainda não começou" — não é parado,
+ * é um worker que acabou de subir; quem nunca deu a primeira volta não pode
+ * ser acusado de ter parado. `limiteMs` nasce do `idleIntervalMs` DA INSTALAÇÃO
+ * quando o laço começa, então um `.env` com intervalo maior ganha o mesmo
+ * número de ciclos de folga, não o mesmo relógio.
+ */
+interface VigilanciaDoDrain {
+  ultimoTickEm: number | null;
+  limiteMs: number | null;
+}
+const vigilancia: VigilanciaDoDrain = { ultimoTickEm: null, limiteMs: null };
+
+/** Resposta do `/healthz` sobre o laço do drain — nomes para a máquina. */
+export interface ProntidaoDoDrainDaIa {
+  /** Há quanto tempo o último tick concluiu; `null` = o laço não começou. */
+  ultimo_tick_ha_ms: number | null;
+  /** Limite em vigor (idle da instalação × `TICKS_PARA_PARADO`); `null` antes de começar. */
+  limite_ms: number | null;
+  /** `true` quando o carimbo passou do limite — o laço travou NO MEIO de um tick. */
+  parado: boolean;
+}
+
+/**
+ * Estado do laço para quem pergunta de fora. Nunca lança: o `/healthz` não pode
+ * ser o motivo de o worker cair — quem está degradado não ganha o direito de
+ * derrubar o resto.
+ *
+ * `agoraMs` é injetável para o teste medir o LIMITE sem esperar o relógio.
+ */
+export function prontidaoDoDrainDaIa(agoraMs: number = Date.now()): ProntidaoDoDrainDaIa {
+  const { ultimoTickEm, limiteMs } = vigilancia;
+  if (ultimoTickEm === null || limiteMs === null) {
+    return { ultimo_tick_ha_ms: null, limite_ms: limiteMs, parado: false };
+  }
+  const ha = Math.max(0, agoraMs - ultimoTickEm);
+  return { ultimo_tick_ha_ms: ha, limite_ms: limiteMs, parado: ha > limiteMs };
+}
+
+/** Só para teste: volta ao estado de "o laço ainda não começou". */
+export function _reiniciarVigilanciaDoDrain(): void {
+  vigilancia.ultimoTickEm = null;
+  vigilancia.limiteMs = null;
+}
+
 /** Loop do drain — polling com backoff adaptativo (ocioso = tick mais lento). */
 export async function runDrainLoop(
   pool: pg.Pool,
@@ -546,6 +675,11 @@ export async function runDrainLoop(
   log: Logger,
   signal: AbortSignal,
 ): Promise<void> {
+  // O carimbo de vida (#2505): o limite nasce do intervalo ocioso DA INSTALAÇÃO
+  // e o carimbo é gravado quando o laço começa e ao FIM de cada volta — um tick
+  // que travar deixa o carimbo envelhecer, e é isso que o `/healthz` lê.
+  vigilancia.limiteMs = knobs.idleIntervalMs * TICKS_PARA_PARADO;
+  vigilancia.ultimoTickEm = Date.now();
   while (!signal.aborted) {
     let drained = 0;
     try {
@@ -555,6 +689,8 @@ export async function runDrainLoop(
         error: (err instanceof Error ? err.message : String(err)).slice(0, 300),
       });
     }
+    // O laço DEU A VOLTA — sucesso e erro capturado são a mesma prova de vida.
+    vigilancia.ultimoTickEm = Date.now();
     if (signal.aborted) break;
     // Lote CHEIO é sinal de backlog: há mais evento esperando do que caberia no
     // lote, e pagar o intervalo antes de voltar só empurra a fila para frente.
