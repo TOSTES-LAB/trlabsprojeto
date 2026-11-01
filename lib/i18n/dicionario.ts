@@ -6197,6 +6197,32 @@ export const DICIONARIO: Traducoes = {
     es: "Cada valor CSS puede tener un máximo de 256 caracteres.",
   },
   "Informe ao menos uma regra CSS.": { es: "Indica al menos una regla CSS." },
+  "Tema da plataforma": { es: "Tema de la plataforma" },
+  "A paleta de superfícies, bordas e textos do login, do admin e das organizações que não escolheram tema. A cor de ação continua vindo da Marca.":
+    {
+      es: "La paleta de superficies, bordes y textos del inicio de sesión, del panel de administración y de las organizaciones que no eligieron tema. El color de acción sigue viniendo de Marca.",
+    },
+  "Nenhuma extensão instalada oferece um tema. Instale uma extensão com tema para poder escolher.":
+    {
+      es: "Ninguna extensión instalada ofrece un tema. Instala una extensión con tema para poder elegir.",
+    },
+  "Tema": { es: "Tema" },
+  "Vale para quem não tem tema próprio: dentro de uma organização com tema escolhido, a paleta dela é que manda.":
+    {
+      es: "Rige para quien no tiene tema propio: dentro de una organización con tema elegido, manda su paleta.",
+    },
+  "Salvar tema": { es: "Guardar tema" },
+  "Tema da plataforma salvo.": { es: "Tema de la plataforma guardado." },
+  "Escolha um tema da lista de extensões instaladas.":
+    { es: "Elige un tema de la lista de extensiones instaladas." },
+  "Não foi possível conferir a extensão agora. Tente de novo.":
+    { es: "No fue posible verificar la extensión ahora. Inténtalo de nuevo." },
+  "Essa extensão não está mais instalada nesta instalação.":
+    { es: "Esa extensión ya no está instalada en esta instalación." },
+  "A extensão escolhida não oferece um tema válido.":
+    { es: "La extensión elegida no ofrece un tema válido." },
+  "Não foi possível gravar o tema no banco da instalação.":
+    { es: "No se pudo guardar el tema en la base de datos de la instalación." },
   "Sua cor": { es: "Tu color" },
   "fora da escala — fica só no logo": { es: "fuera de la escala: solo se usa en el logo" },
   "Botões no modo claro": { es: "Botones en el modo claro" },
@@ -14457,6 +14483,14 @@ export const DICIONARIO: Traducoes = {
   "Compacta": { es: "Compacta" },
   "Cards compactos": { es: "Tarjetas compactas" },
   "Mostrar descrição nos cards": { es: "Mostrar descripción en las tarjetas" },
+  "Paleta da extensão": { es: "Paleta de la extensión" },
+  "Nenhuma (padrão do produto)": { es: "Ninguna (predeterminado del producto)" },
+  "Pinta o produto com as cores desta extensão, só nesta organização.": { es: "Pinta el producto con los colores de esta extensión, solo en esta organización." },
+  "Sálvia": { es: "Salvia" },
+  "Argila": { es: "Arcilla" },
+  "Névoa": { es: "Niebla" },
+  "Ameixa": { es: "Ciruela" },
+  "Oliva": { es: "Oliva" },
   "Abrir guia": { es: "Abrir guía" },
   "Ative para abrir o guia.": { es: "Actívala para abrir la guía." },
   "Salvar configuração": { es: "Guardar configuración" },
