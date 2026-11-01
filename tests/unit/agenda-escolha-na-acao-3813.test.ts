@@ -78,8 +78,16 @@ vi.mock("@/lib/escalacao/assunto-comercial", () => ({
 import { getAction } from "@/lib/automation/actions";
 import "@/lib/automation/actions/send-whatsapp";
 import "@/lib/automation/actions/send-ai-message";
-import { MOTIVO_DO_PULO } from "@/lib/agenda/escolha-no-envio";
 import type { ActionCtx, ActionResultDetail } from "@/lib/automation/types";
+
+/**
+ * O motivo é literal de propósito: este arquivo mede o COMPORTAMENTO da ação
+ * (a mensagem sai, o pulo é registrado), não o vocabulário — que tem os casos
+ * dele no arquivo da decisão pura. Com a constante escrita aqui, o teste
+ * também roda na `main` e falha pelo motivo certo (a ação adia), em vez de
+ * morrer no import de um módulo que ainda não existe lá.
+ */
+const MOTIVO_DO_PULO = "compromisso_na_agenda";
 
 const ORG = "11111111-1111-4111-8111-111111111111";
 const CANAL = "22222222-2222-4222-8222-222222222222";
