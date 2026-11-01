@@ -1,3 +1,4 @@
+// @vitest-environment jsdom
 /**
  * A barra de rolagem segue o TEMA — e não um neutro fixo.
  *
@@ -29,7 +30,12 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { PALETTES, type PaletteDef } from "@/app/design/lib/tokens";
-import { CHAVES_DE_TOKEN_DO_TEMA, PALETAS_DE_TEMA } from "@/lib/extensions/tema";
+import {
+  CHAVES_DE_TOKEN_DO_TEMA,
+  cssDaExtensaoDeTema,
+  ESCOPO_DO_TEMA_DA_ORGANIZACAO,
+  PALETAS_DE_TEMA,
+} from "@/lib/extensions/tema";
 
 const CSS = readFileSync(join(__dirname, "..", "..", "app", "globals.css"), "utf8");
 
@@ -184,6 +190,63 @@ describe("o token escolhido existe onde a extensão pode declará-lo", () => {
           `paleta \`${nome}\` (${tema}): borda e fundo em ${razao.toFixed(2)}:1`,
         ).toBeGreaterThanOrEqual(1.15);
       }
+    }
+  });
+});
+
+/**
+ * A barra da PÁGINA não é a barra de uma área interna: o navegador a pinta com
+ * o `scrollbar-color` do `<html>`, e o `<html>` não herda do `<body>`. Medido
+ * na prova de tela do #3800 (mist ativo): as áreas internas seguiam a borda do
+ * tema e a barra da viewport ficava no `#e7e3da`/`#33312a` da paleta padrão,
+ * porque o tema só era declarado em `body:has([data-tema-extensao])`.
+ */
+describe("o tema da organização alcança o `<html>`, onde mora a barra da página", () => {
+  const BORDA = { claro: "#dddbd3", escuro: "#2c2b27" } as const;
+
+  function montar(tema: "light" | "dark", comMarcador: boolean): void {
+    document.head.innerHTML = "";
+    document.body.innerHTML = "";
+    document.documentElement.setAttribute("data-theme", tema);
+    const padrao = document.createElement("style");
+    padrao.textContent =
+      ':root { --color-border: #e7e3da; } [data-theme="dark"] { --color-border: #33312a; }';
+    document.head.appendChild(padrao);
+    if (!comMarcador) return;
+    const { css } = cssDaExtensaoDeTema({
+      palette: "mist",
+      claro: { "--color-border": BORDA.claro },
+      escuro: { "--color-border": BORDA.escuro },
+    });
+    expect(css).not.toBeNull();
+    const marcador = document.createElement("div");
+    marcador.setAttribute("data-tema-extensao", "");
+    const estilo = document.createElement("style");
+    estilo.textContent = css!;
+    marcador.appendChild(estilo);
+    document.body.appendChild(marcador);
+  }
+
+  const bordaDoHtml = (): string =>
+    getComputedStyle(document.documentElement).getPropertyValue("--color-border").trim();
+
+  it("com o tema escolhido, o `<html>` lê a borda do tema no claro e no escuro", () => {
+    montar("light", true);
+    expect(bordaDoHtml()).toBe(BORDA.claro);
+    montar("dark", true);
+    expect(bordaDoHtml()).toBe(BORDA.escuro);
+  });
+
+  it("sem o marcador, o `<html>` fica no padrão do produto (quem não escolheu não muda)", () => {
+    montar("light", false);
+    expect(bordaDoHtml()).toBe("#e7e3da");
+    montar("dark", false);
+    expect(bordaDoHtml()).toBe("#33312a");
+  });
+
+  it("o `<body>` segue no escopo: é ele que dá a precedência sobre um tema do `<html>`", () => {
+    for (const [seletor] of ESCOPO_DO_TEMA_DA_ORGANIZACAO) {
+      expect(seletor).toMatch(/body:has\(\[data-tema-extensao\]\)/);
     }
   });
 });
