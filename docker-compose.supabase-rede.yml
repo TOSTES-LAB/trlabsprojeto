@@ -19,6 +19,10 @@ services:
     networks: [supabase]
   scheduler:
     networks: [supabase]
+  # Opcional (perfil `telefonia`): também lê o banco pelo .env. O perfil vem do
+  # compose principal; aqui só soma a rede.
+  voice-agent:
+    networks: [supabase]
 
 networks:
   supabase:

@@ -123,7 +123,9 @@ rede_do_supabase_ok() {
 pg_container() {
   local -a rede=() ca=()
   local caminho=""
-  [ -n "${PSQL_DOCKER_NETWORK:-}" ] && rede=(--network "$PSQL_DOCKER_NETWORK")
+  # Gêmea de _common.sh: sem PSQL_DOCKER_NETWORK, vale a rede do Supabase do mesmo host.
+  if [ -n "${PSQL_DOCKER_NETWORK:-}" ]; then rede=(--network "$PSQL_DOCKER_NETWORK")
+  elif rede_do_supabase_ok; then rede=(--network "$SUPABASE_DOCKER_NETWORK"); fi
   # `local caminho` separado de propósito: `local caminho="$(...)"` engole o
   # status do comando substituído e o `if` aceitaria CA quebrada como pronta.
   if caminho="$(ca_do_supabase 2>/dev/null)"; then

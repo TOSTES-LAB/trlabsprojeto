@@ -15,7 +15,10 @@
 #   3. Com a variável mas a rede inexistente, o overlay NÃO entra (uma rede
 #      `external` ausente derrubaria o `up` inteiro).
 #   4. O install.sh (gêmeo, roda antes do clone) anda junto com o _common.sh.
-#   5. O overlay liga app, worker e scheduler a uma rede externa.
+#   5. O overlay liga app, worker, scheduler e voice-agent a uma rede externa.
+#   6. pg_container (psql/pg_dump do kit) usa a mesma rede quando
+#      PSQL_DOCKER_NETWORK está vazia — e PSQL_DOCKER_NETWORK, quando existe, vence.
+#   7. Chave declarada com a rede ausente avisa; sem a chave, silêncio.
 #
 # `docker` é um dublê: registra os argumentos e só reconhece a rede em REDES_OK.
 set -uo pipefail
@@ -82,11 +85,34 @@ check "install.sh leva o overlay em dc_files()" grep -q "supabase-rede.yml\"$" "
 echo "── 5. docker-compose.supabase-rede.yml"
 OVERLAY="$REPO_ROOT/docker-compose.supabase-rede.yml"
 check "o arquivo existe na raiz" test -f "$OVERLAY"
-for svc in app worker scheduler; do
+for svc in app worker scheduler voice-agent; do
   check "liga o serviço $svc" grep -q "^  $svc:" "$OVERLAY"
 done
 check "a rede é externa" grep -q "external: true" "$OVERLAY"
 check "o nome vem da variável" grep -q "name: \${SUPABASE_DOCKER_NETWORK}" "$OVERLAY"
+
+echo "── 6. pg_container: a rede do Supabase serve também ao psql do kit"
+roda_kit SUPABASE_DOCKER_NETWORK=supabase_default REDES_OK=supabase_default -- "pg_container img true" >/dev/null
+check "sem PSQL_DOCKER_NETWORK, o psql efêmero entra na rede do Supabase" \
+  grep -q -- "^run --rm --network supabase_default img true" "$DOCKER_LOG"
+roda_kit SUPABASE_DOCKER_NETWORK=supabase_default REDES_OK=supabase_default PSQL_DOCKER_NETWORK=outra_rede -- "pg_container img true" >/dev/null
+check "PSQL_DOCKER_NETWORK declarada vence" grep -q -- "^run --rm --network outra_rede img true" "$DOCKER_LOG"
+roda_kit SUPABASE_DOCKER_NETWORK=outra REDES_OK=supabase_default -- "pg_container img true" >/dev/null
+check "rede ausente: o psql roda sem --network (como antes)" grep -q -- "^run --rm img true" "$DOCKER_LOG"
+roda_kit -- "pg_container img true" >/dev/null
+check "sem nenhuma chave: sem --network" grep -q -- "^run --rm img true" "$DOCKER_LOG"
+check "install.sh (gêmeo) também cai para a rede do Supabase" \
+  grep -qF 'elif rede_do_supabase_ok; then rede=(--network "$SUPABASE_DOCKER_NETWORK")' "$KIT/install.sh"
+
+echo "── 7. Chave declarada, rede ausente: o kit avisa"
+saida="$(roda_kit SUPABASE_DOCKER_NETWORK=outra REDES_OK=supabase_default -- aviso_rede_do_supabase)"
+check "avisa nomeando a chave e a rede" \
+  bash -c "printf %s \"\$1\" | grep -q 'SUPABASE_DOCKER_NETWORK=outra'" _ "$saida"
+check "rede existente: sem aviso" test -z \
+  "$(roda_kit SUPABASE_DOCKER_NETWORK=supabase_default REDES_OK=supabase_default -- aviso_rede_do_supabase)"
+check "sem a chave: sem aviso" test -z "$(roda_kit -- aviso_rede_do_supabase)"
+check "update.sh chama o aviso logo depois de entrar no projeto" \
+  grep -qx "aviso_rede_do_supabase" "$KIT/update.sh"
 
 echo
 if [ "$FAILS" -eq 0 ]; then echo "OK — todas as provas passaram."; else echo "FALHOU — $FAILS prova(s)."; fi
