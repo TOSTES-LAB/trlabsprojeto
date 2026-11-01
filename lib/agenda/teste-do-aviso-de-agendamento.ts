@@ -5,8 +5,12 @@
  * (`enviarAvisoDeTeste`), um depois do outro. O grupo sai pela mesma conexão
  * que acabou de mandar ao número, então o anti-ban pede o intervalo de ~1,2 s
  * entre os dois: em vez de devolver "espere" para quem clicou uma vez, o teste
- * espera esse intervalo (até `ESPERA_MAXIMA_DO_GRUPO_MS`) e tenta o grupo de
- * novo uma vez. Teto diário não é esperado: ele só libera no dia seguinte.
+ * espera esse intervalo e tenta o grupo de novo, quantas vezes precisar, até
+ * `ESPERA_MAXIMA_DO_GRUPO_MS` contados da primeira tentativa. Uma só não
+ * basta: o pacing sorteia o jitter de novo a cada consulta, então o `liberaEm`
+ * da segunda resposta pode cair depois do da primeira. O espaçamento continua
+ * valendo; o teste só espera por ele. Teto diário não é esperado: ele só libera
+ * no dia seguinte.
  *
  * O grupo é destino EXTRA, como no envio real: o desfecho dele vem separado e
  * nunca muda o do número.
@@ -55,13 +59,13 @@ export async function enviarTesteDoAvisoDeAgendamento(
   if (!grupo) return { ...numero, grupo: null };
 
   const noGrupo = () => enviarAvisoDeTeste(deps, { ...comum, telefone: grupo });
+  const limite = deps.clock().getTime() + ESPERA_MAXIMA_DO_GRUPO_MS;
   let r = await noGrupo();
-  if (!r.enviado && r.codigo === "espacamento" && r.liberaEm) {
-    const falta = Date.parse(r.liberaEm) - deps.clock().getTime();
-    if (falta <= ESPERA_MAXIMA_DO_GRUPO_MS) {
-      await esperar(Math.max(0, falta));
-      r = await noGrupo();
-    }
+  while (!r.enviado && r.codigo === "espacamento" && r.liberaEm) {
+    const liberaEm = Date.parse(r.liberaEm);
+    if (liberaEm > limite) break;
+    await esperar(Math.max(0, liberaEm - deps.clock().getTime()));
+    r = await noGrupo();
   }
   return { ...numero, grupo: doGrupo(r) };
 }

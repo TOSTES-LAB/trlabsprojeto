@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { CanalDoAviso } from "@/lib/escalacao/aviso-ao-suporte";
 import type { DepsDoAvisoDeTeste } from "@/lib/escalacao/aviso-de-teste";
+import { decidirEspacamento } from "@/lib/agent-engine/pacing/ledger-supabase";
 
 import { ESPERA_MAXIMA_DO_GRUPO_MS, enviarTesteDoAvisoDeAgendamento } from "./teste-do-aviso-de-agendamento";
 
@@ -89,6 +90,41 @@ describe("'Enviar teste' do aviso de agendamento manda também para o grupo (iss
     expect(esperar).toHaveBeenCalledWith(1_500);
     expect(r.grupo).toEqual({ enviado: true });
     expect(enviados).toEqual(["5531998966398@c.us", GRUPO]);
+  });
+
+  it("o jitter sorteado de novo a cada consulta não derruba o grupo: espera até liberar, sem furar o espaçamento", async () => {
+    // A regra de produção, com o rng mudando entre as consultas: a 1ª manda
+    // esperar 1.280 ms, a 2ª (já em +1.280) sorteia +1.920 e recusa de novo,
+    // a 3ª (em +1.920) libera. Com uma tentativa só, o grupo voltava "espacamento".
+    const { deps, enviados, esperar } = cenario();
+    const sorteios = [0.1, 0.9, 0.5];
+    let ultimoEnvio: Date | null = null;
+    const liberadoEm: number[] = [];
+    deps.pacing.decide = vi.fn(async (_o, _c, agora: Date) => {
+      const d = decidirEspacamento({
+        agora,
+        estado: { lastSentAt: ultimoEnvio, sentToday: 0, numberActivatedAt: null },
+        throttleMs: 1_200,
+        jitterMaxMs: 800,
+        timezone: "America/Sao_Paulo",
+        warmupDailyCaps: [],
+        crmDailyLimit: null,
+        rng: () => sorteios.shift() ?? 0,
+      });
+      if (d.liberado) liberadoEm.push(agora.getTime() - AGORA.getTime());
+      return d;
+    });
+    deps.pacing.registraEnvio = vi.fn(async (_o, _c, agora: Date) => {
+      ultimoEnvio = agora;
+    });
+
+    const r = await enviarTesteDoAvisoDeAgendamento(deps, entrada(GRUPO), esperar);
+
+    expect(r.grupo).toEqual({ enviado: true });
+    expect(enviados).toEqual(["5531998966398@c.us", GRUPO]);
+    expect(esperar.mock.calls.map(([ms]) => ms)).toEqual([1_280, 640]);
+    // O grupo só saiu quando a regra liberou: nunca antes de 1,2 s do número.
+    expect(liberadoEm).toEqual([0, 1_920]);
   });
 
   it("espera longa demais não é esperada: o grupo volta com o motivo, e o número segue enviado", async () => {
