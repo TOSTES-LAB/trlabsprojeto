@@ -88,7 +88,7 @@ export function TemaDaPlataforma({
             <Select value={valor} onValueChange={setValor} disabled={isPending}>
               <SelectTrigger
                 id="tema-da-plataforma-escolha"
-                className="w-[320px]"
+                className="w-full max-w-80"
                 aria-label={t("Tema da plataforma")}
               >
                 <SelectValue />
