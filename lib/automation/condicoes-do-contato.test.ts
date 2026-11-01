@@ -30,9 +30,9 @@ const fatos = (parcial: Partial<Fatos> = {}): Fatos => ({
   ...parcial,
 });
 
-/** Só as condições importam; o contexto do evento fica vazio. */
-const avalia = (conditions: unknown, f: Fatos) =>
-  evaluateConditions(conditions as never, {}, f as never);
+/** Só as condições importam; o contexto do evento, quando há, entra vazio. */
+const avalia = (conditions: unknown, f: Fatos, contexto: Record<string, unknown> = {}) =>
+  evaluateConditions(conditions as never, contexto, f as never);
 
 const FOLLOW_UP = "contato.followup_vivo";
 const HORARIO = "contato.horario_marcado";
@@ -75,8 +75,8 @@ describe("condição 'Contato tem follow-up vivo'", () => {
     ];
     const contexto = { lead: { title: "Bia" } };
 
-    expect(evaluateConditions(regra, contexto, fatos({ inscricao_viva: false }))).toBe(true);
-    expect(evaluateConditions(regra, contexto, fatos({ inscricao_viva: true }))).toBe(false);
+    expect(avalia(regra, fatos({ inscricao_viva: false }), contexto)).toBe(true);
+    expect(avalia(regra, fatos({ inscricao_viva: true }), contexto)).toBe(false);
   });
 });
 
