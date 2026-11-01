@@ -8823,7 +8823,7 @@ create table if not exists public.crm_lead_risk_states (
 );
 
 comment on table public.crm_lead_risk_states is
-  'Estado de risco por negócio (wave 7 — o ciclo). FORA de crm_leads pelos motivos da 0075 (pulso que mente, 409 fantasma), mas DENTRO da publicação supabase_realtime, ao contrário de crm_lead_scores: risco é mudança de estado, não telemetria. O escritor só grava quando o bucket muda.';
+  'Estado de risco por negócio (wave 7 — o ciclo). FORA de crm_leads pelos motivos da 0075 (pulso que mente, 409 fantasma). Saiu da publicação supabase_realtime na 9046 (#3697): nenhuma tela assina esta tabela, e publicada sem consumidor ela só custava decodificação por escrita. O escritor só grava quando o bucket muda.';
 
 alter table public.crm_lead_risk_states
   drop constraint if exists crm_lead_risk_states_bucket_check;
@@ -8857,6 +8857,7 @@ create index if not exists idx_crm_lead_risk_states_org_bucket
   on public.crm_lead_risk_states (organization_id, bucket, since);
 
 -- DENTRO da publicação — ver o cabeçalho. Idempotente: só adiciona se faltar.
+-- (A 9046 desfaz isto no fim do arquivo: sem consumidor no código, a tabela sai.)
 do $$
 begin
   if not exists (
@@ -9138,6 +9139,8 @@ create trigger trg_crm_lead_reactivations_carimbo
 -- DENTRO da publicação de realtime, pela mesma regra da 0078: proposta nascendo
 -- ou vencendo é MUDANÇA DE ESTADO que o card precisa mostrar sem reload —
 -- não é telemetria.
+-- (A 9046 desfaz isto no fim do arquivo: o card é do NEGÓCIO, e nenhuma tela
+-- assina esta tabela.)
 do $$
 begin
   if not exists (
@@ -37317,6 +37320,14 @@ begin
     vencimento date not null,
     valor_cents bigint not null check (valor_cents > 0),
 
+    -- A MOEDA DA PARCELA (#3379). Linha de dinheiro carrega a sua unidade, como
+    -- `financial_entries.currency` e `sales.currency`: herdar
+    -- `organizations.currency` na hora de LER faria o histórico inteiro mudar de
+    -- rótulo no dia em que a organização trocasse de moeda. O default é o
+    -- backfill das parcelas que já existem (todas nasceram sem coluna, e o
+    -- `financial_entries` delas nasceu em BRL).
+    currency text not null default 'BRL' check (char_length(currency) = 3),
+
     -- Preservada mesmo se o lançamento do caixa for desfeito — a MESMA decisão
     -- de `financial_entries.sale_id`: o link é conveniência de navegação, nunca
     -- a fonte da verdade do valor ou da data.
@@ -37520,11 +37531,15 @@ begin
     raise exception 'conta_invalida' using errcode = '22023';
   end if;
 
+  -- A entrada do caixa nasce na MOEDA DA PARCELA (#3379): `financial_entries`
+  -- tem `default 'BRL'`, então sem esta coluna o dinheiro de uma parcela em
+  -- dólar entrava no extrato em real — o valor certo no bloco errado do
+  -- relatório.
   insert into public.financial_entries
-    (organization_id, account_id, account_plan_id, direction, amount_cents,
+    (organization_id, account_id, account_plan_id, direction, amount_cents, currency,
      description, status, paid_at, origin, created_by_user_id)
   values (
-    p_org, p_account_id, p_account_plan_id, 'in', v_parcela.valor_cents,
+    p_org, p_account_id, p_account_plan_id, 'in', v_parcela.valor_cents, v_parcela.currency,
     format('Parcela %s de honorários', v_parcela.numero), 'paid', now(), 'manual', auth.uid()
   )
   returning id into v_entry;
@@ -41665,7 +41680,10 @@ create table if not exists public.companies (
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
   constraint companies_normalized_cnpj_digits
-    check (normalized_cnpj is null or normalized_cnpj ~ '^\d{14}$')
+    -- #3495: 12 posições de dígito ou LETRA maiúscula + 2 dígitos verificadores.
+    -- O CNPJ alfanumérico da Receita (`12.ABC.345/01DE-35`) cabe aqui; o dígito
+    -- em si quem confere é `isValidCnpj`, no código.
+    check (normalized_cnpj is null or normalized_cnpj ~ '^[0-9A-Z]{14}$')
 );
 
 create index if not exists idx_companies_org_updated
@@ -60047,12 +60065,25 @@ alter table public.entregas_de_aviso_de_agendamento
 
 -- AS DUAS CHAVES DA IDEMPOTÊNCIA. O `23505` delas é o sinal que o handler lê
 -- para REIVINDICAR a entrega antes de tocar a rede.
-create unique index if not exists entregas_de_aviso_de_agendamento_evento_unico
-  on public.entregas_de_aviso_de_agendamento (organization_id, event_id)
-  where event_id is not null;
-create unique index if not exists entregas_de_aviso_de_agendamento_resumo_unico
-  on public.entregas_de_aviso_de_agendamento (organization_id, dia)
-  where tipo = 'resumo';
+-- Desde a 9060 as duas chaves são por destino (`alvo`), e o bloco da 9060
+-- apaga estas. Na reaplicação do `update.sh` a coluna já existe: recriar a
+-- chave estreita aqui falharia sobre um evento entregue ao número E ao grupo.
+do $$
+begin
+  if not exists (
+       select 1 from information_schema.columns
+        where table_schema = 'public'
+          and table_name = 'entregas_de_aviso_de_agendamento'
+          and column_name = 'alvo') then
+    create unique index if not exists entregas_de_aviso_de_agendamento_evento_unico
+      on public.entregas_de_aviso_de_agendamento (organization_id, event_id)
+      where event_id is not null;
+    create unique index if not exists entregas_de_aviso_de_agendamento_resumo_unico
+      on public.entregas_de_aviso_de_agendamento (organization_id, dia)
+      where tipo = 'resumo';
+  end if;
+end
+$$;
 
 -- Os leitores declarados: a lista da tela e o cancelamento por agendamento.
 create index if not exists entregas_de_aviso_de_agendamento_org_idx
@@ -61316,6 +61347,180 @@ $$;
 
 revoke execute on function public.fn_casos_parados_para_lembrar(integer) from public, anon, authenticated;
 grant execute on function public.fn_casos_parados_para_lembrar(integer) to service_role;
+
+-- ---- aviso de agendamento também em grupo do WhatsApp (migration 9060) ----
+-- ═══════════════════════════════════════════════════════════════════════════
+-- 9060 — O aviso de agendamento também vai para um grupo do WhatsApp.
+--
+-- Quem trabalha em equipe quer ver a agenda num grupo da empresa, sem repassar
+-- mensagem. O grupo é destino EXTRA: o número continua como era, e cada
+-- destino tem a SUA linha de entrega — por isso a chave da idempotência ganha
+-- `alvo`. Uma unique só por evento faria o grupo e o número disputarem a mesma
+-- linha, e um deles nunca sairia. O motor mora em
+-- `lib/agenda/aviso-de-agendamento.ts`, no MESMO commit.
+--
+-- Reaplicação: tudo idempotente (`add column if not exists`, `drop … if
+-- exists` + `add`, índices novos com nome novo). Linhas existentes nascem
+-- `alvo = 'numero'`, então as `unique` novas (mais largas) não falham.
+-- ═══════════════════════════════════════════════════════════════════════════
+
+alter table public.config_aviso_de_agendamento
+  add column if not exists grupo_destino text;
+alter table public.config_aviso_de_agendamento
+  drop constraint if exists config_aviso_de_agendamento_grupo_check;
+alter table public.config_aviso_de_agendamento
+  add constraint config_aviso_de_agendamento_grupo_check
+  check (grupo_destino is null or grupo_destino ~ '^[0-9-]+@g\.us$');
+
+alter table public.entregas_de_aviso_de_agendamento
+  add column if not exists alvo text not null default 'numero';
+alter table public.entregas_de_aviso_de_agendamento
+  drop constraint if exists entregas_de_aviso_de_agendamento_alvo_check;
+alter table public.entregas_de_aviso_de_agendamento
+  add constraint entregas_de_aviso_de_agendamento_alvo_check
+  check (alvo in ('numero', 'grupo'));
+
+-- As chaves novas nascem ANTES de as antigas saírem: o update.sh roda sem
+-- ON_ERROR_STOP, e a ordem inversa deixaria uma janela sem unique.
+create unique index if not exists entregas_de_aviso_de_agendamento_evento_alvo_unico
+  on public.entregas_de_aviso_de_agendamento (organization_id, event_id, alvo)
+  where event_id is not null;
+create unique index if not exists entregas_de_aviso_de_agendamento_resumo_alvo_unico
+  on public.entregas_de_aviso_de_agendamento (organization_id, dia, alvo)
+  where tipo = 'resumo';
+drop index if exists public.entregas_de_aviso_de_agendamento_evento_unico;
+drop index if exists public.entregas_de_aviso_de_agendamento_resumo_unico;
+
+-- A assinatura muda (`p_grupo` no fim, com default): a de seis argumentos sai,
+-- senão ficariam duas portas de escrita para a mesma tabela.
+drop function if exists public.fn_definir_aviso_de_agendamento(uuid,boolean,uuid,text,boolean,boolean);
+create or replace function public.fn_definir_aviso_de_agendamento(
+  p_org uuid,
+  p_usa_numero_do_aviso_de_caso boolean,
+  p_channel uuid,
+  p_telefone text,
+  p_ligado boolean,
+  p_confirma_contato boolean default false,
+  p_grupo text default null
+) returns jsonb
+language plpgsql
+security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_antes public.config_aviso_de_agendamento;
+  v_arch timestamptz;
+  v_digitos text;
+  v_variantes text[];
+  v_usa boolean := coalesce(p_usa_numero_do_aviso_de_caso, true);
+  v_channel uuid := p_channel;
+  v_telefone text := nullif(btrim(coalesce(p_telefone, '')), '');
+  v_grupo text := nullif(btrim(coalesce(p_grupo, '')), '');
+begin
+  if auth.uid() is null or p_org is null
+     or not public.fn_role_at_least(p_org, 'admin')
+     or not public.fn_support_write_allowed(p_org) then
+    raise exception 'aviso_de_agendamento_forbidden' using errcode = '42501';
+  end if;
+  if not public.fn_session_mfa_proven() then
+    raise exception 'aviso_de_agendamento_mfa_required' using errcode = '42501';
+  end if;
+
+  if v_usa then
+    -- O número do aviso de caso já passou pelas guardas da 0292 quando foi
+    -- salvo. Aqui só se exige que ele EXISTA, senão a tela diria "usando o
+    -- número do aviso de caso" sobre um número que não há.
+    if not exists (
+         select 1 from public.config_aviso_de_caso c
+          where c.organization_id = p_org
+            and c.channel_session_id is not null) then
+      raise exception 'aviso_de_agendamento_sem_aviso_de_caso' using errcode = '22023';
+    end if;
+    v_channel := null;
+    v_telefone := null;
+  else
+    if v_telefone is null or v_telefone !~ '^\+[1-9][0-9]{7,14}$' then
+      raise exception 'aviso_de_agendamento_telefone_invalido' using errcode = '22023';
+    end if;
+    if v_channel is null then
+      raise exception 'aviso_de_agendamento_canal_invalido' using errcode = '22023';
+    end if;
+    select archived_at into v_arch
+      from public.channel_sessions
+     where id = v_channel and organization_id = p_org;
+    if not found or v_arch is not null then
+      raise exception 'aviso_de_agendamento_canal_invalido' using errcode = '22023';
+    end if;
+
+    -- As duas grafias do nono dígito — a MESMA regra da 0292 e de
+    -- `lib/channels/phone-variants.ts`.
+    v_digitos := regexp_replace(v_telefone, '\D', '', 'g');
+    v_variantes := array[v_digitos];
+    if v_digitos like '55%' then
+      if length(v_digitos) = 13
+         and substring(v_digitos from 5 for 1) = '9'
+         and substring(v_digitos from 6 for 1) between '6' and '9' then
+        v_variantes := v_variantes || (substring(v_digitos from 1 for 4) || substring(v_digitos from 6));
+      elsif length(v_digitos) = 12
+         and substring(v_digitos from 5 for 1) between '6' and '9' then
+        v_variantes := v_variantes || (substring(v_digitos from 1 for 4) || '9' || substring(v_digitos from 5));
+      end if;
+    end if;
+
+    -- O número de destino NÃO pode ser de uma conexão da própria organização:
+    -- é o laço robô-com-robô (a conexão avisa o número oficial, o agente dele
+    -- responde, e as duas pontas se alimentam).
+    if exists (
+         select 1 from public.channel_sessions s
+          where s.organization_id = p_org
+            and s.archived_at is null
+            and s.phone_number is not null
+            and regexp_replace(s.phone_number, '\D', '', 'g') = any (v_variantes)) then
+      raise exception 'aviso_de_agendamento_numero_da_propria_org' using errcode = '22023';
+    end if;
+
+    -- O número de aviso vira INTERNO (o que chega dele não vira atendimento).
+    -- Se ele já é um cliente, isso não pode acontecer por engano.
+    if not coalesce(p_confirma_contato, false) and exists (
+         select 1 from public.contacts c
+          where c.organization_id = p_org
+            and c.phone_number is not null
+            and regexp_replace(c.phone_number, '\D', '', 'g') = any (v_variantes)) then
+      raise exception 'aviso_de_agendamento_numero_de_cliente' using errcode = '22023';
+    end if;
+  end if;
+
+  -- O grupo é destino EXTRA, da mesma conexão que envia. Só a forma é
+  -- conferida aqui: se o número saiu do grupo, o envio cai só para ele.
+  if v_grupo is not null and v_grupo !~ '^[0-9-]+@g\.us$' then
+    raise exception 'aviso_de_agendamento_grupo_invalido' using errcode = '22023';
+  end if;
+
+  select * into v_antes from public.config_aviso_de_agendamento where organization_id = p_org;
+
+  insert into public.config_aviso_de_agendamento
+    (organization_id, usa_numero_do_aviso_de_caso, channel_session_id, telefone_destino, grupo_destino, ligado, criado_por, atualizado_por)
+  values
+    (p_org, v_usa, v_channel, v_telefone, v_grupo, coalesce(p_ligado, false), auth.uid(), auth.uid())
+  on conflict (organization_id) do update
+    set usa_numero_do_aviso_de_caso = excluded.usa_numero_do_aviso_de_caso,
+        channel_session_id          = excluded.channel_session_id,
+        telefone_destino            = excluded.telefone_destino,
+        grupo_destino               = excluded.grupo_destino,
+        ligado                      = excluded.ligado,
+        atualizado_por              = auth.uid(),
+        updated_at                  = now();
+
+  return jsonb_build_object(
+    'trocou_numero', (v_antes.telefone_destino is distinct from v_telefone
+                      or v_antes.usa_numero_do_aviso_de_caso is distinct from v_usa),
+    'antes_ligado',  coalesce(v_antes.ligado, false)
+  );
+end;
+$$;
+-- AS DUAS ORIGENS DE EXECUTE (item 9 da doutrina de migrations).
+revoke all     on function public.fn_definir_aviso_de_agendamento(uuid,boolean,uuid,text,boolean,boolean,text) from public, anon;
+grant  execute on function public.fn_definir_aviso_de_agendamento(uuid,boolean,uuid,text,boolean,boolean,text) to authenticated;
 
 notify pgrst, 'reload schema';
 
@@ -70427,6 +70632,39 @@ begin
 end;
 $recibos_9018$;
 
+-- ---- parcela de honorários na moeda da organização (migration 0770, #3379) ----
+-- Módulo opcional: `fn_honorarios_provisionar()` só roda na INSTALAÇÃO, então
+-- quem já tem o módulo jamais passaria por ela de novo e ficaria sem a coluna —
+-- e a rota de criação, que passou a mandá-la, quebraria com `42703`. O bloco é
+-- guardado por `to_regclass` (a tabela pode não existir) e é feito de
+-- `if not exists` / `drop ... if exists`, porque o `update.sh` re-aplica este
+-- arquivo sem `ON_ERROR_STOP`. Corpo completo em
+-- supabase/migrations/20261031122853_0770_parcela_de_honorarios_na_moeda_da_organizacao.sql.
+
+do $$
+begin
+  if to_regclass('public.honorarios_parcelas') is null then
+    return;
+  end if;
+
+  alter table public.honorarios_parcelas
+    add column if not exists currency text not null default 'BRL';
+
+  alter table public.honorarios_parcelas
+    drop constraint if exists honorarios_parcelas_currency_check;
+  alter table public.honorarios_parcelas
+    add constraint honorarios_parcelas_currency_check check (char_length(currency) = 3);
+
+  -- O comentário mora DENTRO da guarda: fora dela, `comment on column` numa base
+  -- com o módulo NÃO instalado derruba o install inteiro (`ON_ERROR_STOP=1`) por
+  -- uma tabela que, de propósito, não existe ali.
+  execute $c$
+    comment on column public.honorarios_parcelas.currency is
+      'Moeda da parcela, resolvida de organizations.currency no servidor quando a parcela nasce (#3379). Linha de dinheiro carrega a própria unidade — é o que permite o histórico não mudar de rótulo quando a organização troca de moeda.'
+  $c$;
+end
+$$;
+
 -- ---- Recuperar as mensagens da queda do número (migration 9033, Spec 32) ----
 -- Espelho idempotente da 9033; o porquê está no cabeçalho dela. Não cria função,
 -- então pode ficar depois da VARREDURA anon. Os dois kinds novos entraram no
@@ -70494,5 +70732,82 @@ create unique index if not exists agent_inbox_recuperacao_da_queda_aberto_unico
 create unique index if not exists agent_inbox_cliente_sem_resposta_na_queda_aberto_unico
   on public.agent_inbox_items (organization_id, kind, ref_id)
   where status = 'open' and kind = 'cliente_sem_resposta_na_queda';
+
+-- ---- CNPJ alfanumérico da Receita em normalized_cnpj (migration 9056, #3495) ----
+-- Espelho idempotente da 9056: `update.sh` re-aplica este arquivo sem
+-- `ON_ERROR_STOP`, então o `drop ... if exists` vem antes do `add`. O corpo
+-- acima (CREATE TABLE) já nasce com a régua nova; este bloco é a cura para quem
+-- instalou antes da 9056. O porquê está no cabeçalho da migration.
+alter table public.companies
+  drop constraint if exists companies_normalized_cnpj_digits;
+
+alter table public.companies
+  add constraint companies_normalized_cnpj_digits
+  check (normalized_cnpj is null or normalized_cnpj ~ '^[0-9A-Z]{14}$');
+
+notify pgrst, 'reload schema';
+
+-- ---- realtime sem consumidor: o que ninguém assina sai da publicação (9046, #3697) ----
+-- `ai_agents` entra na lista do `foreach` lá em cima (linha do bloco "realtime:
+-- inbox, kanban e IA") porque na época a tela de agentes parecia candidata a
+-- tempo real; ela nunca assinou — lê por PostgREST. `crm_lead_risk_states`
+-- (0078) e `crm_lead_reactivations` (0082) entraram pela regra "mudança de
+-- estado pinta o card", mas o card é do NEGÓCIO (`crm_leads`), e nenhuma tela
+-- abre canal nas duas. As três saem AQUI, no fim, pelo mesmo desenho do
+-- `crm_lead_scores` (0075): o `add` fica na posição em que aconteceu, o `drop`
+-- vem depois — o baseline é aplicado inteiro e em ordem, então a lista final
+-- não repete tabela e o resultado é o mesmo de uma instalação migrada.
+-- Idempotente e guardado: `alter publication ... drop table` não aceita
+-- `if exists`, então só executa o que está de fato em `pg_publication_tables`.
+do $$
+begin
+  if not exists (
+    select 1 from pg_publication where pubname = 'supabase_realtime'
+  ) then
+    -- publicação ausente: nada a tirar (instância que nunca ligou realtime).
+    return;
+  end if;
+
+  -- ai_agents: a tela de agentes lê por PostgREST; nenhum canal assina.
+  if exists (
+    select 1 from pg_publication_tables
+     where pubname = 'supabase_realtime'
+       and schemaname = 'public'
+       and tablename = 'ai_agents'
+  ) then
+    execute 'alter publication supabase_realtime drop table public.ai_agents';
+  end if;
+
+  -- crm_lead_risk_states: risco é lido junto do negócio; nenhum canal assina.
+  if exists (
+    select 1 from pg_publication_tables
+     where pubname = 'supabase_realtime'
+       and schemaname = 'public'
+       and tablename = 'crm_lead_risk_states'
+  ) then
+    execute 'alter publication supabase_realtime drop table public.crm_lead_risk_states';
+  end if;
+
+  -- crm_lead_reactivations: proposta de reativação é lida pela tela; nenhum
+  -- canal assina.
+  if exists (
+    select 1 from pg_publication_tables
+     where pubname = 'supabase_realtime'
+       and schemaname = 'public'
+       and tablename = 'crm_lead_reactivations'
+  ) then
+    execute 'alter publication supabase_realtime drop table public.crm_lead_reactivations';
+  end if;
+end $$;
+
+-- ---- pacing_ledger.resposta (migration 9061) ----
+-- Resposta a quem escreveu não gasta nem é barrada pelo teto do dia. O porquê
+-- inteiro está no cabeçalho da migration.
+--
+-- Não cria função, então pode ficar depois da VARREDURA anon.
+alter table public.pacing_ledger
+  add column if not exists resposta boolean not null default false;
+comment on column public.pacing_ledger.resposta is
+  'true = resposta a quem escreveu: vale para o espaçamento, não para o teto do dia (warm-up/daily_message_limit), que conta só disparos (9061).';
 
 notify pgrst, 'reload schema';
