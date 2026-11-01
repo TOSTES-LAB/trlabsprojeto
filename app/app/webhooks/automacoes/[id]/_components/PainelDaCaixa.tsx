@@ -40,7 +40,7 @@ import {
   ValorDaCondicaoDoContato,
   valorDaCondicaoNaTela,
 } from "@/app/app/webhooks/_components/CondicaoDoContato";
-import { CURATED_FIELDS, OP_LABELS, type Op } from "@/app/app/webhooks/_components/RuleEditor";
+import { CURATED_FIELDS, OP_LABELS, type CuratedField, type Op } from "@/app/app/webhooks/_components/RuleEditor";
 import { ACTION_LABELS, TRIGGER_LABELS, type ActionType, type TriggerEvent } from "@/app/app/webhooks/_components/labels";
 
 import { VISUAL_DAS_CONDICOES, VISUAL_DO_GATILHO, visualDaAcao, type VisualDaCaixa } from "./visual";
@@ -306,7 +306,7 @@ export function PainelDasCondicoes({
   const etapas = quadro?.data?.stages ?? [];
   // As condições do contato (#3814) valem em qualquer gatilho: entram depois
   // das do evento, e não na tabela de cada um.
-  const campos = evento
+  const campos: CuratedField[] = evento
     ? [...(CURATED_FIELDS[evento as TriggerEvent] ?? []), ...CONDICOES_DO_CONTATO]
     : [];
   const linhas = dados.linhas;

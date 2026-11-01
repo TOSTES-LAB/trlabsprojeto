@@ -16,7 +16,7 @@ import type { FollowupFlowPointerRow } from "@/hooks/followup/useFollowupFlows";
 import { useAssignableMembers } from "@/hooks/inbox/useAssignableMembers";
 import { usePipelineStages, usePipelines, useWebhookSources } from "@/hooks/webhooks/useWebhookSources";
 import type { PlanoDeTarefas } from "@/lib/tarefas/plano";
-import { CURATED_FIELDS, OP_LABELS, type Op } from "@/app/app/webhooks/_components/RuleEditor";
+import { CURATED_FIELDS, OP_LABELS, type CuratedField, type Op } from "@/app/app/webhooks/_components/RuleEditor";
 import { valorDaCondicaoNaTela } from "@/app/app/webhooks/_components/CondicaoDoContato";
 import { CONDICOES_DO_CONTATO } from "@/lib/automation/conditions";
 import { ACTION_LABELS, TRIGGER_LABELS, type ActionType, type TriggerEvent } from "@/app/app/webhooks/_components/labels";
@@ -189,7 +189,10 @@ function DescricaoDasCondicoes({ dados, evento }: { dados: Extract<DadosDaCaixa,
   // As condições do contato (#3814) valem em qualquer gatilho: o rótulo delas
   // não está na tabela por evento, e sem esta linha o cartão mostraria o
   // caminho técnico (`contato.followup_vivo`) para o operador.
-  const campos = [...(CURATED_FIELDS[evento as TriggerEvent] ?? []), ...CONDICOES_DO_CONTATO];
+  const campos: CuratedField[] = [
+    ...(CURATED_FIELDS[evento as TriggerEvent] ?? []),
+    ...CONDICOES_DO_CONTATO,
+  ];
   const primeira = completas[0]!;
   const campo = campos.find((c) => c.value === primeira.field);
   const op = t(campo?.lista && primeira.op === "contains" ? "tem a tag" : OP_LABELS[primeira.op as Op]);

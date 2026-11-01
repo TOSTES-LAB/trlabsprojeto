@@ -391,7 +391,7 @@ export function RuleEditor({ open, onOpenChange, rule }: Props) {
   // As duas condições do contato valem em QUALQUER gatilho: elas perguntam pelo
   // contato do evento, não pelo evento. Por isso entram depois das do gatilho,
   // e não na tabela de cada um (que é por tipo de evento).
-  const curatedFields = triggerEvent
+  const curatedFields: CuratedField[] = triggerEvent
     ? [...CURATED_FIELDS[triggerEvent], ...CONDICOES_DO_CONTATO]
     : [];
   const ehGatilhoDeData = triggerEvent === GATILHO_DE_DATA_DO_FUNIL;
