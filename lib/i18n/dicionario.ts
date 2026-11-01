@@ -6876,6 +6876,9 @@ export const DICIONARIO: Traducoes = {
     es: "El contacto pidió no recibir mensajes (opt-out).",
   },
   "O contato não tem telefone cadastrado.": { es: "El contacto no tiene teléfono registrado." },
+  "O contato tem horário marcado na agenda — esta automação foi configurada para não enviar quando isso acontece.": {
+    es: "El contacto tiene horario reservado en la agenda — esta automatización está configurada para no enviar cuando ocurre.",
+  },
   "Falta preencher alguma configuração desta ação — abra a automação e revise.": {
     es: "Falta completar algún ajuste de esta acción. Abre la automatización y revísala.",
   },
