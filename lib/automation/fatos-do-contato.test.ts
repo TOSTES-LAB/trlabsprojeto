@@ -7,6 +7,7 @@ import {
   CAMPOS_DO_CONTATO,
   CONDICOES_DO_CONTATO,
   conditionsSchema,
+  DIAS_MAXIMOS_DA_AGENDA,
   lerValorDeHorario,
   montarValorDeHorario,
   usaFatosDoContato,
@@ -209,6 +210,73 @@ describe("a condição do contato no vocabulário do editor e na porta da API", 
     expect(montarValorDeHorario({ resposta: "sim", dias: null, tipo: "Consulta" })).toBe(
       "sim||Consulta",
     );
+  });
+
+  it("todo valor que o editor grava volta igual ao ler — o tipo pode ter `|` (#3821)", () => {
+    // Todas as combinações do controle: resposta × prazo × tipo. Os tipos com
+    // `|` são o defeito medido: `nao|7|Corte|Barba` era lido como `null`, a
+    // tela voltava o seletor para "Sim" e a porta recusava com a frase do prazo.
+    const respostas = ["sim", "nao"] as const;
+    const prazos = [null, 1, 7, DIAS_MAXIMOS_DA_AGENDA];
+    const tipos = [
+      null,
+      "Manutenção",
+      "Corte (masculino), barba - 30min",
+      "Corte|Barba",
+      "A | B",
+      "|começa com barra",
+      "termina com barra|",
+      "a||b",
+    ];
+    let combinacoes = 0;
+    for (const resposta of respostas) {
+      for (const dias of prazos) {
+        for (const tipo of tipos) {
+          const regra = { resposta, dias, tipo };
+          const gravado = montarValorDeHorario(regra);
+          expect(lerValorDeHorario(gravado), gravado).toEqual(regra);
+          expect(
+            validarCondicaoDoContato({
+              field: CAMPOS_DO_CONTATO.horarioMarcado,
+              op: "eq",
+              value: gravado,
+            }),
+            gravado,
+          ).toBeNull();
+          expect(
+            conditionsSchema.safeParse([
+              { field: CAMPOS_DO_CONTATO.horarioMarcado, op: "eq", value: gravado },
+            ]).success,
+            gravado,
+          ).toBe(true);
+          // Trocar de campo e voltar não apaga o que já estava escrito.
+          expect(valorPadraoDoCampo(CAMPOS_DO_CONTATO.horarioMarcado, gravado)).toBe(gravado);
+          combinacoes += 1;
+        }
+      }
+    }
+    // Controle da varredura: o laço não pode ter rodado vazio.
+    expect(combinacoes).toBe(2 * 4 * 8);
+  });
+
+  it("valores gravados no formato de antes leem igual; o inválido continua recusado", () => {
+    expect(lerValorDeHorario("sim")).toEqual({ resposta: "sim", dias: null, tipo: null });
+    expect(lerValorDeHorario("nao")).toEqual({ resposta: "nao", dias: null, tipo: null });
+    expect(lerValorDeHorario("sim|7")).toEqual({ resposta: "sim", dias: 7, tipo: null });
+    expect(lerValorDeHorario("nao|7")).toEqual({ resposta: "nao", dias: 7, tipo: null });
+    expect(lerValorDeHorario(" sim | 7 | Manutenção ")).toEqual({
+      resposta: "sim",
+      dias: 7,
+      tipo: "Manutenção",
+    });
+    expect(lerValorDeHorario("sim||Consulta")).toEqual({
+      resposta: "sim",
+      dias: null,
+      tipo: "Consulta",
+    });
+    for (const invalido of ["", "talvez", "|7", "sim|0", "sim|999", "sim|abc", "sim|7.5"]) {
+      expect(lerValorDeHorario(invalido), invalido).toBeNull();
+    }
   });
 
   it("o motor só vai ao banco quando alguma regra casada usa estas condições", () => {

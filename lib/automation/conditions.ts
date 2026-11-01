@@ -272,6 +272,7 @@ function compara(raw: unknown, alvo: string, op: "gt" | "gte" | "lt" | "lte"): b
  *   follow-up vivo   → `sim` | `nao`
  *   horário marcado  → `sim` | `nao`, e opcionalmente `|N` (dias) e `|TIPO`:
  *                      `sim`, `sim|7`, `sim|7|Manutenção`, `nao|7`
+ *                      (o TIPO é o resto do texto e pode ter `|`)
  *
  * Quem lê e escreve é `lerValorDeHorario`/`montarValorDeHorario`; quem recusa o
  * que não é isso é `validarCondicaoDoContato`, usada pelo schema da API (a
@@ -321,12 +322,19 @@ export function ehCampoDoContato(field: string): field is CampoDoContato {
  * (o schema recusa; o avaliador trata como falso, nunca como "sim").
  *
  * O separador é `|` porque o campo do tipo é NOME de tipo de atendimento, e
- * nome de serviço tem vírgula, hífen e parêntese; `|` não.
+ * nome de serviço tem vírgula, hífen e parêntese. Só os DOIS primeiros `|`
+ * separam: o tipo é a última posição e é texto livre, então tudo depois do
+ * segundo `|` é dele — inclusive outro `|` ("Corte|Barba"). Cortar em todo `|`
+ * devolvia `null` para o que o próprio editor gravou (`nao|7|Corte|Barba`), e a
+ * tela voltava o seletor para "Sim" (#3821). Os valores de antes (`sim`,
+ * `sim|7`, `sim|7|Manutenção`, `sim||Consulta`) leem exatamente igual.
  */
 export function lerValorDeHorario(valor: string): RegraDeHorario | null {
   if (typeof valor !== "string") return null;
-  const [resposta, dias, tipo, ...resto] = valor.split("|").map((parte) => parte.trim());
-  if (resto.length > 0) return null;
+  const [primeira = "", segunda, ...doTipo] = valor.split("|");
+  const resposta = primeira.trim();
+  const dias = segunda?.trim();
+  const tipo = doTipo.length > 0 ? doTipo.join("|").trim() : undefined;
   if (!RESPOSTAS_DE_SIM_NAO.includes(resposta as RespostaDeSimNao)) return null;
   const janela = dias === undefined || dias === "" ? null : Number(dias);
   if (janela !== null && (!Number.isInteger(janela) || janela < 1 || janela > DIAS_MAXIMOS_DA_AGENDA)) {
