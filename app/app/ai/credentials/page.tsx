@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { ROLE_RANK } from "@/lib/auth/types";
 import { createClient } from "@/lib/supabase/server";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { CredentialRow } from "@/hooks/ai/useCredentials";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { contarUsoQueBloqueia, type VersaoVinculada } from "@/lib/ai/credenciais/uso";
@@ -22,7 +23,9 @@ import { DEFAULT_CLASSIFIER_MODEL } from "@/lib/ai/gateway";
 import { resolverModeloDoPonto } from "@/lib/ai/gateway-binding";
 import { lerAmbiente } from "@/lib/instalacao/ambiente";
 import { logger } from "@/lib/logger";
-import { criarSessaoPkce } from "@/lib/ai/pontos/pkce-da-assinatura";
+import { criarSessaoPkce, gerarNonceSiwc, CLIENTE_DINAMICO_SIWC } from "@/lib/ai/pontos/pkce-da-assinatura";
+import { lerLoginCodex } from "@/lib/ai/credenciais/login-codex";
+import { lerOuCriarHostIdSiwc } from "@/lib/ai/credenciais/host-siwc";
 import { emitirEstado } from "@/lib/agenda/google/estado";
 import { env } from "@/lib/env";
 import { PROVEDOR_POR_ASSINATURA, PROVEDORES } from "@/lib/ai/pontos/provedores";
@@ -85,16 +88,31 @@ export default async function CredentialsPage() {
   // `state`. Sem segredo utilizável o painel não aparece — um login que
   // ninguém consegue conferir não deve ser oferecido.
   let sessaoPkce: ReturnType<typeof criarSessaoPkce> | null = null;
+  let siwcAutorizado = false;
   if (moduloLoginCodex) {
     try {
+      const admin = createAdminClient();
+      const [hostId, tokens] = await Promise.all([
+        lerOuCriarHostIdSiwc(admin),
+        lerLoginCodex({ admin, orgId: activeOrg.orgId }),
+      ]);
+      siwcAutorizado = tokens !== null;
+      if (!hostId) throw new Error("host_siwc_nao_persistido");
+      const clientId = tokens?.client_id;
+      const nonce = gerarNonceSiwc();
       sessaoPkce = criarSessaoPkce(
         emitirEstado(
-          { organizationId: activeOrg.orgId, userId: user.id },
-          { segredo: env.INTERNAL_SECRET, agora: new Date() },
+          {
+            organizationId: activeOrg.orgId,
+            userId: user.id,
+            authSessionId: clientId ?? CLIENTE_DINAMICO_SIWC,
+          },
+          { segredo: env.INTERNAL_SECRET, agora: new Date(), nonce },
         ),
+        { nonce, ...(clientId ? { clientId } : {}), extAgentHostId: hostId },
       );
     } catch (err) {
-      logger.warn("[ai/credentials] login por assinatura sem state assinado (INTERNAL_SECRET?)", {
+      logger.warn("[ai/credentials] login SIWC indisponível (state/host do servidor)", {
         error: err instanceof Error ? err.message : String(err),
       });
     }
@@ -176,6 +194,8 @@ export default async function CredentialsPage() {
   // A mesma pergunta que o worker faz: sem a chave do Jev, há IA principal para medir?
   const jev = jevLigado
     ? {
+        // De onde o Jev responde: decide QUAL credencial a lista marca como dele.
+        origem: configDoJev.origem,
         // Só as tarefas que a chave de fato serve agora.
         tarefas: TAREFAS_DO_JEV.filter(
           (t) =>
@@ -215,12 +235,46 @@ export default async function CredentialsPage() {
           )}
         </p>
       </header>
+      {/* O AVISO DE QUEM NÃO VÊ O PAINEL (#4438). O #1672 decidiu que,
+          desligado, o login por assinatura não aparece — e a tela ficava muda:
+          quem procurava a assinatura do ChatGPT concluía que o produto não tem
+          o recurso. Aqui a tela DIZ que ele existe, para que serve e onde se
+          liga, sem oferecer conexão nenhuma: nada de painel, nada de token.
+          Este bloco só existe com o módulo FORA; ligado, a tela é a de sempre. */}
+      {!moduloLoginCodex && (
+        <Card data-testid="aviso-login-codex-desligado">
+          <CardHeader>
+            <CardTitle>{traduzir("Assinatura do ChatGPT", idioma)}</CardTitle>
+            <CardDescription>
+              {traduzir(
+                "Ligada, a assinatura do ChatGPT deixa o agente responder com a conta do ChatGPT da sua empresa, no lugar de uma chave de API da organização. Cada empresa conecta a própria conta nesta tela, assim que o recurso estiver ligado.",
+                idioma,
+              )}
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-2 text-sm">
+            <p>
+              {traduzir(
+                "Este recurso vem desligado de fábrica: quem administra a instalação liga em Administração › Recursos opcionais (/admin/sistema).",
+                idioma,
+              )}
+            </p>
+            <p>
+              {traduzir(
+                "Se você não administra esta instalação, peça a essa pessoa que ligue o recurso. Depois disso, o painel para conectar a conta aparece nesta tela.",
+                idioma,
+              )}
+            </p>
+          </CardContent>
+        </Card>
+      )}
       {moduloLoginCodex && sessaoPkce && (
         <PainelDeLoginCodex
           url={sessaoPkce.url}
           codeVerifier={sessaoPkce.codeVerifier}
           conectado={linhaDeLogin !== null}
           validada={linhaDeLogin?.validated_at != null}
+          siwcAutorizado={siwcAutorizado}
         />
       )}
       <CredentialsList

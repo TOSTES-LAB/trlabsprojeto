@@ -43,6 +43,8 @@ export interface McpContext {
   role: Role;
   actor: Actor;
   apiTokenId: string;
+  /** Escopos da linha autenticada; nunca argumentos da ferramenta. */
+  tokenScopes?: readonly string[];
   requestId: string;
   /** Service-role admin client. Tools devem filtrar `organization_id` em toda query. */
   supabase: SupabaseClient;
@@ -79,6 +81,19 @@ export interface McpToolDefinition<TInput extends z.ZodRawShape = z.ZodRawShape>
    */
   redigirParaAuditoria?: (args: Record<string, unknown>) => Record<string, unknown>;
   /**
+   * ESCRITA DELEGADA AO CONTATO (servidores MCP por agente, migration 9095).
+   *
+   * Só uma remota de servidor `oauth_por_contato`, com `escrita_delegada`
+   * ligada no cadastro, marcada `escrita` pelo admin em `tool_ids` E montada com
+   * o token do CONTATO DO TURNO recebe isto (`definirFerramentasDoServidorDoAgente`).
+   * A ponte (`lib/ai/runtime/tools.ts`) então não aplica a recusa
+   * `escrita_sem_escopo_do_turno`: a escrita acontece na conta do terceiro com a
+   * credencial que o próprio contato autorizou, e não alcança registro nenhum do
+   * CRM. Auditoria, papel e escopo continuam valendo. Nenhuma tool compilada
+   * declara isto.
+   */
+  escritaDelegadaAoContato?: true;
+  /**
    * O que a tool DECLARA quando a resposta é um vazio que NÃO é sucesso.
    *
    * Uma busca que não acha nada TERMINOU bem: não houve erro, houve ausência —
@@ -98,8 +113,21 @@ export interface McpToolDefinition<TInput extends z.ZodRawShape = z.ZodRawShape>
    * transformaria comportamento normal em alarme.
    */
   motivoDoVazio?: (resultado: unknown) => string | null;
-  handler: (
-    input: z.infer<z.ZodObject<TInput>>,
-    ctx: McpContext,
-  ) => Promise<unknown>;
+  /**
+   * O que a tool DECLARA como o "termo" desta chamada — o que a pessoa escreveu
+   * na busca, para o painel poder contar "não achei" POR TERMO e não só
+   * "falhou".
+   *
+   * Sem isto o termo só existe dentro de `metadata.args`, cujo nome do campo é
+   * de cada tool (`args.termo` numa, `args.query` ou um filtro redigido noutra):
+   * a contagem no banco teria de gravar o nome do argumento de UMA tool dentro
+   * do SQL. Declarar aqui deixa a auditoria subir o termo para um campo próprio
+   * — `metadata.termo` — que a leitura por termo lê sem conhecer tool nenhuma.
+   *
+   * Devolver `null` (ou não declarar) = a chamada não tem termo a contar. O
+   * termo é do cliente e o audit já grava os args; isto não abre dado novo, só
+   * dá ao leitor uma chave estável.
+   */
+  termoBuscado?: (input: z.infer<z.ZodObject<TInput>>) => string | null;
+  handler: (input: z.infer<z.ZodObject<TInput>>, ctx: McpContext) => Promise<unknown>;
 }

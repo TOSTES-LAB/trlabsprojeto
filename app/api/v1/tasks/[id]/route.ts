@@ -20,14 +20,17 @@ import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { portaDaAplicacao } from "@/lib/db";
 import { createClient } from "@/lib/supabase/server";
 import { registraAtividadeDaTarefa } from "@/lib/tarefas/atividade";
+import { conferirDemanda } from "@/lib/tarefas/demanda";
+import { conferirResponsavel } from "@/lib/tarefas/responsavel";
 import { PRIORIDADES_DA_TAREFA, SITUACOES_DA_TAREFA, type Tarefa } from "@/lib/tarefas/tipos";
 
 export const dynamic = "force-dynamic";
 
 const COLUNAS =
-  "id, organization_id, title, description, due_date, priority, status, lead_id, contact_id, assigned_to, created_by, created_at, updated_at";
+  "id, organization_id, title, description, due_date, priority, status, lead_id, contact_id, demanda_id, assigned_to, created_by, created_at, updated_at, lead:crm_leads(id, title)";
 
 const edicaoSchema = z
   .object({
@@ -38,6 +41,8 @@ const edicaoSchema = z
     status: z.enum(SITUACOES_DA_TAREFA).optional(),
     lead_id: z.string().uuid().nullable().optional(),
     contact_id: z.string().uuid().nullable().optional(),
+    /** Vincular (`<uuid>`) e desvincular (`null`) a demanda do atendimento (#2818). */
+    demanda_id: z.string().uuid().nullable().optional(),
     assigned_to: z.string().uuid().nullable().optional(),
   })
   // PATCH vazio gravaria só o `updated_at` e devolveria 200: a tela diria
@@ -67,17 +72,64 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     });
   }
 
+  if (parsed.data.assigned_to) {
+    // A chave estrangeira de `assigned_to` é só para `auth.users`: sem esta conferência, um id de
+    // outra organização (ou de quem saiu da equipe) gravaria sem erro. A régua
+    // e o porquê do filtro de organização estão em `lib/tarefas/responsavel.ts`
+    // (SQL direto na porta de `lib/db` — o pool NÃO passa por RLS).
+    const veredito = await conferirResponsavel(
+      portaDaAplicacao(),
+      authz.org.orgId,
+      parsed.data.assigned_to,
+    );
+    if (veredito === "falha_na_consulta") {
+      return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+    }
+    if (veredito === "fora_da_equipe") {
+      return fail("validation_failed", t("O responsável escolhido não faz parte da equipe."), 422, {
+        requestId,
+      });
+    }
+  }
+
   const supabase = await createClient();
+
+  if (parsed.data.demanda_id) {
+    // A chave estrangeira não passa pela RLS: sem esta conferência, a demanda
+    // de outra organização gravaria sem erro. A régua está em `lib/tarefas/demanda.ts`.
+    const veredito = await conferirDemanda(
+      portaDaAplicacao(),
+      authz.org.orgId,
+      parsed.data.demanda_id,
+    );
+    if (veredito === "falha_na_consulta") {
+      return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+    }
+    if (veredito === "fora_da_organizacao") {
+      return fail("validation_failed", t("O negócio, o contato ou a demanda vinculada não existe."), 422, {
+        requestId,
+      });
+    }
+    if (veredito === "encerrada") {
+      return fail("state_conflict", t("Esta demanda já foi encerrada. Crie a tarefa numa demanda em andamento."), 409, {
+        requestId,
+      });
+    }
+  }
 
   // A situação ANTES da edição decide se esta é a vez em que a tarefa fechou.
   // Sem ler antes, marcar "concluída" duas vezes emitiria duas linhas na
   // timeline do negócio — e a segunda seria mentira.
-  const { data: antes } = await supabase
+  const { data: antes, error: erroDaLeitura } = await supabase
     .from("crm_tasks")
     .select("status")
     .eq("id", id)
     .eq("organization_id", authz.org.orgId)
     .maybeSingle();
+
+  if (erroDaLeitura) {
+    return fail("internal_error", t("Erro ao salvar a tarefa."), 500, { requestId });
+  }
 
   const { data, error } = await supabase
     .from("crm_tasks")
@@ -92,7 +144,7 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
       return fail("not_found", t("Tarefa não encontrada."), 404, { requestId });
     }
     if (error.code === "23503") {
-      return fail("validation_failed", t("O negócio ou contato vinculado não existe."), 422, {
+      return fail("validation_failed", t("O negócio, o contato ou a demanda vinculada não existe."), 422, {
         requestId,
       });
     }
@@ -101,6 +153,23 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
 
   const tarefa = data as unknown as Tarefa;
 
+  /*
+   * A TRANSIÇÃO, quando houve uma (#4028).
+   *
+   * O `campos` dizia QUAIS campos mudaram, não PARA ONDE. Para o quadro isso é
+   * o registro que importa: arrastar o cartão é a única ação da tela de Tarefas
+   * que muda o estado da linha, e sem `de`/`para` o audit responderia "alguém
+   * tocou nesta tarefa" a quem perguntasse "quem a concluiu, e quando". O
+   * QUANDO é o `created_at` da própria linha de audit; o QUEM é o ator.
+   *
+   * Só entra quando `status` veio no corpo: editar o título não pode gravar uma
+   * transição que não existiu (`de: "pending", para: "pending"`).
+   */
+  const transicao =
+    parsed.data.status !== undefined
+      ? { de: (antes as { status?: string } | null)?.status ?? null, para: tarefa.status }
+      : {};
+
   await audit({
     organizationId: authz.org.orgId,
     actorUserId: authz.user.id,
@@ -108,13 +177,13 @@ export async function PATCH(req: NextRequest, ctx: Contexto): Promise<Response> 
     resourceType: "crm_tasks",
     resourceId: tarefa.id,
     requestId,
-    metadata: { campos: Object.keys(parsed.data) },
+    metadata: { campos: Object.keys(parsed.data), ...transicao },
   });
 
   const fechouAgora =
     tarefa.status === "done" && (antes as { status?: string } | null)?.status !== "done";
   if (fechouAgora) {
-    await registraAtividadeDaTarefa(supabase, {
+    await registraAtividadeDaTarefa(portaDaAplicacao(), {
       organizationId: authz.org.orgId,
       tarefa,
       tipo: "task_completed",

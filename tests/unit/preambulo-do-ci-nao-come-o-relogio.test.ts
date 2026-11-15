@@ -64,7 +64,7 @@ const TETOS: Record<string, { minutos: number; razao: string }> = {
   "ci.yml::verify-parte": {
     minutos: 15,
     razao:
-      "a suíte foi repartida em partes (#1185 via #1190; três desde 22/09/2026); cada parte roda uma fatia de uma suíte " +
+      "a suíte foi repartida em partes (#1185 via #1190; três de unit desde 22/09/2026, e uma quarta só de cercas+kit desde 08/10/2026); cada parte roda uma fatia de uma suíte " +
       "que custava 649s de unit num verde. 15 é guarda de travamento; quem denuncia crescimento " +
       "é o passo `Orçamento de tempo do verify-parte` (12 min por parte, medido em 19/09)",
   },
@@ -72,12 +72,14 @@ const TETOS: Record<string, { minutos: number; razao: string }> = {
   // lê o desfecho de `needs`. O teto que denuncia a suíte crescendo vive na perna
   // que a roda.
   "ci.yml::invariants-majors": {
-    minutos: 30,
+    minutos: 45,
     razao:
       "a perna deixou de ser UMA passada: agora é `test:db` + `test:db:update`, e cada uma sobe " +
-      "Postgres e aplica o baseline (p90 medido de uma passada: 325s). O 30 é DECLARADO, não " +
-      "medido — não há Docker onde esta matriz foi escrita; mantido em 20, a perna morreria por " +
-      "relógio no meio da segunda passada",
+      "Postgres e aplica o baseline (p90 medido de uma passada: 325s). O 30 era DECLARADO, não " +
+      "medido. Em 10/11/2026 ele passou a cortar por relógio: pg15 e pg17 cancelados aos 30 min, " +
+      "também na `main`, e o #3590, pronto e provado pela tela, cortado três vezes seguidas. " +
+      "45 com ok do dono (doc de decisão 302). Se voltar a bater no teto, a pergunta é por que a " +
+      "passada cresceu, não subir de novo",
   },
 };
 
@@ -249,7 +251,7 @@ describe("o preâmbulo do CI não come o orçamento dos testes", () => {
   });
 
   it("o orçamento vale para TODAS as partes da matrix, não só para uma", () => {
-    // `verify-parte` é uma `matrix` (3 partes desde 22/09/2026), e o
+    // `verify-parte` é uma `matrix` (8 partes desde 03/11/2026), e o
     // `ORCAMENTO_MIN` vive num passo ÚNICO que todas as partes executam. Os passos vizinhos (`Cercas`,
     // `Typecheck`, `Lint`, `Kit self-host`) são todos `if: matrix.parte == N` —
     // então pôr um `if:` de parte neste aqui é uma edição de uma linha, natural
@@ -305,6 +307,12 @@ describe("o preâmbulo do CI não come o orçamento dos testes", () => {
     // Mexer na divisão (reequilibrar passos, criar a parte 3) tem dois erros
     // VERDES: `--shard=N/3` com matrix [1, 2] deixa um terço da suíte sem rodar,
     // e `if: matrix.parte == 3` com matrix [1, 2] deixa o passo sem parte.
+    // Desde 08/10/2026 há parte SEM unit (a última — 4 até 23/10/2026, 7 até 03/11/2026; hoje 7 e 8:
+    // cercas + as duas fatias do kit), excluídas por
+    // `if: matrix.parte != 7 && matrix.parte != 8` no passo de unit — então o N do shard é o número de
+    // partes que RODAM unit, não o tamanho da matrix. Os dois erros verdes novos:
+    // tirar a exclusão (a parte 7 roda `--shard=7/6`, que o vitest recusa ou
+    // duplica) e excluir uma parte do meio (um sexto da suíte sem rodar).
     // Que o `--shard` do vitest corta em fatias disjuntas que somam tudo foi
     // provado com o sequenciador dele no PR que moveu o lint (1108 = 554 + 554).
     const texto = readFileSync(join(DIR_WORKFLOWS, "ci.yml"), "utf8");
@@ -321,10 +329,27 @@ describe("o preâmbulo do CI não come o orçamento dos testes", () => {
     expect(partes, "a matrix `parte: [...]` não foi encontrada").toBeDefined();
     expect(partes, "as partes têm de ser 1..N, sem buraco").toEqual(partes!.map((_, i) => i + 1));
 
-    const shards = [...job.matchAll(/--shard=\$\{\{ matrix\.parte \}\}\/(\d+)/g)].map((m) => Number(m[1]));
-    expect(shards, "o passo de unit tem de recortar com --shard=${{ matrix.parte }}/N").toEqual([partes!.length]);
+    // As partes que rodam unit: a matrix MENOS as que o `if:` do passo de unit exclui.
+    const passoUnit = job.match(/^\s+- name: Unit tests[^\n]*\n((?:(?!\s+- (?:name|uses):)[^\n]*\n)*)/m)?.[1];
+    expect(passoUnit, "o passo `Unit tests` não foi encontrado — esta guarda cegou").toBeDefined();
+    const condicaoUnit = passoUnit!.match(/^\s+if: (.*)$/m)?.[1] ?? "";
+    const excluidas = [...condicaoUnit.matchAll(/matrix\.parte != (\d+)/g)].map((m) => Number(m[1]));
+    expect(
+      condicaoUnit.replace(/\s*matrix\.parte != \d+\s*(&&\s*)?/g, "").trim(),
+      "o `if:` do passo de unit só pode EXCLUIR partes (`matrix.parte != N`): outra condição o pula sem a conta abaixo ver",
+    ).toBe("");
+    const comUnit = partes!.filter((n) => !excluidas.includes(n));
+    expect(
+      comUnit,
+      "as partes que rodam unit têm de ser 1..N: `--shard=${{ matrix.parte }}/N` só cobre a suíte se a parte for o índice do shard",
+    ).toEqual(comUnit.map((_, i) => i + 1));
 
-    const alvos = [...job.matchAll(/matrix\.parte == (\d+)/g)].map((m) => Number(m[1]));
+    const shards = [...job.matchAll(/--shard=\$\{\{ matrix\.parte \}\}\/(\d+)/g)].map((m) => Number(m[1]));
+    expect(shards, "o passo de unit tem de recortar com --shard=${{ matrix.parte }}/N, N = partes que rodam unit").toEqual([
+      comUnit.length,
+    ]);
+
+    const alvos = [...job.matchAll(/matrix\.parte [!=]= (\d+)/g)].map((m) => Number(m[1]));
     expect(alvos.length, "nenhum `if: matrix.parte == N` — o regex cegou").toBeGreaterThan(0);
     expect(alvos.filter((n) => !partes!.includes(n)), "passo preso a uma parte que não existe").toEqual([]);
   });
