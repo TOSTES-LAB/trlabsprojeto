@@ -17,19 +17,42 @@
  */
 import type { SupabaseClient } from "@supabase/supabase-js";
 
+import {
+  MENSAGEM_PROVEDOR_DESLIGADO,
+  provedorDesligadoNaInstalacao,
+} from "@/lib/ai/pontos/provedores-oferecidos";
+
 export interface EscopoDaVersao {
   pipeline_ids?: string[];
   knowledge_source_ids?: string[];
+  /**
+   * Skills por agente (9107). `null`/ausente = todas, e `[]` = nenhuma: nos dois
+   * não há nome para conferir. Os nomes são conferidos contra as skills da
+   * organização E as de plataforma, que valem em toda organização sem instalar.
+   */
+  skill_names?: string[] | null;
   /** `null`/ausente = a chave da instalação; não há o que conferir. */
   credential_id?: string | null;
   channel_session_id?: string | null;
+  /**
+   * O provedor também é escopo: o Zod (compartilhado com o browser) confere que
+   * o sistema o CONHECE; aqui se confere que esta INSTALAÇÃO o oferece — a
+   * assinatura do ChatGPT só com o módulo `login_codex` ligado.
+   */
+  provider?: string;
 }
 
 export type ResultadoDoEscopo =
   | { ok: true }
+  | { ok: false; campo: "provider"; ausentes: string[] }
   | {
       ok: false;
-      campo: "pipeline_ids" | "knowledge_source_ids" | "credential_id" | "channel_session_id";
+      campo:
+        | "pipeline_ids"
+        | "knowledge_source_ids"
+        | "skill_names"
+        | "credential_id"
+        | "channel_session_id";
       ausentes: string[];
     };
 
@@ -45,6 +68,12 @@ export async function validarEscopoDaVersao(
   organizationId: string,
   escopo: EscopoDaVersao,
 ): Promise<ResultadoDoEscopo> {
+  // O `supabase` aqui é o cliente de serviço em todo chamador; com o de sessão,
+  // a leitura do módulo falha e a assinatura é recusada (falha fechada).
+  if (await provedorDesligadoNaInstalacao(supabase, escopo.provider)) {
+    return { ok: false, campo: "provider", ausentes: [escopo.provider ?? ""] };
+  }
+
   const funis = escopo.pipeline_ids ?? [];
   if (funis.length > 0) {
     const { data } = await supabase
@@ -71,6 +100,20 @@ export async function validarEscopoDaVersao(
     const achados = new Set(((data ?? []) as Array<{ id: string }>).map((r) => r.id));
     const ausentes = materiais.filter((id) => !achados.has(id));
     if (ausentes.length > 0) return { ok: false, campo: "knowledge_source_ids", ausentes };
+  }
+
+  const skills = escopo.skill_names ?? [];
+  if (skills.length > 0) {
+    // Uma skill da organização ou de plataforma (`organization_id is null`): a de
+    // plataforma vale sem instalar, e marcá-la é escolha legítima.
+    const { data } = await supabase
+      .from("skill_pointers")
+      .select("name")
+      .or(`organization_id.eq.${organizationId},organization_id.is.null`)
+      .in("name", skills);
+    const achados = new Set(((data ?? []) as Array<{ name: string }>).map((r) => r.name));
+    const ausentes = skills.filter((nome) => !achados.has(nome));
+    if (ausentes.length > 0) return { ok: false, campo: "skill_names", ausentes };
   }
 
   // Credencial e canal são referências únicas, e a FK do banco só confere que
@@ -101,9 +144,18 @@ export function mensagemDoEscopo(r: Extract<ResultadoDoEscopo, { ok: false }>): 
       return `Um dos funis marcados não existe mais nesta organização (${r.ausentes.length}). Recarregue a página e marque de novo.`;
     case "knowledge_source_ids":
       return `Um dos materiais marcados não existe mais, ou foi arquivado (${r.ausentes.length}). Recarregue a página e marque de novo.`;
+    case "skill_names":
+      return `Uma das skills marcadas não existe mais nesta organização (${r.ausentes.length}). Recarregue a página e marque de novo.`;
     case "credential_id":
       return "A credencial escolhida não existe nesta organização. Recarregue a página e escolha de novo.";
     case "channel_session_id":
       return "A conexão escolhida não existe nesta organização. Recarregue a página e escolha de novo.";
+    case "provider":
+      return MENSAGEM_PROVEDOR_DESLIGADO;
   }
+}
+
+/** O código do erro: o provedor desligado tem o seu, como no PUT de `/ai/providers`. */
+export function codigoDoEscopo(r: Extract<ResultadoDoEscopo, { ok: false }>): string {
+  return r.campo === "provider" ? "provedor_desligado" : "validation_failed";
 }

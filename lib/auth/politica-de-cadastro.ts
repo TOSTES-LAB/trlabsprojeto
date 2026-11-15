@@ -202,6 +202,11 @@ async function lerModo(): Promise<ModoDeCadastro | null> {
       .from("platform_settings")
       .select("signup_mode")
       .eq("id", 1)
+      // Fora da deduplicação de `fetch` do Next dentro de um render: sem o `signal`,
+      // uma 2ª leitura do MESMO render, feita depois de uma escrita ter invalidado o
+      // memo, recebe a resposta de ANTES dela e a memoiza. O porquê inteiro está em
+      // `lerLinha` de `lib/branding/instalacao.ts` (#1218). Nunca é abortado.
+      .abortSignal(new AbortController().signal)
       .maybeSingle();
 
     if (error) {
@@ -225,6 +230,47 @@ async function lerModo(): Promise<ModoDeCadastro | null> {
       detalhe: erro instanceof Error ? erro.message : String(erro),
     });
     return null;
+  }
+}
+
+/**
+ * Garante que a linha da instalação exista ANTES de outra tela gravar nela.
+ *
+ * `platform_settings` é singleton e guarda mais do que o cadastro: o
+ * comportamento da instalação, o molde de IA e os destinos internos também
+ * fazem `upsert` na linha 1 (#4244). Quem grava nessa linha chama esta função
+ * antes. Sem
+ * isto, a primeira dessas gravações CRIA a linha, e o `signup_mode` nasce
+ * `'aberto'` pelo default da coluna — e linha presente vence o `SIGNUP_MODE` do
+ * `.env`. Medido em produção em 2026-11-03: instalação com
+ * `SIGNUP_MODE=so_convite` passou a mostrar o `/signup` aberto depois de alguém
+ * salvar outra configuração da instalação.
+ *
+ * A semente é o modo EM VIGOR (sem linha, o piso do `.env`), e linha que já
+ * existe não é tocada. Devolve `false` quando o banco recusou: quem chama não
+ * grava, porque gravar mesmo assim recriaria exatamente o defeito.
+ */
+export async function semearLinhaDaInstalacao(): Promise<boolean> {
+  try {
+    const { error } = await createAdminClient()
+      .from("platform_settings")
+      .upsert(
+        { id: 1, signup_mode: await modoDeCadastro() },
+        { onConflict: "id", ignoreDuplicates: true },
+      );
+    if (error) {
+      logger.error("política de cadastro: não deu para semear a linha da instalação", {
+        codigo: error.code,
+        detalhe: error.message,
+      });
+      return false;
+    }
+    return true;
+  } catch (erro) {
+    logger.error("política de cadastro: semear a linha da instalação falhou", {
+      detalhe: erro instanceof Error ? erro.message : String(erro),
+    });
+    return false;
   }
 }
 

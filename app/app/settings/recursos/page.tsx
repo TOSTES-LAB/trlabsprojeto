@@ -15,11 +15,13 @@
  */
 import { redirect } from "next/navigation";
 
+import { CabecalhoDaSubTela } from "@/components/settings/CabecalhoDaSubTela";
 import { LinhaDoRecurso } from "@/components/recursos-opcionais/LinhaDoRecurso";
 import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { ROLE_RANK, type Role } from "@/lib/auth/types";
 import { traduzir } from "@/lib/i18n/dicionario";
 import {
+  MODULOS_DA_EMPRESA,
   RECURSOS_OPCIONAIS,
   ROTULO_DO_ESTADO,
   estadoDoRecurso,
@@ -51,7 +53,7 @@ export default async function RecursosOpcionaisPage() {
     dono ||
     (r.quemDecide !== "dono_do_servidor" && ROLE_RANK[activeOrg.role] >= ROLE_RANK[PAPEL_QUE_DECIDE[r.quemDecide]]);
 
-  const modulos = RECURSOS_OPCIONAIS.filter((r) => r.nivel === "instalacao" && r.modulo);
+  const modulos = MODULOS_DA_EMPRESA;
   const daEmpresa = RECURSOS_OPCIONAIS.filter((r) => r.nivel === "organizacao");
   const deCadaAgente = RECURSOS_OPCIONAIS.filter((r) => r.nivel === "agente");
 
@@ -78,15 +80,14 @@ export default async function RecursosOpcionaisPage() {
 
   return (
     <div className="flex h-full flex-col gap-8 overflow-y-auto p-6">
-      <header className="space-y-1">
-        <h1 className="text-2xl font-semibold tracking-tight">{traduzir("Recursos opcionais", idioma)}</h1>
+      <CabecalhoDaSubTela className="space-y-1" titulo={traduzir("Recursos opcionais", idioma)} idioma={idioma}>
         <p className="max-w-2xl text-sm text-muted-foreground">
           {traduzir(
             "Tudo o que se liga e desliga, num lugar só. Cada recurso continua sendo ligado na tela dele: o botão Ajustar leva até lá.",
             idioma,
           )}
         </p>
-      </header>
+      </CabecalhoDaSubTela>
 
       <section className="space-y-3" aria-labelledby="recursos-modulos">
         <div className="space-y-1">
