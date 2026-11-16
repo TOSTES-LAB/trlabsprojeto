@@ -28,10 +28,20 @@ export type { InboxRefKind } from '@/lib/ai/inbox-destino';
 export type InboxKind =
   | 'case_stale'
   | 'canal_mudo_sem_numero'
+  // (migration 0589, issue #2389) A pausa de uma conexão era silenciosa para
+  // todo mundo menos para quem clicou. O audit registrava, mas audit é
+  // histórico para quem procura — a Central é comunicação. O item nasce no
+  // `channel.disabled` e se resolve sozinho no `channel.enabled`/arquivamento,
+  // sem clique (laço do canal-mudo, só que instantâneo).
+  | 'canal_pausado'
   | 'appointment_outcome_required'
   | 'appointment_recovery_review'
   | 'qr_rescan'
   | 'routing_unassigned'
+  // (migration 9333, #3966) O número pediu para esperar a IA qualificar e o
+  // prazo venceu sem ela passar a conversa: a conversa entrou na distribuição,
+  // e quem cuida do agente precisa saber que ele não está passando adiante.
+  | 'routing_ia_wait_expired'
   | 'job_dead'
   | 'event_dead'
   | 'budget_exceeded'
@@ -54,6 +64,11 @@ export type InboxKind =
   // mesma coisa, e foi ele que pegou a primeira versão desta mudança — que
   // tinha o banco atualizado e o tipo não.
   | 'channel_template_review'
+  // (migration 9327, issue #3635) O MESMO evento, no canal OFICIAL DIRETO. Kind
+  // separado porque o rótulo e o destino do de cima apontam para a aba do
+  // parceiro: reaproveitá-lo mandaria quem conecta pela Cloud API para a tela
+  // errada. Nasce com `ref_kind='channel_session'`.
+  | 'channel_template_review_direct'
   | 'channel_number_alert'
   | 'midia_nao_lida'
   | 'promise_unfulfilled'
@@ -106,6 +121,32 @@ export type InboxKind =
   // receberam mensagem enquanto ela estava parada. A IA não respondeu e não vai
   // responder sozinha, então quem abre o Inbox é uma pessoa. Nasce sem referência.
   | 'org_reativada'
+  // (migration 0601) Cobrança do revendedor: os avisos da régua ao admin da
+  // empresa (sem referência) e o de 80% do teto de IA do plano (ref_kind plano).
+  | 'cobranca'
+  // (migration 0614) O admin da plataforma trocou o e-mail de login de uma
+  // pessoa da equipe. O aviso leva o nome e a data, nunca o endereço — é
+  // gravado pela rota `PATCH /api/v1/admin/tenants/[id]/members/[userId]/email`.
+  | 'email_de_login_trocado'
+  // (migration 0655, issue #2529) O prazo da tarefa pede gente ANTES de vencer
+  // (`task_due`) e pede quando ela vence sem conclusão (`task_overdue`). Dois
+  // kinds, e não um: quem lê a Central decide pelo rótulo se ainda dá tempo de
+  // concluir ou se já é reagendamento — e o cron que os emite decide qual dos
+  // dois dispara pela MESMA lista (`lib/tarefas/preferencia-de-lembrete.ts`).
+  | 'task_due'
+  | 'task_overdue'
+  // (migration 9033, Spec 32) Dois avisos da recuperação das conversas da queda.
+  // `recuperacao_da_queda` é o resumo da conexão (um aberto por conexão, atualizado
+  // numa queda nova). `cliente_sem_resposta_na_queda` é um por conversa cujo cliente
+  // escreveu enquanto o número estava fora e ninguém respondeu. Os dois têm índice
+  // único parcial de aberto, e é o banco que fecha a corrida.
+  | 'recuperacao_da_queda'
+  | 'cliente_sem_resposta_na_queda'
+  // (migration 9027, issue #3371) A conta da assinatura do ChatGPT desconectou
+  // e a renovação foi recusada: 107 turnos com 401 no cliente Obralivre, ~26 h
+  // sem resposta e a Central vazia. UM item por incidente (índice único
+  // parcial), fechado sozinho quando o login volta pela tela de Credenciais.
+  | 'assinatura_desconectada'
   | 'other';
 
 export interface InboxItemRow {

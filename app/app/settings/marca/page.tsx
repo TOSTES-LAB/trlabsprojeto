@@ -29,15 +29,21 @@
  */
 import { redirect } from "next/navigation";
 
+import { CabecalhoDaSubTela } from "@/components/settings/CabecalhoDaSubTela";
 import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { ROLE_RANK } from "@/lib/auth/types";
 import { marcaDaInstalacao } from "@/lib/branding/instalacao";
 import { marcaDaOrganizacaoDeSettings } from "@/lib/branding/organizacao";
+import { estadoDaContaResend } from "@/lib/email/resend-da-organizacao";
+import { dominioDeEndereco } from "@/lib/email/dominio-de-envio";
 import { env } from "@/lib/env";
+import { perfilDoPais } from "@/lib/legal/perfil-do-pais";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 import { traduzir } from "@/lib/i18n/dicionario";
 
 import { FormularioDaMarcaDaOrganizacao } from "./_form";
+import { DominioDeEnvio } from "./_dominio-de-envio";
 
 export const metadata = { title: "Marca" };
 export const dynamic = "force-dynamic";
@@ -57,32 +63,59 @@ export default async function MarcaDaOrganizacaoPage() {
   const supabase = await createClient();
   const { data } = await supabase
     .from("organizations")
-    .select("settings")
+    .select("settings, country")
     .eq("id", activeOrg.orgId)
     .maybeSingle();
 
   const gravada = marcaDaOrganizacaoDeSettings(data?.settings ?? null);
   const linha = await marcaDaInstalacao();
   const idioma = user.idioma;
+  // O vocabulário da EMPRESA no país (#2503): a dica do relatório nomeia o
+  // campo do cadastro e a lei, e os dois mudam com o país. `perfilDoPais`
+  // degrada para o Brasil quando a coluna está vazia ou o país é desconhecido
+  // — e o Brasil tem lei revisada, então o `?? "LGPD"` cobre só o tipo.
+  const perfil = perfilDoPais(data?.country);
+  // A CONTA Resend conectada (#3287, fatia da conta própria). A tabela tem RLS
+  // SEM policy (a chave é segredo), então só o admin client lê — e ele lê SÓ as
+  // colunas seguras (`from_email`, `api_key_last4`): a chave e o ciphertext não
+  // saem do servidor, nem aqui nem em lugar nenhum (critério D).
+  let contaResend: Awaited<ReturnType<typeof estadoDaContaResend>> = null;
+  let contaIndisponivel = false;
+  try { contaResend = await estadoDaContaResend(createAdminClient(), activeOrg.orgId); }
+  catch { contaIndisponivel = true; }
+  // Reply-To pode apontar a outra empresa; quem envia é o From da conta.
+  const dominioDoRemetente = dominioDeEndereco(contaResend?.from_email);
 
   return (
     <div className="flex h-full flex-col gap-6 overflow-y-auto p-6">
-      <header>
-        <h1 className="text-2xl font-semibold tracking-tight">{traduzir("Marca", idioma)}</h1>
+      <CabecalhoDaSubTela titulo={traduzir("Marca", idioma)} idioma={idioma}>
         <p className="max-w-2xl text-sm text-muted-foreground">
           {traduzir("O nome e a cor que a sua empresa mostra para quem trabalha aqui dentro.", idioma)}
         </p>
-      </header>
+      </CabecalhoDaSubTela>
 
       <FormularioDaMarcaDaOrganizacao
         gravada={{
           app_name: gravada?.app_name ?? null,
           accent_hex: gravada?.accent_hex ?? null,
+          accent_dark_hex: gravada?.accent_dark_hex ?? null,
           // O CAMINHO no bucket, não a URL: quem converte é `logoDaCamada`, do
           // lado do navegador, com a base do Storage injetada em runtime. Mandar
           // a URL pronta do servidor faria a tela ter uma segunda regra de
           // montagem, e a que divergisse seria a que ninguém abre.
           logo_path: gravada?.logo_path ?? null,
+          logo_dark_path: gravada?.logo_dark_path ?? null,
+          // O remetente da AUTOMAÇÃO (#3287, fatia 1): os dois campos que a tela
+          // grava junto da marca e lê de volta para preencher os inputs.
+          email_from_name: gravada?.email_from_name ?? null,
+          email_reply_to: gravada?.email_reply_to ?? null,
+        }}
+        // A conta Resend conectada (#3287): só o endereço e os 4 últimos da
+        // chave — a chave em claro NUNCA atravessa esta fronteira.
+        contaResend={{
+          from_email: contaResend?.from_email ?? null,
+          last4: contaResend?.api_key_last4 ?? null,
+          indisponivel: contaIndisponivel,
         }}
         // As DUAS camadas de baixo descem para o formulário, e não uma resolução
         // já pronta: a prévia ao vivo remonta a pilha inteira a cada tecla, pelo
@@ -94,6 +127,7 @@ export default async function MarcaDaOrganizacaoPage() {
           logo_url: linha?.logo_url ?? null,
           logo_path: linha?.logo_path ?? null,
           accent_hex: linha?.accent_hex ?? null,
+          accent_dark_hex: linha?.accent_dark_hex ?? null,
         }}
         // Só os três campos de marca do ambiente, nunca o objeto `env` inteiro:
         // isto atravessa a fronteira para o navegador, e o que atravessa é o que
@@ -103,7 +137,18 @@ export default async function MarcaDaOrganizacaoPage() {
           APP_LOGO_URL: env.APP_LOGO_URL,
           APP_ACCENT_HEX: env.APP_ACCENT_HEX,
         }}
+        // O vocabulário do país desce resolvido a STRING (funções do perfil não
+        // atravessam a fronteira para o navegador): a dica da tela cita o campo
+        // e a lei como o formulário de Configurações → Organização os mostra.
+        vocabulario={{
+          // `null` = país sem citação revisada: a dica sai sem citar lei
+          // (issue #2344) — afirmar LGPD aí seria a citação errada.
+          lei: perfil.lei?.nome ?? null,
+          rotuloNomeLegal: perfil.empresa.rotuloNomeLegal,
+        }}
       />
+
+      <DominioDeEnvio key={dominioDoRemetente ?? "sem-conta"} dominioInicial={dominioDoRemetente} contaIndisponivel={contaIndisponivel} idioma={idioma} />
     </div>
   );
 }

@@ -51,9 +51,12 @@ describe("destinos da Central", () => {
     ["handoff", "contact", `/app/contacts/${ID}`], ["other", "lead", `/app/pipelines/${PIPELINE}?lead=${ID}`],
     ["followup_dead", "followup_enrollment", `/app/ai/followups/enrollments/${ID}`],
     ["qr_rescan", "channel_session", "/app/connections"], ["conhecimento_nao_indexado", "ai_knowledge_source", "/app/ai/knowledge/sources"],
+    ["other", "agenda_reminder_sender", "/app/settings/tenant/agenda"],
     ["other", "ai_provider_credential", "/app/ai/credentials"],
     // O caso aberto na Central, na hora (`lib/escalacao/caso-na-central.handler.ts`).
     ["other", "agent_case", `/app/ai/cases?caso=${ID}`],
+    // Doc 301 = B: o run em que a automação segurou o que fala com o cliente.
+    ["other", "automation_rule_run", "/app/webhooks?aba=atividade"],
   ])("%s/%s abre somente contexto real", async (kind, ref, href) => {
     const l = leitor(); const [item] = await resolverDestinosDosAvisos(l.client, ORG, "admin", [aviso(kind, ref)]);
     expect(item?.destination).toMatchObject({ estado: "disponivel", href });
@@ -130,6 +133,58 @@ describe("destinos da Central", () => {
       expect(oculta?.destination.estado, kind).toBe("indisponivel");
     }
   });
+  it("apresentação do catálogo interrompida (other → conversa) abre a conversa só para quem a enxerga", async () => {
+    const [admin] = await resolverDestinosDosAvisos(leitor().client, ORG, "admin", [aviso("other", "conversation")]);
+    expect(admin?.destination).toEqual({ estado: "disponivel", rotulo: "Abrir conversa", href: `/app/inbox/${ID}` });
+    // Fora do alcance da RLS de quem lê: nem o link, nem a existência.
+    const [oculta] = await resolverDestinosDosAvisos(leitor([]).client, ORG, "agent", [aviso("other", "conversation")]);
+    expect(oculta?.destination.estado).toBe("indisponivel");
+    const [viewer] = await resolverDestinosDosAvisos(leitor().client, ORG, "viewer", [aviso("other", "conversation")]);
+    expect(viewer?.destination.estado).toBe("sem_permissao");
+  });
+
+  it("teto de IA do PLANO leva o admin à tela do plano, e só com a org ativa", async () => {
+    // Sem "plano" na lista de refs, o item virava "Este contexto não está
+    // disponível para você" — a frase falsa na parada mais cara do produto.
+    const [admin, outraOrg] = await resolverDestinosDosAvisos(leitor().client, ORG, "admin", [
+      aviso("budget_exceeded", "plano", ORG),
+      aviso("budget_exceeded", "plano", ID),
+    ]);
+    expect(admin?.destination).toEqual({
+      estado: "disponivel",
+      href: "/app/settings/billing",
+      rotulo: "Abrir plano e cobrança",
+    });
+    expect(outraOrg?.destination.estado).toBe("indisponivel");
+    const [gestor] = await resolverDestinosDosAvisos(leitor().client, ORG, "manager", [
+      aviso("budget_exceeded", "plano", ORG),
+    ]);
+    expect(gestor?.destination.estado).toBe("sem_permissao");
+  });
+
+  it("aviso da cobrança leva o admin a Plano e cobrança, com ou sem referência", async () => {
+    const [daRegua, doTetoDeIa, deOutraOrg] = await resolverDestinosDosAvisos(leitor().client, ORG, "admin", [
+      aviso("cobranca", null, null),
+      aviso("cobranca", "plano", ORG),
+      aviso("cobranca", "plano", ID),
+    ]);
+    expect(daRegua?.destination).toEqual({
+      estado: "disponivel",
+      href: "/app/settings/billing",
+      rotulo: "Abrir plano e cobrança",
+      orientacao: POLITICAS_DE_AVISO.cobranca.orientacao,
+    });
+    expect(doTetoDeIa?.destination).toEqual({
+      estado: "disponivel",
+      href: "/app/settings/billing",
+      rotulo: "Abrir plano e cobrança",
+    });
+    expect(deOutraOrg?.destination.estado).toBe("indisponivel");
+    // Plano é assunto do admin: o gestor vê o aviso e é mandado a quem administra.
+    const [gestor] = await resolverDestinosDosAvisos(leitor().client, ORG, "manager", [aviso("cobranca", null, null)]);
+    expect(gestor?.destination.estado).toBe("sem_permissao");
+  });
+
   it("envio preso representa uma conversa, não todas", async () => {
     const [item] = await resolverDestinosDosAvisos(leitor().client, ORG, "agent", [aviso("message_send_stuck")]);
     expect(item?.destination).toMatchObject({ rotulo: "Abrir uma conversa afetada" });
@@ -141,7 +196,7 @@ describe("destinos da Central", () => {
       for (const papel of ["agent", "admin"] as const) {
         const items = await resolverDestinosDosAvisos(leitor().client, ORG, papel, [
           aviso(kind, null, null), aviso(kind, "conversation", missing),
-          ...p.refs.map(ref => aviso(kind, ref, ref === "organization" || ref === "ai_budget" ? ORG : ID)),
+          ...p.refs.map(ref => aviso(kind, ref, ref === "organization" || ref === "ai_budget" || ref === "plano" ? ORG : ID)),
         ]);
         for (const { destination } of items) {
           if (destination.orientacao) textos.add(destination.orientacao);

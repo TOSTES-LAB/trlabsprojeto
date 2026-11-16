@@ -7,8 +7,61 @@ source "$(dirname "$0")/_common.sh"
 enter_project
 
 BACKUP_DIR="${BACKUP_DIR:-$PROJECT_DIR/backups}"
+# Backup é o banco inteiro, a sessão do WhatsApp (quem a lê fala pelo número da
+# empresa) e os anexos dos clientes: só o dono lê. Todo arquivo de backup nasce
+# no HOST, deste umask e com dono = quem chamou: os `tar` dos contêineres mandam
+# o snapshot pela saída padrão em vez de gravar numa montagem — gravado lá
+# dentro, ele nasceria do umask da imagem (022) e do root do contêiner, ilegível
+# para quem roda o backup pelo grupo docker. O `chmod` fecha a pasta que um
+# backup antigo deixou 755; onde o sistema de arquivos o recusa (CIFS/NFS), o
+# backup segue — os arquivos já nascem 600 — em vez de derrubar o update.sh.
+umask 077
 mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR" 2>/dev/null \
+  || c_ylw "⚠ não consegui fechar a pasta $BACKUP_DIR (chmod 700): os arquivos deste backup saem legíveis só pelo dono, mas a pasta ficou como estava."
+# ── Um backup por pasta de destino (#4222) ───────────────────────────────────
+# O cron diário e o backup de segurança do update.sh são DOIS caminhos para este
+# script, e o timestamp do host tem precisão de segundo: dois processos no mesmo
+# segundo abrem o MESMO `.db-<ts>.sql.gz.parcial`, um valida e publica, e o
+# outro — que ainda tem o inode aberto para escrita — escreve por cima do dump
+# já publicado. Medido no teste: o arquivo passa a reprovar no `gzip -t` com
+# "trailing garbage ignored", e o segundo processo morre no `mv`.
+#
+# A trava mora no DIRETÓRIO DE DESTINO, e não em /tmp: o recurso disputado é a
+# pasta de backups, e duas pastas diferentes (produção e um clone de teste ao
+# lado) não têm por que se esperar. `flock` sobre o descritor de arquivo, e não
+# `mkdir` como lock: o kernel solta a trava quando o processo morre, por
+# QUALQUER caminho — `die`, disco cheio, `kill -9`. Lock preso por um backup que
+# morreu pararia o cron em silêncio, que é pior que a corrida.
+#
+# O lock cobre o script inteiro: o `mv` que publica o dump é o último passo da
+# validação, e é justamente a janela que a issue mediu.
+lock="$BACKUP_DIR/.backup.lock"
+# Quem ESPERA é só quem não pode aceitar "já tem outro rodando": o update.sh
+# exige um backup deste momento como rede antes de tocar no banco. O cron não
+# espera — para ele, dois backups ao mesmo tempo é desperdício, e falhar por
+# isso encheria a caixa de e-mail sem que nenhum backup tivesse deixado de
+# existir; sai 0 dizendo o que houve.
+espera="${BACKUP_ESPERA_LOCK:-0}"
+case "$espera" in ''|*[!0-9]*) espera=0 ;; esac
+if command -v flock >/dev/null 2>&1; then
+  if exec 9>"$lock"; then
+    if ! flock -w "$espera" 9; then
+      if [ "$espera" -gt 0 ]; then
+        die "outro backup em curso nesta pasta ($BACKUP_DIR) há mais de ${espera}s — não sigo sem um backup deste momento."
+      fi
+      c_ylw "⚠ outro backup em curso nesta pasta ($BACKUP_DIR) — saindo sem tocar em arquivo nenhum. O backup que está rodando publica o dump dele; dois ao mesmo tempo corromperiam o arquivo (#4222)."
+      exit 0
+    fi
+  else
+    c_ylw "⚠ não consegui criar a trava $lock: sigo sem exclusão mútua — não rode dois backups ao mesmo tempo nesta pasta."
+  fi
+else
+  c_ylw "⚠ flock não existe neste sistema: sigo sem exclusão mútua — não rode dois backups ao mesmo tempo nesta pasta."
+fi
+
 # Timestamp vem do host (não do script) pra manter determinismo do kit.
+# Depois da trava de propósito: dois processos não podem nascer com o mesmo nome.
 ts="$(date +%Y%m%d-%H%M%S)"
 
 step "Dump do banco → $BACKUP_DIR/db-$ts.sql.gz"
@@ -45,8 +98,7 @@ vol="$(volume_waha_data)"
 # retenção dos 14 e o pareamento do WhatsApp — o que este snapshot existe para
 # poupar — só se dava por perdido no dia do restore.
 parcial="$BACKUP_DIR/.waha-$ts.tgz.parcial"
-if ! docker run --rm -v "${vol}:/data:ro" -v "$BACKUP_DIR:/out" alpine:3.20 \
-       tar czf "/out/${parcial##*/}" -C /data . 2>/dev/null; then
+if ! docker run --rm -v "${vol}:/data:ro" alpine:3.20 tar czf - -C /data . 2>/dev/null > "$parcial"; then
   rm -f "$parcial"
   c_ylw "⚠ não consegui ler o volume das sessões ('$vol'): o backup do banco está feito, mas o pareamento do WhatsApp NÃO entrou nele."
 elif ! tar_tem_sessao "$parcial"; then
@@ -63,9 +115,17 @@ fi
 # restauração devolvia anexos quebrados. Por isso aqui falha é FALHA.
 if [ "${SINGLE_SERVER:-0}" = "1" ]; then
   step "Arquivos anexados (Storage) → $BACKUP_DIR/storage-$ts.tgz"
-  docker run --rm -v "$(dir_do_supabase)/volumes/storage:/data:ro" -v "$BACKUP_DIR:/out" alpine:3.20 \
-    tar czf "/out/storage-$ts.tgz" -C /data . \
-    || die "Não consegui salvar os arquivos anexados: este backup NÃO está completo."
+  parcial_st="$BACKUP_DIR/.storage-$ts.tgz.parcial"
+  origem_storage="$(dir_do_supabase)/volumes/storage"
+  # -v cria a origem ausente e o tar arquiva uma pasta vazia com sucesso.
+  # --mount recusa a origem ausente. O campo source entre aspas é CSV.
+  if ! docker run --rm \
+       --mount "type=bind,\"source=${origem_storage//\"/\"\"}\",target=/data,readonly" alpine:3.20 \
+       tar czf - -C /data . > "$parcial_st"; then
+    rm -f "$parcial_st"
+    die "Não consegui salvar os arquivos anexados: este backup NÃO está completo."
+  fi
+  mv "$parcial_st" "$BACKUP_DIR/storage-$ts.tgz"
   c_grn "✓ anexos: $(du -h "$BACKUP_DIR/storage-$ts.tgz" | awk '{print $1}')"
 fi
 

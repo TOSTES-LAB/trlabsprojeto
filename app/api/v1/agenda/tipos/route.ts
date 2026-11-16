@@ -47,14 +47,24 @@ import { audit } from "@/lib/audit";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { listaTiposDeAtendimento } from "@/lib/agenda/consulta";
 import { TETO_DE_LEMBRETES_EXTRAS } from "@/lib/agenda/lembretes";
+import { variaveisQueOLembretePreenche } from "@/lib/agenda/lembrete-por-modelo";
+import { transportaMensagem } from "@/lib/channels/capabilities";
 import { traduzir } from "@/lib/i18n/dicionario";
 
 export const dynamic = "force-dynamic";
 
 /** As dez do CHECK da tabela. Fora daqui o Postgres recusa — melhor recusar antes. */
 const CATEGORIAS = [
-  "consulta", "procedimento", "retorno", "visita", "vistoria",
-  "reuniao", "call", "orcamento", "demonstracao", "outro",
+  "consulta",
+  "procedimento",
+  "retorno",
+  "visita",
+  "vistoria",
+  "reuniao",
+  "call",
+  "orcamento",
+  "demonstracao",
+  "outro",
 ] as const;
 
 const LOCAIS = ["in_person", "phone", "whatsapp", "video_link", "google_meet"] as const;
@@ -96,6 +106,23 @@ const camposDoTipo = {
    * mensagem para o telefone de um cliente é irreversível.
    */
   reminder_enabled: z.boolean().optional(),
+  /**
+   * O BLOCO DO NEGÓCIO na descrição do evento do Google (#4006, doc 272 = B).
+   *
+   * Nasce desligado (default da coluna, migration 9209) e não tem `.default()`
+   * aqui: no Google todo convidado lê a descrição, inclusive o cliente com
+   * e-mail na ficha, e atualizar o sistema não pode mandar o nome, o telefone e
+   * a etapa do funil para fora sem alguém decidir.
+   */
+  levar_dados_do_negocio: z.boolean().optional(),
+  reminder_channel_session_id: z.string().uuid().nullish(),
+  /**
+   * O modelo aprovado que sai quando a janela de 24 h do cliente fechou
+   * (`lib/agenda/lembrete-por-modelo.ts`). Nulo = como antes: fora da janela o
+   * lembrete não sai e a equipe recebe o aviso. Conferido em
+   * `recusaDoModeloDoLembrete` antes de gravar.
+   */
+  reminder_meta_template_id: z.string().uuid().nullish(),
   /**
    * ⚠️ ESTA FAIXA É MAIS ESTREITA QUE O CHECK DO BANCO, E ISSO CONTRARIA O
    * PARÁGRAFO ACIMA DE PROPÓSITO.
@@ -163,6 +190,9 @@ const camposDoTipo = {
 };
 
 const criarSchema = z.object(camposDoTipo);
+// Somente a criação pode nascer como serviço em rascunho. O PATCH legado não
+// ganha uma porta de ativação: a programação é validada pelo núcleo de serviços.
+const criarComRascunhoSchema = criarSchema.extend({ service_draft: z.boolean().optional() });
 // `.partial()` em vez de repetir os doze campos como opcionais: repetir criaria
 // duas listas para manter em sincronia, e a segunda envelhece calada.
 const alterarSchema = criarSchema.partial().extend({
@@ -209,6 +239,63 @@ const alterarSchema = criarSchema.partial().extend({
 const desativarSchema = z.object({ id: z.string().uuid() });
 
 /**
+ * O MODELO DO LEMBRETE FORA DA JANELA — conferido antes de gravar.
+ *
+ * Três recusas, cada uma com o que fazer, em vez do erro cru do banco:
+ *   - de outra organização (a FK composta da 9092 também recusaria, mas como 500);
+ *   - com variável que o lembrete não tem de onde preencher — o cron nunca o
+ *     mandaria, e a escolha ficaria gravada sem efeito;
+ *   - de OUTRO número que o escolhido no mesmo pedido: o modelo só sai pelo número
+ *     dono dele, e o lembrete nunca troca de número sozinho.
+ *
+ * O status (aprovado, pausado) NÃO é recusa aqui: muda depois da escolha, e quem
+ * confere na hora de mandar é o cron (`lerModeloDoLembrete`).
+ */
+async function recusaDoModeloDoLembrete(
+  admin: ReturnType<typeof createAdminClient>,
+  organizationId: string,
+  campos: { reminder_meta_template_id?: string | null; reminder_channel_session_id?: string | null },
+  t: (texto: string) => string,
+  requestId: string,
+): Promise<Response | null> {
+  if (!campos.reminder_meta_template_id) return null;
+  const { data: modelo, error } = await admin
+    .from("meta_templates")
+    .select("id, name, language, channel_session_id, parameter_format, components")
+    .eq("organization_id", organizationId)
+    .eq("id", campos.reminder_meta_template_id)
+    .maybeSingle();
+  if (error)
+    return fail("internal_error", t("Não foi possível consultar o modelo do lembrete."), 500, {
+      requestId,
+    });
+  if (!modelo)
+    return fail("validation_failed", t("Escolha um modelo aprovado desta organização."), 422, {
+      requestId,
+    });
+  if (variaveisQueOLembretePreenche(modelo) === null)
+    return fail(
+      "validation_failed",
+      t(
+        "Este modelo não serve para o lembrete: ele só pode ter variáveis de texto no corpo, de {{1}} a {{4}}, sem pular número.",
+      ),
+      422,
+      { requestId },
+    );
+  if (
+    campos.reminder_channel_session_id &&
+    modelo.channel_session_id !== campos.reminder_channel_session_id
+  )
+    return fail(
+      "validation_failed",
+      t("O modelo escolhido é de outro número. Escolha um modelo do número que envia os lembretes."),
+      422,
+      { requestId },
+    );
+  return null;
+}
+
+/**
  * O slug sai do NOME, e é estável depois de criado.
  *
  * A ferramenta MCP aceita `event_type_slug`, então o slug é endereço público: se
@@ -217,13 +304,15 @@ const desativarSchema = z.object({ id: z.string().uuid() });
  * e não "mudou de nome". Por isso o PATCH nunca o toca.
  */
 function slugDe(nome: string): string {
-  return nome
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "")
-    .slice(0, 60) || "tipo";
+  return (
+    nome
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 60) || "tipo"
+  );
 }
 
 export async function GET(req: NextRequest): Promise<Response> {
@@ -270,11 +359,16 @@ export async function GET(req: NextRequest): Promise<Response> {
       // ligado — só como pedir que ligue. Um PATCH cego sobre um estado que a
       // leitura não conta é o mesmo controle decorativo, do outro lado.
       reminder_enabled: t.lembreteLigado,
+      levar_dados_do_negocio: t.levarDadosDoNegocio,
+      reminder_channel_session_id: t.lembreteCanalId ?? null,
+      reminder_meta_template_id: t.lembreteModeloId ?? null,
       reminder_minutes_before: t.lembreteAntecedenciaMin,
       reminder_extra_offsets_minutes: t.lembreteDegrausExtras,
       reminder_body: t.lembreteMensagem,
       reminder_bodies: t.lembreteMensagens,
       default_price_cents: t.precoPadraoCents,
+      ...(t.servico ? { service_enabled: true, booking_mode: t.servico.booking_mode, service_capacity: t.servico.capacity,
+        service_revision: t.servico.revision, service_publication_mode: t.servico.publication_mode } : {}),
     })),
     { requestId },
   );
@@ -297,26 +391,53 @@ export async function POST(req: NextRequest): Promise<Response> {
   const teto = await tetoDeEscritaDoToken(authz, "agenda_tipos", requestId ?? "");
   if (teto) return teto;
 
-  const lido = criarSchema.safeParse(await req.json().catch(() => ({})));
+  const lido = criarComRascunhoSchema.safeParse(await req.json().catch(() => ({})));
   if (!lido.success) {
     // A mensagem do Zod passa pelo dicionário, e não direto ao corpo da resposta:
     // as recusas de `reminder_minutes_before` são escritas em português nesta
     // rota, e quem opera em espanhol as receberia cruas. Texto sem entrada
     // degrada para ele mesmo — que é o contrato de `traduzir`.
-    return fail("validation_failed", t(lido.error.issues[0]?.message ?? "corpo inválido"), 422, { requestId });
+    return fail("validation_failed", t(lido.error.issues[0]?.message ?? "corpo inválido"), 422, {
+      requestId,
+    });
   }
 
   const admin = createAdminClient();
+  if (lido.data.reminder_channel_session_id) {
+    const { data: canal, error: erroCanal } = await admin
+      .from("channel_sessions")
+      .select("id, provider, archived_at")
+      .eq("organization_id", authz.organizationId)
+      .eq("id", lido.data.reminder_channel_session_id)
+      .maybeSingle();
+    if (erroCanal)
+      return fail("internal_error", t("Não foi possível consultar o canal do lembrete."), 500, {
+        requestId,
+      });
+    if (!canal || canal.archived_at || !transportaMensagem(canal.provider)) {
+      return fail(
+        "validation_failed",
+        t("Escolha um canal de mensagem não arquivado desta organização."),
+        422,
+        { requestId },
+      );
+    }
+  }
+  const recusaDoModelo = await recusaDoModeloDoLembrete(admin, authz.organizationId, lido.data, t, requestId);
+  if (recusaDoModelo) return recusaDoModelo;
+  const { service_draft, ...fields } = lido.data;
   const { data, error } = await admin
     .from("calendar_event_types")
-    .insert({ ...lido.data, organization_id: authz.organizationId, slug: slugDe(lido.data.name) })
+    .insert({ ...fields, ...(service_draft ? { service_enabled: true, is_active: false, default_owner_user_id: null } : {}), organization_id: authz.organizationId, slug: slugDe(lido.data.name) })
     .select("id, slug")
     .single();
 
   if (error) {
     // 23505 é o slug repetido — recusa esperada, não erro de sistema.
     if (error.code === "23505") {
-      return fail("conflict", `Já existe um tipo com o nome "${lido.data.name}".`, 409, { requestId });
+      return fail("conflict", `Já existe um tipo com o nome "${lido.data.name}".`, 409, {
+        requestId,
+      });
     }
     return fail("internal_error", error.message, 500, { requestId });
   }
@@ -328,7 +449,11 @@ export async function POST(req: NextRequest): Promise<Response> {
     organizationId: authz.organizationId,
     resourceType: "calendar_event_types",
     resourceId: data.id,
-    metadata: { nome: lido.data.name, categoria: lido.data.category, duracao: lido.data.duration_minutes },
+    metadata: {
+      nome: lido.data.name,
+      categoria: lido.data.category,
+      duracao: lido.data.duration_minutes,
+    },
   });
   return ok(data, { requestId, status: 201 });
 }
@@ -354,12 +479,12 @@ export async function PATCH(req: NextRequest): Promise<Response> {
   if (!lido.success) {
     // Idem ao POST: o dicionário na borda, para a recusa do lembrete chegar
     // legível a quem opera em espanhol.
-    return fail("validation_failed", t(lido.error.issues[0]?.message ?? "corpo inválido"), 422, { requestId });
+    return fail("validation_failed", t(lido.error.issues[0]?.message ?? "corpo inválido"), 422, {
+      requestId,
+    });
   }
   const { id, ...bruto } = lido.data;
-  const campos = Object.fromEntries(
-    Object.entries(bruto).filter(([, v]) => v !== undefined),
-  );
+  const campos = Object.fromEntries(Object.entries(bruto).filter(([, v]) => v !== undefined));
   if (Object.keys(campos).length === 0) {
     // Recusa em vez de UPDATE vazio: "alterei" sobre nada é a mesma família de
     // mentira que o "Marcado ✓" sem linha no banco.
@@ -367,6 +492,28 @@ export async function PATCH(req: NextRequest): Promise<Response> {
   }
 
   const admin = createAdminClient();
+  if (lido.data.reminder_channel_session_id) {
+    const { data: canal, error: erroCanal } = await admin
+      .from("channel_sessions")
+      .select("id, provider, archived_at")
+      .eq("organization_id", authz.organizationId)
+      .eq("id", lido.data.reminder_channel_session_id)
+      .maybeSingle();
+    if (erroCanal)
+      return fail("internal_error", t("Não foi possível consultar o canal do lembrete."), 500, {
+        requestId,
+      });
+    if (!canal || canal.archived_at || !transportaMensagem(canal.provider)) {
+      return fail(
+        "validation_failed",
+        t("Escolha um canal de mensagem não arquivado desta organização."),
+        422,
+        { requestId },
+      );
+    }
+  }
+  const recusaDoModelo = await recusaDoModeloDoLembrete(admin, authz.organizationId, lido.data, t, requestId);
+  if (recusaDoModelo) return recusaDoModelo;
   const { data, error } = await admin
     .from("calendar_event_types")
     .update(campos)
