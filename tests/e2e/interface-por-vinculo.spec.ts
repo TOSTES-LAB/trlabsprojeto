@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { createClient } from "@supabase/supabase-js";
-import { test, expect, type Page } from "./helpers/test";
+import { esperarARevelacaoNasCargas, test, expect, type Page } from "./helpers/test";
 import { credenciaisSupabaseDeTeste } from "../../scripts/lib/env-de-teste";
 const credentials = credenciaisSupabaseDeTeste();
 const db = createClient(credentials.url, credentials.serviceRole, {
@@ -42,8 +42,11 @@ test("interface por membro atualiza ao vivo, preserva formulário e convite apli
   const users: string[] = [];
   const orgs: string[] = [];
   const memberContext = await browser.newContext();
+  memberContext.on("page", esperarARevelacaoNasCargas);
   const otherContext = await browser.newContext();
+  otherContext.on("page", esperarARevelacaoNasCargas);
   const guestContext = await browser.newContext();
+  guestContext.on("page", esperarARevelacaoNasCargas);
   try {
     for (const email of emails) {
       const { data, error } = await db.auth.admin.createUser({
@@ -178,7 +181,7 @@ test("interface por membro atualiza ao vivo, preserva formulário e convite apli
     // A coluna também descreve a seleção para quem só pode consultar a equipe.
     await customize(page, emails[2]!, "Produtos");
     await page.getByRole("combobox", { name: `Papel de ${emails[2]}` }).click();
-    await page.getByRole("option", { name: "manager", exact: true }).click();
+    await page.getByRole("option", { name: "Gerente", exact: true }).click();
     await expect(page.getByText("Papel atualizado.", { exact: true })).toBeVisible();
     await other.goto("/app/team");
     await expect(other.getByRole("row").filter({ hasText: emails[2] }).getByText("Personalizada", { exact: true })).toBeVisible();

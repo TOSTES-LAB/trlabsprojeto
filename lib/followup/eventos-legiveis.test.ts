@@ -189,6 +189,15 @@ describe("descreveEvento", () => {
     }
   });
 
+  it("o encerramento pela recusa 'sem interesse' diz o motivo, é do cliente, e tem espanhol e inglês (decisão D3)", () => {
+    const en = JSON.parse(readFileSync("lib/i18n/traducoes/en.json", "utf8")) as Record<string, string>;
+    const r = descreveEvento(evento({ event_type: "cancelled_sem_interesse" }), nos, "pt-BR");
+    expect(r.titulo).toBe("Encerrado porque o cliente disse que não tem interesse");
+    expect(r.autor).toBe("cliente");
+    expect(DICIONARIO[r.titulo]?.es).toBeTruthy();
+    expect(en[r.titulo]).toBeTruthy();
+  });
+
   it("o classificar que espera a resposta diz que ESPERA, e até quando — não parece travado", () => {
     const r = descreveEvento(
       evento({ node_id: "action-1", event_type: EVENTO_CLASSIFICACAO_ESPERANDO, payload: { until: "2026-08-11T12:00:00.000Z" } }),
@@ -208,6 +217,21 @@ describe("descreveEvento", () => {
     );
     expect(r.titulo).toBe("O cliente não respondeu dentro do prazo");
     expect(r.detalhe).toBe("foi para Primeira cutucada");
+  });
+
+  it("o mover recusado diz que o card NÃO andou, com o motivo da recusa", () => {
+    const r = descreveEvento(
+      evento({
+        node_id: "m1",
+        event_type: "move_lead_failed",
+        payload: { error: "Informe o motivo da perda.", codigo: "lost_reason_required" },
+      }),
+      nos,
+      "pt-BR",
+    );
+    expect(r.titulo).toBe("Não conseguiu mover o card para a etapa escolhida");
+    expect(r.detalhe).toBe("Informe o motivo da perda.");
+    expect(r.autor).toBe("motor");
   });
 
   it("tipo desconhecido não vira jargão disfarçado de frase, mas também não some", () => {

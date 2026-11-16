@@ -112,6 +112,21 @@ export async function aplicarRespostaNaCampanha(
 ): Promise<ResumoDaResposta> {
   const { organizationId, contactId, recebidoEm } = entrada;
 
+  // Contato pessoal (spec 21, caminho 6): a resposta dele não carimba NADA —
+  // nem `replied_at`, nem saída. O que estava pendente já saiu no marcar com
+  // status próprio (etapa 4); carimbar aqui ressuscitaria métrica de quem a
+  // operação escondeu.
+  const { data: contato, error: contatoErro } = await admin
+    .from("contacts")
+    .select("is_personal")
+    .eq("organization_id", organizationId)
+    .eq("id", contactId)
+    .maybeSingle();
+  if (contatoErro) throw new Error(`resposta de campanha: leitura do contato — ${contatoErro.message}`);
+  if ((contato as { is_personal?: boolean } | null)?.is_personal === true) {
+    return { atribuiu: false, optOut: 0 };
+  }
+
   // A janela vem da ORGANIZAÇÃO, com o default do produto quando ninguém
   // escolheu. Ler config nunca derruba a atribuição: `lerConfiguracao` cai no
   // padrão em vez de lançar.
@@ -167,6 +182,16 @@ export async function aplicarRespostaNaCampanha(
  * Alcança também quem já recebeu (`sent`/`delivered`/`read`): para essas linhas
  * `opted_out` é métrica — a mensagem saiu e a pessoa pediu para parar, e é isso
  * que a taxa de opt-out mede.
+ *
+ * E quem está `sending`: no broadcast a lista inteira fica `sending` enquanto o
+ * provedor entrega, e quem pede para parar nesse meio tempo ficava de fora. O
+ * provedor não tira uma pessoa da transmissão (o contrato só cancela a
+ * transmissão inteira), então a linha não impede a mensagem que já está na fila
+ * dele — mas sai da contagem certa, e o relatório dele não a reabre
+ * (`opted_out` é estável em `desfechoDaTransmissao`). Com a transmissão ainda em
+ * rascunho a linha impede, sim: `rascunhoSoTemALista` a vê fora da lista e o
+ * rascunho é refeito. Na rodada de sempre, toda
+ * saída de `sending` confere `.eq("status", "sending")`: o opt-out vence.
  */
 async function fecharPorOptOut(
   admin: SupabaseClient,
@@ -192,7 +217,7 @@ async function fecharPorOptOut(
     })
     .eq("organization_id", organizationId)
     .eq("contact_id", contactId)
-    .in("status", ["pending", "queued", "sent", "delivered", "read", "replied"])
+    .in("status", ["pending", "queued", "sending", "sent", "delivered", "read", "replied"])
     .select("id");
   return (data ?? []).length;
 }

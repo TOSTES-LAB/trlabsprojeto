@@ -1,15 +1,31 @@
 /**
  * Evidências já consultadas pelo servidor NESTE turno. Não são uma lista de
  * exceções: o classificador continua lendo a candidata inteira e suas condições.
- * Não recebe histórico, notas do contato, prompt do agente ou argumentos de tool.
+ * Não recebe histórico, prompt do agente ou argumentos de tool. A origem
+ * `servidor_externo` é a exceção sobre dado do contato: o sistema de terceiro
+ * devolve o registro dele, e por isso o conteúdo passa pela redação de dado
+ * pessoal (`anonymize`) antes de ser guardado.
  */
 export interface EvidenciaComercial {
-  origem: "catalogo" | "conhecimento";
+  origem: OrigemDaEvidencia;
   referencia: string;
   titulo: string;
   conteudo: string;
 }
 
+/**
+ * `servidor_externo`: resultado de uma ferramenta do servidor MCP externo
+ * montada como LEITURA (`category: "read"` de `definirFerramentasRemotas`). É
+ * o sistema da empresa — a agenda, o pedido — consultado com a identidade do
+ * contato da conversa. Sustenta RELATAR o que ele registra (data, horário,
+ * situação); é registro consultado, nunca instrução nem política comercial, e
+ * não entra no material da organização (`materialDaOrganizacao`).
+ */
+export type OrigemDaEvidencia = "catalogo" | "conhecimento" | "servidor_externo";
+
+const ORIGENS: readonly OrigemDaEvidencia[] = ["conhecimento", "catalogo", "servidor_externo"];
+
+import { anonymize } from "@/lib/ai/anonymize";
 import { canonizarTipoDeFonte, type TipoDeFonteId } from "@/lib/ai/rag/tipos-de-fonte";
 import type { Queryable } from "../../queue/queue";
 
@@ -18,7 +34,11 @@ import type { Queryable } from "../../queue/queue";
  * CLIENTE escreveu, e um cliente não autoriza oferta. Tipo legado é canonizado
  * antes (`conversations` vira `conversas`), e tipo desconhecido fica de fora.
  */
-const TIPOS_QUE_PROVAM_OFERTA: ReadonlySet<TipoDeFonteId> = new Set(["faq", "documento", "catalogo"]);
+const TIPOS_QUE_PROVAM_OFERTA: ReadonlySet<TipoDeFonteId> = new Set([
+  "faq",
+  "documento",
+  "catalogo",
+]);
 
 export function fontesQueProvamOferta(
   fontes: readonly { id: string; source_type: string }[],
@@ -48,6 +68,24 @@ export async function carregarFontesQueProvamOferta(
 const MAX_EVIDENCIAS = 20;
 const MAX_CARACTERES = 16_000;
 const MAX_POR_EVIDENCIA = 4_000;
+// O orçamento enviado ao revisor é menor que o acervo do turno. Um catálogo
+// amplo não deve eliminar a política antes de sabermos o que será afirmado.
+const MAX_ACERVO_POR_ORIGEM = 100;
+const MAX_CARACTERES_POR_ORIGEM = 100_000;
+
+function termos(value: string): Set<string> {
+  return new Set(
+    (
+      value
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .match(/[a-z0-9]+(?:[.,][0-9]+)?/g) ?? []
+    )
+      .filter((t) => t.length >= 2)
+      .map((t) => t.replace(",", ".")),
+  );
+}
 
 function objeto(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
@@ -63,20 +101,24 @@ export function criarEvidenciasComerciaisDoTurno(fontesHabilitadas: readonly str
   const fontes = new Set(fontesHabilitadas);
   const evidencias = new Map<string, EvidenciaComercial>();
 
-  function guardar(evidencia: EvidenciaComercial) {
+  /** `false` quando a evidência passa do teto e fica de fora. */
+  function guardar(evidencia: EvidenciaComercial): boolean {
     const chave = `${evidencia.origem}:${evidencia.referencia}`;
     evidencias.delete(chave);
     // Nunca cortar uma frase: a ressalva no fim pode mudar toda a autorização.
-    if (JSON.stringify(evidencia).length > MAX_POR_EVIDENCIA) return;
+    if (JSON.stringify(evidencia).length > MAX_POR_EVIDENCIA) return false;
     evidencias.set(chave, evidencia);
+    const daOrigem = () =>
+      [...evidencias.entries()].filter(([, e]) => e.origem === evidencia.origem);
     while (
-      evidencias.size > MAX_EVIDENCIAS ||
-      JSON.stringify([...evidencias.values()]).length > MAX_CARACTERES
+      daOrigem().length > MAX_ACERVO_POR_ORIGEM ||
+      JSON.stringify(daOrigem().map(([, e]) => e)).length > MAX_CARACTERES_POR_ORIGEM
     ) {
-      const primeira = evidencias.keys().next().value;
+      const primeira = daOrigem()[0]?.[0];
       if (primeira === undefined) break;
       evidencias.delete(primeira);
     }
+    return true;
   }
 
   function registrarConhecimento(resultado: unknown) {
@@ -123,10 +165,88 @@ export function criarEvidenciasComerciaisDoTurno(fontesHabilitadas: readonly str
     }
   }
 
+  let consultasRemotas = 0;
+
+  /**
+   * Só retornos bem-sucedidos (`{ texto, dados? }` de `definirFerramentasRemotas`).
+   * Erro do servidor, recusa de escopo e resultado vazio não viram evidência.
+   * `dados` em lista vira uma evidência por item: a agenda com vários horários
+   * não cai inteira no teto de uma evidência. Item acima do teto é descartado
+   * inteiro, como nas outras origens (cortar poderia esconder a ressalva do
+   * fim), e o tamanho de cada descarte volta a quem chamou, para o log do turno.
+   */
+  function registrarLeituraRemota(nome: string, resultado: unknown): number[] {
+    const r = objeto(resultado);
+    if (!r || r.error || r.erro || r.ok === false || r.permitido === false) return [];
+    const temDados = r.dados !== undefined && r.dados !== null;
+    const partes = !temDados ? [r.texto] : Array.isArray(r.dados) ? r.dados : [r.dados];
+    consultasRemotas += 1;
+    const descartadas: number[] = [];
+    partes.forEach((parte, i) => {
+      const bruto =
+        typeof parte === "string" ? texto(parte) : parte == null ? null : JSON.stringify(parte);
+      if (!bruto) return;
+      const evidencia: EvidenciaComercial = {
+        origem: "servidor_externo",
+        referencia: `${nome}:${consultasRemotas}${partes.length > 1 ? `.${i + 1}` : ""}`,
+        titulo: `Consulta ao sistema externo: ${nome}`,
+        conteudo: anonymize(bruto).anonymized,
+      };
+      if (!guardar(evidencia)) descartadas.push(JSON.stringify(evidencia).length);
+    });
+    return descartadas;
+  }
+
   return {
     registrarConhecimento,
     registrarCatalogo,
-    // Cópia: consumidor não muda o estado compartilhado pelas consultas do turno.
-    ler: (): EvidenciaComercial[] => [...evidencias.values()].map((e) => ({ ...e })),
+    registrarLeituraRemota,
+    // Relevância escolhe o CONTEXTO, nunca concede autorização. O classificador
+    // recebe os trechos completos, inclusive condições/negações, e decide.
+    ler: (candidata = ""): EvidenciaComercial[] => {
+      const consulta = termos(candidata);
+      const acervo = [...evidencias.values()].map((e, ordem) => ({
+        e,
+        ordem,
+        palavras: termos(`${e.titulo} ${e.conteudo}`),
+      }));
+      const frequencias = new Map<string, number>();
+      for (const { palavras } of acervo)
+        for (const palavra of palavras)
+          frequencias.set(palavra, (frequencias.get(palavra) ?? 0) + 1);
+      const ordenadas = acervo
+        .map((item) => ({
+          ...item,
+          pontos: [...consulta].reduce(
+            (n, t) => n + (item.palavras.has(t) ? 1 / (frequencias.get(t) ?? 1) : 0),
+            0,
+          ),
+        }))
+        .sort((a, b) => b.pontos - a.pontos || b.ordem - a.ordem);
+      const escolhidas: EvidenciaComercial[] = [];
+      const usadas = new Set<EvidenciaComercial>();
+      function adicionar(e: EvidenciaComercial) {
+        if (usadas.has(e) || escolhidas.length >= MAX_EVIDENCIAS) return;
+        if (JSON.stringify([...escolhidas, e]).length > MAX_CARACTERES) return;
+        escolhidas.push(e);
+        usadas.add(e);
+      }
+      // Reserva mínima para cada origem: política e produto complementam-se.
+      // O restante segue a relevância global, sem duplicar ou truncar itens.
+      for (let i = 0; i < 3; i++)
+        for (const origem of ORIGENS) {
+          const item = ordenadas.filter(({ e }) => e.origem === origem)[i];
+          if (item) adicionar(item.e);
+        }
+      for (const { e } of ordenadas) adicionar(e);
+      return escolhidas.map((e) => ({ ...e }));
+    },
+    // Inclui também itens fora do pacote selecionado: uma consulta pode mudar
+    // qual item é pertinente à mesma candidata. Usado só no memo do turno.
+    contexto: (): string => JSON.stringify([...evidencias.values()]),
+    // O que a ORGANIZAÇÃO escreveu ou cadastrou, para o lastro de concessão. O
+    // registro do servidor externo fica fora: ele relata, não autoriza.
+    materialDaOrganizacao: (): string =>
+      JSON.stringify([...evidencias.values()].filter((e) => e.origem !== "servidor_externo")),
   };
 }

@@ -29,7 +29,11 @@ interface Linha extends Record<string, unknown> {
 /** Banco em memória: aplica eq/in/is/gt/lt, como o PostgREST. */
 function bancoDeLista(rows: Linha[]) {
   const aplicados: Record<string, unknown[]> = {};
-  let dados = rows;
+  // Estado POR TABELA, como no banco de verdade: uma consulta em `contacts`
+  // (ex.: os ids de pessoais da spec 21) nunca filtra as linhas de
+  // `conversations`. Estado compartilhado entre tabelas apagaria a lista.
+  function cadeiaPara(dadosIniciais: Linha[]) {
+    let dados = dadosIniciais;
   const cadeia: Record<string, unknown> = {
     select: () => cadeia,
     order: () => cadeia,
@@ -69,11 +73,14 @@ function bancoDeLista(rows: Linha[]) {
       resolve: (v: { data: unknown; error: null }) => unknown,
       reject?: (e: unknown) => unknown,
     ) => Promise.resolve({ data: dados, error: null }).then(resolve, reject),
-  };
+    };
+    return { cadeia, linhas: () => dados };
+  }
+  const principal = cadeiaPara(rows);
   const supabase = {
-    from: () => cadeia,
+    from: (tabela: string) => (tabela === "conversations" ? principal.cadeia : cadeiaPara([]).cadeia),
   } as never;
-  return { supabase, aplicados, resultado: () => dados };
+  return { supabase, aplicados, resultado: () => principal.linhas() };
 }
 
 const ctx: HandlerCtx = {
@@ -103,8 +110,8 @@ function montarQ(params: Record<string, string>) {
 }
 
 const FIXTURE: Linha[] = [
-  { id: "grupo-1", organization_id: ORG, is_group: true, group_chat_id: "1@g.us", contact_id: "ct-g", status: "open", comando_da_conversa: "aguardando", last_message_at: "2026-10-01T00:00:00Z", awaiting_since: "2026-10-01T00:00:00Z" },
-  { id: "pessoa-1", organization_id: ORG, is_group: false, group_chat_id: null, contact_id: "ct-p", status: "open", comando_da_conversa: "aguardando", last_message_at: "2026-10-02T00:00:00Z", awaiting_since: "2026-10-02T00:00:00Z" },
+  { id: "grupo-1", organization_id: ORG, is_group: true, group_chat_id: "1@g.us", contact_id: "ct-g", status: "open", assigned_to_user_id: null, comando_da_conversa: "aguardando", last_message_at: "2026-10-01T00:00:00Z", awaiting_since: "2026-10-01T00:00:00Z" },
+  { id: "pessoa-1", organization_id: ORG, is_group: false, group_chat_id: null, contact_id: "ct-p", status: "open", assigned_to_user_id: null, comando_da_conversa: "aguardando", last_message_at: "2026-10-02T00:00:00Z", awaiting_since: "2026-10-02T00:00:00Z" },
 ];
 
 describe("a cadeia do filtro is_group (#2103)", () => {
