@@ -65,6 +65,12 @@ describe("a consulta dos compromissos", () => {
     expect(chamadas[0]!.sql).toContain("ends_at >= $3");
   });
 
+  it("lê o local da reserva", async () => {
+    const { q, chamadas } = db();
+    await compromissosDoContato(q, ORG, CONTATO, AGORA);
+    expect(chamadas[0]!.sql).toContain("location_kind, location_details");
+  });
+
   it("pede uma linha a mais que o teto — é assim que se sabe que truncou", async () => {
     const { q, chamadas } = db();
     await compromissosDoContato(q, ORG, CONTATO, AGORA);
@@ -83,8 +89,17 @@ describe("o bloco em texto", () => {
 
   it("⭐ traz horário e título do compromisso", () => {
     const t = renderCompromissos([linha(4)]);
-    expect(t).toContain("2026-09-04T14:00:00Z");
+    expect(t).toContain("2026-09-04T11:00:00-03:00");
     expect(t).toContain("Consulta 4");
+  });
+
+  it("⭐ mostra o local que o revisor de promessas confere", () => {
+    const t = renderCompromissos([
+      { ...linha(4), location_kind: "in_person", location_details: "Unidade Centro" },
+      { ...linha(5), location_kind: "whatsapp" },
+    ]);
+    expect(t).toContain("Consulta 4 (confirmed) — Presencial · Unidade Centro");
+    expect(t).toContain("Consulta 5 (confirmed) — WhatsApp");
   });
 
   it("sem compromisso, o bloco é VAZIO — não custa tokens para dizer 'nenhum'", () => {

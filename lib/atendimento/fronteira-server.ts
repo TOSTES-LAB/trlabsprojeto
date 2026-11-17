@@ -11,6 +11,7 @@ import {
   parseServiceBoundary,
   type CurrentServiceBoundary,
   type ServiceBoundary,
+  StaleServiceBoundaryError,
 } from "./fronteira";
 
 const execution = new AsyncLocalStorage<{
@@ -46,18 +47,52 @@ export async function requireCurrentServiceBoundary(
       : null,
   );
 }
+/**
+ * Roda `acao` fora do turno em curso, para um efeito que pertence a OUTRO contato:
+ * o agente cancela o compromisso de um cliente e a vaga é oferecida a outro.
+ */
+export function foraDaFronteira<T>(acao: () => Promise<T>): Promise<T> {
+  return execution.exit(acao);
+}
 export function currentExecutionBoundary(): ServiceBoundary | null {
   return execution.getStore()?.boundary ?? null;
 }
 export function currentExecutionJob(): JobRow | null {
   return execution.getStore()?.job ?? null;
 }
+export function currentExecutionAgentOperation(): AgentOperationContext | null {
+  return execution.getStore()?.agentOperation ?? null;
+}
 export function setExecutionAgentOperation(context: AgentOperationContext): void {
   const scope = execution.getStore();
   if (scope) scope.agentOperation = context;
 }
+/** O lease original não volta a autorizar o turno depois de Assumir → Devolver.
+ * A atribuição invalida apenas trabalhos autônomos; aprovação humana, entrega
+ * de compromisso e operador têm outra autoridade e não passam por esta regra.
+ */
+export async function requireCurrentAutonomousTurn(
+  db: Queryable,
+  job: Pick<
+    JobRow,
+    "id" | "organization_id" | "contact_id" | "kind" | "locked_by" | "claim_acquired_at"
+  >,
+): Promise<void> {
+  if (!["inbound_turn", "followup_turn", "case_reply_turn"].includes(job.kind)) return;
+  const claim = claimOfJob(job);
+  if (!claim) throw new StaleServiceBoundaryError();
+  const { rows } = await db.query<{ current: boolean }>(
+    `select exists(select 1 from job_queue where organization_id=$1 and id=$2
+      and contact_id=$3 and kind=$4 and status='running'
+      and locked_by=$5 and locked_at=$6::timestamptz
+      and not public.fn_autonomous_turn_revoked($1,job_queue.id)) as current`,
+    [job.organization_id, job.id, job.contact_id, job.kind, claim.worker_id, claim.acquired_at],
+  );
+  if (!rows[0]?.current) throw new StaleServiceBoundaryError();
+}
 export async function guardServiceEffect(): Promise<void> {
   const scope = execution.getStore();
+  if (scope?.job) await requireCurrentAutonomousTurn(scope.db, scope.job);
   if (scope?.agentOperation) await assertAgentOperationPg(scope.db, scope.agentOperation);
   if (scope) await requireCurrentServiceBoundary(scope.db, scope.boundary);
   if (scope?.job?.kind === "transactional_delivery") {
@@ -114,6 +149,7 @@ export async function withServiceJob<T>(
     assertCurrentServiceBoundary(null, null);
   }
   await requireCurrentServiceBoundary(db, boundary);
+  await requireCurrentAutonomousTurn(db, job);
   return execution.run({ db, boundary, job }, () =>
     job.kind === "followup_turn" && job.contact_id
       ? withAgendaEffect(
@@ -148,6 +184,12 @@ export function guardServiceTools(tools: ToolSet | undefined): ToolSet | undefin
     "crm_describe_external_data",
     "crm_query_external_data",
   ]);
+  // As guardas das chamadas paralelas de um passo correm em fila: cada `execute`
+  // começa na ordem em que o modelo escreveu as chamadas, não na ordem em que a
+  // consulta da guarda voltou. É dessa ordem que depende a fila de envio do turno
+  // (`lib/agent-engine/agent/fila-de-envio.ts`). Uma guarda que falha não trava as
+  // seguintes: cada uma confere o próprio efeito.
+  let guardaAnterior: Promise<unknown> = Promise.resolve();
   return Object.fromEntries(
     Object.entries(tools).map(([name, definition]) => {
       if (reads.has(name) || !definition.execute) return [name, definition];
@@ -156,9 +198,10 @@ export function guardServiceTools(tools: ToolSet | undefined): ToolSet | undefin
         name,
         {
           ...definition,
-          execute: async (...args: Parameters<typeof execute>) => {
-            await guardServiceEffect();
-            return execute(...args);
+          execute: (...args: Parameters<typeof execute>) => {
+            const guarda = guardaAnterior.then(() => guardServiceEffect());
+            guardaAnterior = guarda.catch(() => undefined);
+            return guarda.then(() => execute(...args));
           },
         },
       ];
