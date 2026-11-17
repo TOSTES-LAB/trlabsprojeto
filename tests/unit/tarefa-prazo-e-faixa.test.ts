@@ -15,9 +15,12 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import {
   agrupaPorPrazo,
+  calcularUrgenciaDoPrazo,
   diaLocalDoPrazo,
   estaAtrasada,
+  estaEncerrada,
   faixaDePrazo,
+  proximoEstadoAoAlternar,
   type Tarefa,
 } from "@/lib/tarefas/tipos";
 
@@ -35,8 +38,11 @@ function tarefa(p: Partial<Tarefa>): Tarefa {
     status: "pending",
     lead_id: null,
     contact_id: null,
+    demanda_id: null,
     assigned_to: null,
     created_by: null,
+    // A série (#4595): nula = tarefa avulsa, que é o caso de todo o histórico.
+    recurrence: null,
     created_at: AGORA.toISOString(),
     updated_at: AGORA.toISOString(),
     ...p,
@@ -124,5 +130,86 @@ describe("o dia do calendário é o dia de QUEM OLHA", () => {
 
   it("prazo de manhã também casa com o próprio dia", () => {
     expect(diaLocalDoPrazo(local(2026, 3, 5, 9))).toBe("2026-03-05");
+  });
+});
+
+/**
+ * #2549 — a caixa "Reabrir a tarefa" numa tarefa CANCELADA gravava `done`.
+ *
+ * A caixa da lista é pintada por `estaEncerrada` (cancelada = encerrada, caixa
+ * marcada, rótulo "Reabrir"), mas o cliente decidia o próximo status olhando
+ * só `done`. Dois códigos dizendo o que é "encerrada": o clique reabria para
+ * CONCLUÍDA e a rota registrava "Tarefa concluída" na linha do tempo. A regra
+ * agora é uma função pura só, e é ela que este bloco prende.
+ */
+describe("alternar a caixa da lista (#2549)", () => {
+  it("cancelada reabre para pendente — NUNCA para concluída", () => {
+    // Previsto na `main` antiga: `cancelled` não era `done`, a condição caía no
+    // ramo falso e o PATCH saía com {"status":"done"}. Medido aqui: `pending`.
+    expect(proximoEstadoAoAlternar("cancelled")).toBe("pending");
+    expect(proximoEstadoAoAlternar("cancelled")).not.toBe("done");
+  });
+
+  it("concluída reabre para pendente — o caso que já funcionava", () => {
+    expect(proximoEstadoAoAlternar("done")).toBe("pending");
+  });
+
+  it("o que ainda pede ação vira concluída", () => {
+    expect(proximoEstadoAoAlternar("pending")).toBe("done");
+    expect(proximoEstadoAoAlternar("in_progress")).toBe("done");
+  });
+
+  it("a caixa e o cliente partilham a MESMA regra do que é encerrada", () => {
+    // Se a função voltar a divergir de `estaEncerrada`, a tela mostra
+    // "Reabrir a tarefa" e o cliente grava outra coisa — que era o defeito.
+    for (const status of ["pending", "in_progress", "done", "cancelled"] as const) {
+      const proximo = proximoEstadoAoAlternar(status);
+      const reabriu = proximo === "pending";
+      expect(reabriu).toBe(estaEncerrada({ status }));
+    }
+  });
+});
+
+describe("farol preventivo de prazos (calcularUrgenciaDoPrazo)", () => {
+  it("sem prazo ou encerrada retorna 'normal'", () => {
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: null }), AGORA)).toBe("normal");
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: local(2026, 9, 1, 10), status: "done" }), AGORA)).toBe("normal");
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: local(2026, 9, 1, 10), status: "cancelled" }), AGORA)).toBe("normal");
+  });
+
+  it("prazo vencido retorna 'atrasada'", () => {
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: local(2026, 9, 1, 10) }), AGORA)).toBe("atrasada");
+  });
+
+  it("prazo em até 24h úteis retorna 'vence_hoje'", () => {
+    // AGORA = 2026-09-02 10:00 (quarta). Mesma quarta às 18:00 (8h úteis)
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: local(2026, 9, 2, 18) }), AGORA)).toBe("vence_hoje");
+  });
+
+  it("prazo entre 24h e 48h úteis retorna 'atencao_48h'", () => {
+    // Quinta-feira às 18:00 (32h úteis)
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: local(2026, 9, 3, 18) }), AGORA)).toBe("atencao_48h");
+  });
+
+  it("prazo além de 48h úteis retorna 'normal'", () => {
+    // Segunda-feira da próxima semana
+    expect(calcularUrgenciaDoPrazo(tarefa({ due_date: local(2026, 9, 7, 10) }), AGORA)).toBe("normal");
+  });
+
+  it("proteção de fim de semana: sexta-feira à tarde alertando para segunda de manhã", () => {
+    // Sexta-feira 16h (2026-09-04 16:00)
+    const sexta16h = new Date(2026, 8, 4, 16, 0, 0);
+    // Segunda-feira 10h (2026-09-07 10:00)
+    const segunda10h = local(2026, 9, 7, 10, 0);
+
+    // Com padrão Seg-Sex: fim de semana é ignorado, restam 18h úteis -> 'vence_hoje'
+    expect(
+      calcularUrgenciaDoPrazo(tarefa({ due_date: segunda10h }), sexta16h, { diasUteis: [1, 2, 3, 4, 5] }),
+    ).toBe("vence_hoje");
+
+    // Se a empresa trabalha sábado: restam 42h úteis -> 'atencao_48h'
+    expect(
+      calcularUrgenciaDoPrazo(tarefa({ due_date: segunda10h }), sexta16h, { diasUteis: [1, 2, 3, 4, 5, 6] }),
+    ).toBe("atencao_48h");
   });
 });
