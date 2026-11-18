@@ -42,6 +42,29 @@ async function inbound(id = conversation, at?: string, direction = "inbound") {
 async function state(id = conversation) {
   return (await pool.query("select * from conversations where id=$1", [id])).rows[0];
 }
+// A proteção de execução exige o lease real que o worker recebe da fila.
+// Mantemos o assunto testado; só o preparo do turno deixa de inventar JobRow.
+async function withClaimedJob(
+  kind: "inbound_turn" | "followup_turn",
+  ct: string,
+  boundary: Awaited<ReturnType<typeof readCurrentServiceBoundary>>,
+  action: () => Promise<void>,
+) {
+  const { rows } = await pool.query<JobRow>(
+    `insert into job_queue(organization_id, contact_id, kind, payload, status, locked_by, locked_at)
+     values($1,$2,$3,$4,'running','service-boundary-test',clock_timestamp())
+     returning *, locked_at::text as claim_acquired_at`,
+    [GOV_ORG, ct, kind, { service_boundary: boundary }],
+  );
+  try {
+    await withServiceJob(pool, rows[0]!, action);
+  } finally {
+    await pool.query("delete from job_queue where organization_id=$1 and id=$2", [
+      GOV_ORG,
+      rows[0]!.id,
+    ]);
+  }
+}
 async function close(id = conversation) {
   const c = await state(id);
   return (
@@ -99,9 +122,9 @@ describe("transição real de atendimento", () => {
         c.current_demanda_id,
         GOV_AGENT_A,
       ]),
-    ).rejects.toMatchObject({ code: "40001" });
+    ).rejects.toMatchObject({ code: "PT409" });
   });
-  it("antigo/igual/outbound não reabre; nova entrada concorrente reabre uma vez e invalida trabalho antigo", async () => {
+  it("atrasada reabre pela ordem de CHEGADA; saída não reabre e a reabertura é uma só", async () => {
     const closed = await state();
     // 0228 coalesce trabalho ativo por org/conversa. Arma backoff futuro para
     // provar que a reabertura acorda a fila, sem exigir evento duplicado.
@@ -115,9 +138,14 @@ describe("transição real de atendimento", () => {
       )
     ).rows;
     expect(pending).toHaveLength(1);
-    const at = closed.service_closed_at.toISOString();
-    await inbound(conversation, at);
-    await inbound(conversation, "2000-01-01");
+    const carimbo = async (id: string) =>
+      (await pool.query("select service_revision from messages where id=$1", [id])).rows[0]
+        .service_revision;
+    // A fronteira do episódio encerrado, lida enquanto ele ainda está encerrado.
+    const old = await readCurrentServiceBoundary(pool, GOV_ORG, conversation);
+
+    // Saída não reabre nada: o `fn_service_inbound` devolve cedo em
+    // `m.direction <> 'inbound'` e a fila não é rearmada.
     await inbound(conversation, undefined, "outbound");
     expect((await state()).status).toBe("closed");
     const stillWaiting = (
@@ -127,12 +155,29 @@ describe("transição real de atendimento", () => {
       ])
     ).rows[0];
     expect(stillWaiting.next_attempt_at).toEqual(pending[0].next_attempt_at);
-    const old = await readCurrentServiceBoundary(pool, GOV_ORG, conversation);
-    await Promise.all([inbound(), inbound()]);
+
+    // ── A LEI QUE A #3015 MUDOU ─────────────────────────────────────────────
+    // Antes, as duas entradas abaixo NÃO reabriam: o guard
+    // `if m.sent_at <= c.service_closed_at then return; end if` vinha ANTES do
+    // cálculo de `reopened`, e uma mensagem entregue atrasada (sent_at igual ou
+    // anterior ao fechamento) era descartada em silêncio — a conversa seguia
+    // encerrada COM a mensagem dentro e o Inbox não a mostrava. Agora reabrem: a
+    // ordem do CANAL decide se a atrasada entra no episódio em curso, nunca se um
+    // cliente que escreveu depois do fechamento volta a ser atendido.
+    const atrasada = await inbound(conversation, "2000-01-01");
+    // Com a conversa JÁ reaberta, o guard volta a valer: esta segunda atrasada
+    // (sent_at igual ao fechamento) não cria episódio nenhum.
+    const segundaAtrasada = await inbound(conversation, closed.service_closed_at.toISOString());
+
     const reopened = await state();
     expect(reopened.status).toBe("open");
     expect(Number(reopened.service_revision)).toBe(Number(closed.service_revision) + 1);
     expect(reopened.current_demanda_id).not.toBe(closed.current_demanda_id);
+    expect(await carimbo(atrasada), "a atrasada que reabriu entra no episódio novo").not.toBeNull();
+    expect(
+      await carimbo(segundaAtrasada),
+      "a segunda atrasada, com a conversa já aberta, fica fora do episódio",
+    ).toBeNull();
     await expect(requireCurrentServiceBoundary(pool, old)).rejects.toThrow(
       "service_boundary_stale",
     );
@@ -157,6 +202,19 @@ describe("transição real de atendimento", () => {
       },
     });
     expect(routing[0].next_attempt_at.getTime()).toBeLessThan(pending[0].next_attempt_at.getTime());
+  });
+  it("duas entradas concorrentes reabrem a conversa fechada uma vez só", async () => {
+    await close();
+    const closed = await state();
+    const old = await readCurrentServiceBoundary(pool, GOV_ORG, conversation);
+    await Promise.all([inbound(), inbound()]);
+    const reopened = await state();
+    expect(reopened.status).toBe("open");
+    expect(Number(reopened.service_revision)).toBe(Number(closed.service_revision) + 1);
+    expect(reopened.current_demanda_id).not.toBe(closed.current_demanda_id);
+    await expect(requireCurrentServiceBoundary(pool, old)).rejects.toThrow(
+      "service_boundary_stale",
+    );
   });
   it("CAS de close obsoleto não fecha nova revisão; escopo forjado é recusado", async () => {
     // PT409, não 40001 (migration 0514): revisão obsoleta é recusa PERMANENTE, e
@@ -239,13 +297,7 @@ describe("transição real de atendimento", () => {
     await inbound();
     const boundary = await readCurrentServiceBoundary(pool, GOV_ORG, conversation);
     if (!boundary) throw new Error("missing");
-    const job = {
-      kind: "inbound_turn",
-      organization_id: GOV_ORG,
-      contact_id: contact,
-      payload: { service_boundary: boundary },
-    } as unknown as JobRow;
-    await withServiceJob(pool, job, async () => {
+    await withClaimedJob("inbound_turn", contact, boundary, async () => {
       expect(await latestCheckpoint(pool, GOV_ORG, contact)).toBeNull();
       const result = await getLeadContext(
         pool,
@@ -281,7 +333,7 @@ describe("transição real de atendimento", () => {
     await inbound();
     await expect(
       pool.query("select fn_service_begin($1,$2,null,$3)", [GOV_ORG, contact, rows[0].snapshot]),
-    ).rejects.toMatchObject({ code: "40001" });
+    ).rejects.toMatchObject({ code: "PT409" });
     const fresh = await pool.query("select fn_service_observe($1,$2) snapshot", [GOV_ORG, contact]);
     const started = await pool.query("select fn_service_begin($1,$2,null,$3) boundary", [
       GOV_ORG,
@@ -307,7 +359,7 @@ describe("transição real de atendimento", () => {
     expect(first.service_started_at).toBeTruthy();
     await expect(
       pool.query("select fn_service_begin($1,$2,null,$3)", [GOV_ORG, ct, observed]),
-    ).rejects.toMatchObject({ code: "40001" });
+    ).rejects.toMatchObject({ code: "PT409" });
     await pool.query("update conversations set service_started_at=null where id=$1", [
       first.conversation_id,
     ]);
@@ -450,21 +502,12 @@ describe("transição real de atendimento", () => {
     // A fronteira do vencedor não herda o checkpoint que ficou na outra conversa.
     const fronteira = await readCurrentServiceBoundary(pool, GOV_ORG, convA);
     if (!fronteira) throw new Error("fronteira do vencedor ausente");
-    await withServiceJob(
-      pool,
-      {
-        kind: "inbound_turn",
-        organization_id: GOV_ORG,
-        contact_id: a,
-        payload: { service_boundary: fronteira },
-      } as unknown as JobRow,
-      async () => {
-        expect(
-          await latestCheckpoint(pool, GOV_ORG, a),
-          "o checkpoint amarrado à conversa da lápide não entra na fronteira do vencedor",
-        ).toBeNull();
-      },
-    );
+    await withClaimedJob("inbound_turn", a, fronteira, async () => {
+      expect(
+        await latestCheckpoint(pool, GOV_ORG, a),
+        "o checkpoint amarrado à conversa da lápide não entra na fronteira do vencedor",
+      ).toBeNull();
+    });
   });
 
   it("checkpoint vigente sem demanda é recuperado; fechar/reabrir o exclui", async () => {
@@ -478,35 +521,17 @@ describe("transição real de atendimento", () => {
       values($1,$2,$3,$4,null,null,'[]','[]','PASSO_VIGENTE_SEM_DEMANDA','RESUMO_VIGENTE')`,
       [GOV_ORG, contact, conversation, current.service_revision],
     );
-    await withServiceJob(
-      pool,
-      {
-        kind: "followup_turn",
-        organization_id: GOV_ORG,
-        contact_id: contact,
-        payload: { service_boundary: current },
-      } as unknown as JobRow,
-      async () => {
-        expect((await latestCheckpoint(pool, GOV_ORG, contact))?.next_action).toBe(
-          "PASSO_VIGENTE_SEM_DEMANDA",
-        );
-      },
-    );
+    await withClaimedJob("followup_turn", contact, current, async () => {
+      expect((await latestCheckpoint(pool, GOV_ORG, contact))?.next_action).toBe(
+        "PASSO_VIGENTE_SEM_DEMANDA",
+      );
+    });
     await close();
     await pool.query("select fn_service_begin($1,$2,$3)", [GOV_ORG, contact, GOV_SESSION]);
     const next = await readCurrentServiceBoundary(pool, GOV_ORG, conversation);
-    await withServiceJob(
-      pool,
-      {
-        kind: "followup_turn",
-        organization_id: GOV_ORG,
-        contact_id: contact,
-        payload: { service_boundary: next },
-      } as unknown as JobRow,
-      async () => {
-        expect(await latestCheckpoint(pool, GOV_ORG, contact)).toBeNull();
-      },
-    );
+    await withClaimedJob("followup_turn", contact, next, async () => {
+      expect(await latestCheckpoint(pool, GOV_ORG, contact)).toBeNull();
+    });
   });
   it("memória inclui duas entradas pós-fechamento fora de ordem, excluindo passado", async () => {
     await close();

@@ -10,7 +10,7 @@
  *      Replay preserva vínculo ativo; revogado exige convite posterior à revogação.
  *   5. Audit `member.accepted` and redirect to /app/inbox.
  */
-import { readSupportContext } from "@/lib/impersonate/support";
+import { permanentAccessError, readSupportContext } from "@/lib/impersonate/support";
 import { redirect } from "next/navigation";
 
 import { aplicarConvite } from "@/lib/auth/aplicar-convite";
@@ -21,7 +21,12 @@ export type AcceptInviteResult =
   | { ok: true }
   | {
       ok: false;
-      error: "invalid_or_expired" | "email_mismatch" | "not_authenticated" | "internal_error";
+      error:
+        | "invalid_or_expired"
+        | "email_mismatch"
+        | "not_authenticated"
+        | "internal_error"
+        | "limite_do_plano";
       message?: string;
       expectedEmail?: string;
     };
@@ -36,7 +41,7 @@ export async function acceptInviteAction(token: string): Promise<AcceptInviteRes
   } = await supabase.auth.getUser();
   if (!user) return { ok: false, error: "not_authenticated" };
 
-  if (await readSupportContext(supabase))
+  if (permanentAccessError(await readSupportContext(supabase)))
     return {
       ok: false,
       error: "internal_error",

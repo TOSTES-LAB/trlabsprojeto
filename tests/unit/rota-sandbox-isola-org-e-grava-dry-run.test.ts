@@ -86,7 +86,17 @@ describe("POST de teste do agente: isolamento e efeitos explícitos", () => {
       ok: true, user: { id: "ffffffff-ffff-4fff-8fff-ffffffffffff", idioma: "pt-BR" },
       org: { orgId: ORG, role: "admin" },
     });
-    mocks.preview.mockResolvedValue({ candidates: [{ body: "Olá!" }], proposals: [], trace: [] });
+    // #2490: o resultado do motor traz `midia` (a preparação das fotos do
+    // produto que a resposta usaria) — o dublê espelha a forma real.
+    // #4129: e `materiais`, pela mesma razão (o material da empresa que a
+    // resposta usaria), com o mesmo desfecho: pendência reprova o teste.
+    mocks.preview.mockResolvedValue({
+      candidates: [{ body: "Olá!" }],
+      proposals: [],
+      trace: [],
+      midia: [],
+      materiais: [],
+    });
   });
 
   it("recusa versão de outra organização antes de criar run ou chamar modelo", async () => {
@@ -117,5 +127,56 @@ describe("POST de teste do agente: isolamento e efeitos explícitos", () => {
       organizationId: ORG, agentId: AGENT, versionId: VERSION, runId: RUN,
       sampleMessage: "Mensagem de teste", channelId: null,
     }));
+  });
+
+  it("candidato com a mídia pendente sai como teste BLOQUEADO (#2490)", async () => {
+    // Um send_message que falhou a foto e outro, sem produto_codigo, que gerou
+    // candidato: a tela não pode aprovar o teste com a foto por preparar.
+    mocks.preview.mockResolvedValue({
+      candidates: [{ body: "Segue a foto" }],
+      proposals: [],
+      trace: [],
+      midia: [{
+        codigo: "IP15", produtoResolvido: true, fotosCadastradas: 1, fotosPreparadas: 0, anexos: [],
+        falha: { code: "midia_nao_preparada", message: "x" },
+      }],
+      materiais: [],
+    });
+    const db = bancoDaRota(ORG);
+    mocks.admin.mockReturnValue(db.admin);
+    const resposta = await POST(requisicao(), ctx);
+    expect(resposta.status).toBe(200);
+    const { data } = (await resposta.json()) as { data: { status: string; guardrails: { passou: boolean } } };
+    expect(data.status).toBe("blocked");
+    expect(data.guardrails.passou).toBe(false);
+  });
+
+  it("candidato com o MATERIAL da empresa pendente também sai BLOQUEADO (#4129)", async () => {
+    // A mesma régua do #2490 para o arquivo da empresa: `material_id` que o
+    // dry-run não conseguiu preparar não pode sair da tela como teste aprovado.
+    mocks.preview.mockResolvedValue({
+      candidates: [{ body: "Segue o catálogo" }],
+      proposals: [],
+      trace: [],
+      midia: [],
+      materiais: [{
+        materialId: "11111111-2222-4333-8444-555555555555",
+        nome: null,
+        anexo: null,
+        falha: { code: "material_nao_copiado", message: "x" },
+      }],
+    });
+    const db = bancoDaRota(ORG);
+    mocks.admin.mockReturnValue(db.admin);
+    const resposta = await POST(requisicao(), ctx);
+    expect(resposta.status).toBe(200);
+    const { data } = (await resposta.json()) as {
+      data: { status: string; materiais: Array<{ falha?: { code: string } }> };
+    };
+    // `guardrails.passou` mede o TEXTO e a mídia do produto
+    // (`avaliarRespostaDeTeste`); o material não entra nessa régua — quem reprova
+    // o teste é o `status`, e é ele que a tela lê como "não aprovado".
+    expect(data.status).toBe("blocked");
+    expect(data.materiais[0]?.falha?.code).toBe("material_nao_copiado");
   });
 });

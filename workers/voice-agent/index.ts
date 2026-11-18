@@ -33,10 +33,13 @@
  * asterisk_channel_id (== o UUID, de propósito) e sobe UMA
  * AudioSocketCallBridge — não importa se a chamada é de entrada ou saída.
  *
- * Sem publicação em event_log (call.ended etc.): nenhum handler em
- * lib/event-log/register-handlers.ts consumiria esses tipos ainda — ver nota
- * na migration 0347. Sumarização/sentimento pós-chamada fica fora do escopo
- * deste esqueleto até existir consumidor real.
+ * O `event_log` ganhou UM tipo nesta fatia (#4365): `voice_call.missed`, quando
+ * a RECEBIDA termina tocando sem ninguém atender — ver
+ * `lib/voip/evento-de-ligacao-perdida.ts`. É o único fato daqui com consumidor
+ * real (o motor de automação); `call.ended`/`call.answered` continuam sem
+ * publicação porque nenhum handler em `lib/event-log/register-handlers.ts` os
+ * consome — ver nota na migration 0347. Sumarização/sentimento pós-chamada
+ * seguem fora do escopo deste esqueleto.
  */
 
 import net from "node:net";
@@ -49,13 +52,24 @@ import {
   type AriEvent,
 } from "@/lib/voip/ariClient";
 import { AudioSocketCallBridge } from "./audioSocketBridge";
+import { montarAgendaDaVoz } from "./agenda-da-voz";
+import { idsDaLinhaDoCanal, uuidDoAudioSocketDeEntrada } from "./canal-de-entrada";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { getActiveVoiceAgent } from "@/lib/ai/agents";
 import { resolveOrCreateCallerContact, type ContatoDaChamada } from "@/lib/voip/resolve-caller";
-import { deveRecusarChamada, END_REASON_CONTACT_BLOCKED } from "./recusa-bloqueado";
+import {
+  deveRecusarChamada,
+  deveRecusarChamadaPessoal,
+  END_REASON_CONTACT_BLOCKED,
+  END_REASON_CONTACT_PERSONAL,
+} from "./recusa-bloqueado";
 import { garantirLeadDaConversa } from "@/lib/leads/nascimento-do-lead";
 import { buscarConhecimento, resolverAcervoDoAgente } from "@/lib/ai/knowledge/busca";
 import { ehOperante } from "@/lib/organizacao/operante";
+import { registrarChamadaDeIa } from "@/lib/ai/usage/registrar-chamada";
+import { logger } from "@/lib/logger";
+import { publicarLigacaoPerdida } from "@/lib/voip/evento-de-ligacao-perdida";
+import { linhaDaLigacao } from "./uso-da-sessao";
 
 const supabaseAdmin = createAdminClient();
 
@@ -130,6 +144,37 @@ export async function handleStasisStart(event: AriEvent) {
     return;
   }
 
+  // PESSOAL NA LIGAÇÃO É RECUSADO COMO BLOQUEADO (spec 21, etapa 14 —
+  // critério 11): depois do contato resolvido, antes do insert, antes do
+  // dialplan e antes da IA. Grava a linha já encerrada (ESCONDIDA do
+  // histórico, como a mensagem — volta ao desmarcar) e desliga — sem negócio,
+  // sem IA, sem tocar, sem alerta. `end_reason` próprio, nunca o de bloqueio.
+  // SABOTAGEM DO FIO: remover a chamada a `deveRecusarChamadaPessoal` abaixo
+  // (manter a função pura existindo mas sem uso) = teste do fio vermelho.
+  if (deveRecusarChamadaPessoal(contatoDeQuemLiga?.is_personal)) {
+    const agora = new Date().toISOString();
+    const { error: refuseError } = await supabaseAdmin.from("voice_calls").insert({
+      organization_id: routing.organization_id,
+      provider: "sip",
+      direction: "inbound",
+      status: "ended",
+      end_reason: END_REASON_CONTACT_PERSONAL,
+      peer_phone: callerNumber,
+      contact_id: callerContactId,
+      asterisk_channel_id: randomUUID(),
+      started_at: agora,
+      answered_at: null,
+      ended_at: agora,
+    });
+    if (refuseError) {
+      console.error(`[voice-agent] falha ao gravar recusa de pessoal:`, refuseError.message);
+    } else {
+      console.info(`[voice-agent] chamada recusada de pessoal`);
+    }
+    await hangupChannel(channel.id, "normal");
+    return;
+  }
+
   // channel.id é o identificador NATIVO do canal no Asterisk (formato
   // "<epoch>.<sequencia>", ex.: "1789081888.0") — válido pras chamadas REST
   // do ARI (hangup/setChannelVariable/continueDialplan), mas NAO é um UUID:
@@ -138,9 +183,11 @@ export async function handleStasisStart(event: AriEvent) {
   // porque lá QUEM escolhe channel.id somos nós (route.ts gera o UUID e
   // passa em `channelId` pro ARI no originate) — na ENTRADA o Asterisk já
   // criou o canal, com o id dele, antes deste código rodar. Por isso aqui
-  // se gera um UUID SEPARADO só pra correlação do AudioSocket/voice_calls;
-  // as chamadas ARI continuam endereçando o canal por channel.id.
-  const audioSocketUuid = randomUUID();
+  // se usa um UUID SEPARADO só pra correlação do AudioSocket/voice_calls;
+  // as chamadas ARI continuam endereçando o canal por channel.id. Ele é
+  // DERIVADO do channel.id, não sorteado: é assim que o ChannelDestroyed
+  // reencontra esta linha quando o AudioSocket nunca conecta (canal-de-entrada.ts).
+  const audioSocketUuid = uuidDoAudioSocketDeEntrada(channel.id);
 
   const { data: callRow, error } = await supabaseAdmin
     .from("voice_calls")
@@ -185,7 +232,7 @@ export async function handleStasisStart(event: AriEvent) {
     }
   }
 
-  // channel.id JÁ é o asterisk_channel_id gravado acima — reusa como UUID do
+  // audioSocketUuid é o asterisk_channel_id gravado acima — vai como UUID do
   // AudioSocket (mesmo padrão da saída), pra handleAudioSocketConnection
   // achar a linha certa assim que a conexão TCP chegar.
   await setChannelVariable(channel.id, "AUDIOSOCKET_UUID", audioSocketUuid);
@@ -233,6 +280,9 @@ async function resolveInboundNumber(dialedNumber: string): Promise<RoteamentoInb
 interface ActiveAudioSocketCall {
   bridge: AudioSocketCallBridge;
   callRowId: string;
+  organizationId: string;
+  agentId: string;
+  contactId: string | null;
   answeredAt: string;
   transcript: { speaker: string; text: string; ts: string }[];
 }
@@ -269,9 +319,41 @@ async function finalizeAudioSocketCall(uuid: string) {
       transcript: call.transcript,
     })
     .eq("id", call.callRowId);
+
+  // ─── O uso da sessão vai para `llm_calls` ───────────────────────────────
+  //
+  // Sem isto a voz — o gasto mais caro por minuto do produto — não aparecia
+  // em Uso de IA. Tokens medidos pela própria OpenAI (`response.done`), duração
+  // da ligação em `latency_ms`, custo nulo por limitação declarada (tarifa de
+  // áudio fora do catálogo — ver `./uso-da-sessao.ts`). Nunca lança.
+  const sessao = call.bridge.usoDaSessao();
+  await registrarChamadaDeIa(
+    supabaseAdmin,
+    linhaDaLigacao({
+      organizationId: call.organizationId,
+      agentId: call.agentId,
+      contactId: call.contactId,
+      modelo: sessao.modelo,
+      uso: sessao.uso,
+      duracaoMs: durationMs,
+      erro: sessao.erro,
+    }),
+  );
+  logger.info("[voice-agent] uso da ligação registrado", {
+    organization_id: call.organizationId,
+    call_id: call.callRowId,
+    model: sessao.modelo,
+    respostas: sessao.uso.respostas,
+    entrada_audio: sessao.uso.entradaAudio,
+    entrada_texto: sessao.uso.entradaTexto,
+    entrada_cache: sessao.uso.entradaCache,
+    saida_audio: sessao.uso.saidaAudio,
+    saida_texto: sessao.uso.saidaTexto,
+    duracao_ms: durationMs,
+  });
 }
 
-async function handleAudioSocketConnection(socket: net.Socket, uuid: string, leftover: Buffer) {
+export async function handleAudioSocketConnection(socket: net.Socket, uuid: string, leftover: Buffer) {
   const { data: callRow, error } = await supabaseAdmin
     .from("voice_calls")
     .select("*")
@@ -280,6 +362,17 @@ async function handleAudioSocketConnection(socket: net.Socket, uuid: string, lef
 
   if (error || !callRow) {
     console.error(`[audiosocket] uuid ${uuid} não corresponde a nenhuma voice_calls — encerrando`);
+    socket.end();
+    return;
+  }
+
+  // Recusada pela tela enquanto tocava (`lib/voip/recusar-chamada-sip.ts`): a
+  // linha já está `ended`. Fechar o socket devolve o canal ao dialplan, que
+  // desliga (`Hangup()` em [from-trunk-audiosocket]) — sem abrir a sessão de IA,
+  // que é paga por minuto, e sem regravar a linha como `connected`.
+  // SABOTAGEM: remover este bloco = o caso "recusada" de fio-recusada-pela-tela fica vermelho.
+  if (callRow.status === "ended") {
+    console.info(`[audiosocket] chamada ${callRow.id} já encerrada (${callRow.end_reason ?? "sem motivo"}) — desligando`);
     socket.end();
     return;
   }
@@ -321,6 +414,28 @@ async function handleAudioSocketConnection(socket: net.Socket, uuid: string, lef
     return [] as string[];
   });
 
+  // O `connected` é um claim: só vale sobre linha que ainda toca. Sem o filtro
+  // de status, a recusa pela tela que chega entre a leitura acima e esta escrita
+  // era sobrescrita, e a IA atendia a ligação recusada. Antes do bridge, para a
+  // sessão paga nem abrir quando o claim perde.
+  const answeredAt = new Date().toISOString();
+  const { data: atendida, error: claimErr } = await supabaseAdmin
+    .from("voice_calls")
+    .update({ status: "connected", answered_at: answeredAt, handled_by: "ai" })
+    .eq("id", callRow.id)
+    .in("status", ["starting", "ringing"])
+    .select("id");
+  if (!atendida || atendida.length === 0) {
+    if (claimErr) console.error(`[audiosocket] falha ao marcar chamada ${callRow.id} como atendida:`, claimErr.message);
+    else console.info(`[audiosocket] chamada ${callRow.id} deixou de tocar antes do atendimento — desligando`);
+    socket.end();
+    return;
+  }
+
+  // Quem está sendo atendido nesta linha. É daqui — e só daqui — que saem o
+  // contato das tools de agenda e o `contact_id` de qualquer marcação.
+  const contactIdDaChamada = (callRow.contact_id as string | null | undefined) ?? null;
+
   const bridge = new AudioSocketCallBridge(socket, {
     callId: callRow.id,
     organizationId: callRow.organization_id,
@@ -331,6 +446,8 @@ async function handleAudioSocketConnection(socket: net.Socket, uuid: string, lef
     apiKey: agent.apiKey,
     onTranscriptTurn: (turn) => appendAudioSocketTranscriptTurn(uuid, turn),
     onCallEnded: () => finalizeAudioSocketCall(uuid),
+    // Recebida: quem atende fala primeiro. Feita por nós: quem atende diz "alô".
+    falaPrimeiro: callRow.direction === "inbound",
     knowledgeSourceIdsPromise,
     searchKnowledge: async (pergunta: string) => {
       const knowledgeSourceIds = await knowledgeSourceIdsPromise;
@@ -344,15 +461,37 @@ async function handleAudioSocketConnection(socket: net.Socket, uuid: string, lef
       });
       return { trechos: resultado.trechos };
     },
+    // A AGENDA desta ligação (#4221). O bridge não conhece Supabase nem
+    // tabela: ele recebe as cinco operações prontas, ligadas ao handler de
+    // verdade da tool de texto (lib/mcp/tools/agendamento.ts) por
+    // `montarAgendaDaVoz`, com a organização e o contato DESTA linha.
+    //
+    // Duas condições, e as duas fecham: a opção "Agenda na ligação" da aba Voz
+    // (`config.agenda_na_ligacao`, desligada de fábrica) e um contato
+    // identificado — sem ele não há para quem marcar. Faltando qualquer uma,
+    // a agenda nem é oferecida: ferramenta que não existe não é declarada.
+    ...(agent.agendaNaLigacao && contactIdDaChamada
+      ? {
+          agenda: montarAgendaDaVoz({
+            supabase: supabaseAdmin,
+            organizationId: callRow.organization_id,
+            callId: callRow.id,
+            agentId: agent.id,
+            contactId: contactIdDaChamada,
+          }),
+        }
+      : {}),
   });
 
-  const answeredAt = new Date().toISOString();
-  activeAudioSocketCalls.set(uuid, { bridge, callRowId: callRow.id, answeredAt, transcript: [] });
-
-  await supabaseAdmin
-    .from("voice_calls")
-    .update({ status: "connected", answered_at: answeredAt, handled_by: "ai" })
-    .eq("id", callRow.id);
+  activeAudioSocketCalls.set(uuid, {
+    bridge,
+    callRowId: callRow.id,
+    organizationId: callRow.organization_id,
+    agentId: agent.id,
+    contactId: contactIdDaChamada,
+    answeredAt,
+    transcript: [],
+  });
 
   // Se algum byte de áudio já chegou GRUDADO no mesmo pacote TCP do frame de
   // UUID (TCP é stream contínuo, não datagramas), reinjeta no socket depois
@@ -411,32 +550,59 @@ function assertEnv() {
  * fica com status "ringing" pra sempre na tela, mesmo com o canal já tendo
  * sumido do Asterisk há muito tempo -- foi visto ao vivo assim.
  *
+ * A RECEBIDA precisa do mesmo fechamento: ela só sai da Stasis de passagem, e
+ * se o AudioSocket nunca conecta, nada mais a encerra. A linha dela não guarda
+ * o channel.id nativo, e sim o UUID derivado dele -- por isso a busca é pelos
+ * dois (idsDaLinhaDoCanal). Procurar só pelo channel.id deixava toda recebida
+ * que caía antes da IA "tocando" para sempre (medido em 2026-11-04).
+ *
  * Só mexe em linha ainda "ringing": se o AudioSocket já rodou,
  * finalizeAudioSocketCall() já marcou "ended" e este handler não deve
  * sobrescrever isso (ChannelDestroyed chega DEPOIS, no fim normal da
  * ligação, não é exclusivo de "nunca atendida").
  */
-async function handleChannelDestroyed(event: AriEvent) {
+export async function handleChannelDestroyed(event: AriEvent) {
   const channelId = event.channel?.id;
   if (!channelId) return;
 
+  // As colunas vêm no `select` do UPDATE porque é este o único ponto que sabe
+  // que a recebida morreu TOCANDO: quem publica o `voice_call.missed` precisa do
+  // contato, do telefone e da organização, e uma segunda leitura abriria a
+  // janela para a linha mudar entre o fechamento e o evento.
   const { data, error } = await supabaseAdmin
     .from("voice_calls")
     .update({ status: "ended", end_reason: "timeout", ended_at: new Date().toISOString() })
-    .eq("asterisk_channel_id", channelId)
+    .in("asterisk_channel_id", idsDaLinhaDoCanal(channelId))
     .eq("status", "ringing")
-    .select("id")
+    .select("id, organization_id, direction, contact_id, peer_phone")
     .maybeSingle();
 
   if (error) {
     console.error(`[voice-agent] falha ao marcar timeout pro canal ${channelId}:`, error.message);
     return;
   }
-  if (data) {
-    console.info(
-      `[voice-agent] chamada ${data.id} marcada sem resposta (${event.cause_txt ?? "motivo desconhecido"})`,
-    );
-  }
+  if (!data) return;
+
+  console.info(
+    `[voice-agent] chamada ${data.id} marcada sem resposta (${event.cause_txt ?? "motivo desconhecido"})`,
+  );
+
+  // SÓ A RECEBIDA É "PERDIDA" (#4365): quem ligou e não foi atendido é quem
+  // precisa de resposta. Uma ligação FEITA daqui que tocou e caiu não gera
+  // evento — quem discou já sabe, e disparar automação nela mandaria mensagem
+  // para um contato que nunca ligou.
+  //
+  // O filtro `status = 'ringing'` acima também é a idempotência: esta linha só
+  // casa uma vez, então o evento nasce uma vez por ligação. Atendida
+  // (`connected`) e recusada pela tela (`ended`) não casam e não publicam.
+  if (data.direction !== "inbound") return;
+  await publicarLigacaoPerdida(supabaseAdmin, {
+    organizationId: data.organization_id as string,
+    callId: data.id as string,
+    contactId: (data.contact_id as string | null) ?? null,
+    peerPhone: (data.peer_phone as string | null) ?? null,
+    endReason: "timeout",
+  });
 }
 
 function main() {
