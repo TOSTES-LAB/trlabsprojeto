@@ -74,6 +74,9 @@ function makeAdmin(cap: Captura, jaRegistrada: boolean) {
       // que é o cenário deste arquivo (a mensagem é digitação humana de
       // verdade). Quem cobre o eco é `eco-do-envio-nao-silencia-o-bot.test.ts`.
       is: () => chain,
+      // A re-checagem pós-insert (corrida com o envio) filtra por `neq`. O
+      // `maybeSingle` deste dublê responde pelo cenário, não pelos filtros.
+      neq: () => chain,
       gte: () => chain,
       order: () => chain,
       maybeSingle: () => {
@@ -157,6 +160,11 @@ describe("R8 · resposta manual pelo celular pausa a IA", () => {
       "utf-8",
     );
     expect(fonte).toContain("pausarIaPorAtendimentoManual");
-    expect(fonte).toMatch(/direction === "outbound"[\s\S]{0,200}pausarIaPorAtendimentoManual/);
+    // #4749: a condição da saída mora em `ehRespostaManual`, a régua única dos
+    // dois ramos. A guarda cobra as duas metades: a chamada está atrás da régua,
+    // e a régua exige saída.
+    expect(fonte).toMatch(/if \(ehRespostaManual\(msg\)\)[\s\S]{0,200}pausarIaPorAtendimentoManual/);
+    const regua = fonte.slice(fonte.indexOf("function ehRespostaManual("));
+    expect(regua.slice(0, regua.indexOf("\n}"))).toMatch(/msg\.direction === "outbound"/);
   });
 });

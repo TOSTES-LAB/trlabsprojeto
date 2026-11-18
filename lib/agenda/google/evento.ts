@@ -43,6 +43,7 @@
  */
 
 import { instanteDaParede, primeiroInstanteDoDia } from "./tempo";
+import { descricaoDoEvento } from "@/lib/agenda/contexto-do-negocio";
 
 /**
  * O sufixo que marca um evento como nosso, gravado DENTRO do Google.
@@ -109,17 +110,25 @@ export interface ParticipanteDoAgendamento {
 }
 
 /**
- * A lista de convidados do evento: e-mail da ficha do contato, depois o
- * convidado digitado na tela. Mesmo endereço duas vezes vira uma linha — o
- * Google recusa o evento inteiro se `attendees` tiver e-mail repetido.
+ * A lista de convidados do evento: e-mail da ficha do contato, o convidado
+ * digitado na tela e, por último, os CONVIDADOS DA EQUIPE (#4006) — as pessoas
+ * da organização escolhidas no compromisso, com o e-mail que o executor
+ * resolveu (conta Google conectada; sem ela, o de login).
  *
- * Os dois pedem RSVP (`aguardandoResposta`): o convite existe para a pessoa
- * aceitar na caixa dela, não para gravar um "sim" em nome dela.
+ * Mesmo endereço duas vezes vira uma linha, e a deduplicação é UMA só para os
+ * três: o Google recusa o evento inteiro se `attendees` tiver e-mail repetido,
+ * e o convidado da equipe que também está na ficha é o caso comum, não o
+ * exótico.
+ *
+ * Todos pedem RSVP (`aguardandoResposta`): o convite existe para a pessoa
+ * aceitar na caixa dela, não para gravar um "sim" em nome dela — inclusive o
+ * convidado da equipe, que precisa poder recusar.
  */
 export function participantesDoAgendamento(input: {
   contactEmail?: string | null;
   contactName?: string | null;
   guestEmail?: string | null;
+  teamGuests?: readonly { email?: string | null; nome?: string | null }[] | null;
 }): ParticipanteDoAgendamento[] {
   const out: ParticipanteDoAgendamento[] = [];
   const vistos = new Set<string>();
@@ -135,6 +144,7 @@ export function participantesDoAgendamento(input: {
   };
   entra(input.contactEmail, input.contactName);
   entra(input.guestEmail);
+  for (const membro of input.teamGuests ?? []) entra(membro.email, membro.nome);
   return out;
 }
 
@@ -153,7 +163,46 @@ export interface AgendamentoParaGoogle {
   location_kind: TipoDeLocal;
   location_details?: string | null;
   meeting_url?: string | null;
+  /**
+   * #2063 — o `meeting_url` nasceu do espaço ABERTO (`spaces.create` com
+   * `accessType: OPEN`), não do Meet "confiável" do Calendar.
+   *
+   * É o marcador que o review de 08/10 pediu (caminho 2): SÓ com ele o link
+   * vira `location`. Sem o marcador a projeção continua a de sempre
+   * (`location_details`), que é a regra que protege todo compromisso já
+   * publicado com Meet do Calendar — o link deles nasce DEPOIS da
+   * publicação, e se entrasse na projeção a primeira passada do cron mandaria
+   * um PATCH `sendUpdates=all` para cada compromisso com Meet já publicado,
+   * inclusive passados e com a opção desligada.
+   *
+   * Absente/falso é o estado de TODO agendamento que não passou pelo espaço
+   * aberto, inclusive os antigos: os testes da main montam o agendamento sem
+   * esta chave, e é exatamente o que se espera.
+   */
+  meet_aberto?: boolean | null;
   participantes?: ParticipanteDoAgendamento[];
+  /**
+   * Os convidados da equipe (#4006) — ids e e-mails resolvidos pelo executor.
+   *
+   * Os IDs vão para `extendedProperties.private` do evento (`deskcomm_guests`):
+   * é como a passada seguinte sabe QUEM nós convidamos e consegue DESconvidar
+   * quem foi tirado da lista. Sem esse registro, um convidado removido no CRM
+   * continuaria no evento, porque os checkpoints guardam hashes, não e-mails.
+   *
+   * Os e-mails entram no hash do grupo `guest` (ver `localProjection`), então
+   * mudar a equipe publica a alteração como qualquer outro campo.
+   */
+  convidados_da_equipe?: readonly { email: string; nome?: string | null }[] | null;
+  convidados_equipe_ids?: readonly string[] | null;
+  /**
+   * O bloco do negócio (#4006), JÁ MONTADO (`montarBlocoDoNegocio`).
+   *
+   * A descrição do evento é `description` + este bloco. Fica aqui, e não no
+   * executor, porque `localProjection` monta o corpo chamando
+   * `paraEventoDoGoogle`: se o bloco entrasse por fora, o hash local e o
+   * publicado divergiriam e cada passada acharia que há algo a escrever.
+   */
+  contexto_do_negocio?: string | null;
   /** Quando já existe, é a identidade do evento lá — nunca se gera outra. */
   google_ical_uid?: string | null;
 }
@@ -271,9 +320,28 @@ const STATUS_PARA_GOOGLE: Record<StatusDoAgendamento, "confirmed" | "tentative" 
 /**
  * O que escrever no campo `location`, que é o que a pessoa lê no calendário.
  *
- * `google_meet` não aparece aqui enquanto o link não existe: ele só nasce
- * DEPOIS do insert (o Google o cria), e a segunda passada que o grava é da
- * camada de chamada.
+ * ─── Por que `google_meet` só devolve o link do espaço ABERTO (#2063) ──────
+ *
+ * O link do Meet nasce DEPOIS da publicação — o Google o cria no `POST`
+ * (`conferenceData.createRequest`), ou a API do Meet o devolve quando a
+ * organização ligou a opção de acesso aberto. `location` é o único campo que o
+ * `delta` compara, então É por esta projeção que um link publica depois.
+ *
+ * Mas o link do Meet do Calendar NÃO pode entrar aqui. Ele muda a projeção de
+ * TODO compromisso com Meet já publicado na primeira passada do cron depois da
+ * atualização, e pelo `compare()` cada um vira `publish` → um PATCH
+ * `sendUpdates=all` para os convidados de cada um — inclusive compromissos
+ * passados (a seleção do cron não filtra por data), em toda organização, mesmo
+ * com a opção desligada. Pior: o `comConviteDaFicha` (`sync-model.ts`) só segura
+ * o e-mail da ficha enquanto o compromisso não muda; como a decisão passa a ser
+ * `publish`, ele passaria a anexar o e-mail do cliente da ficha a cada um
+ * desses PATCH — o convite em massa que a decisão do doc 36 (opção b) veta.
+ * Por isso as duas regras da main seguem valendo: sem marcador, `google_meet`
+ * devolve `detalhes`, idêntico ao que sempre foi.
+ *
+ * O espaço ABERTO entra pelo marcador `meet_aberto` (caminho 2 do review de
+ * 08/10). Com ele, o link É o local — mesma régua do `video_link`. Sem link
+ * ainda (primeira passada, antes de nascer) sobra `detalhes`, como sempre.
  */
 function localDoEvento(a: AgendamentoParaGoogle): string | undefined {
   const detalhes = a.location_details?.trim() || "";
@@ -287,7 +355,9 @@ function localDoEvento(a: AgendamentoParaGoogle): string | undefined {
     case "video_link":
       return a.meeting_url?.trim() || detalhes || undefined;
     case "google_meet":
-      return detalhes || undefined;
+      // Só o espaço ABERTO troca o local pelo link (#2063). O Meet do
+      // Calendar continua fora da projeção — ver o cabeçalho desta função.
+      return (a.meet_aberto ? a.meeting_url?.trim() : "") || detalhes || undefined;
   }
 }
 
@@ -297,6 +367,33 @@ function instanteValido(iso: string, campo: string): Date {
     throw new Error(`agendamento com ${campo} inválido: ${JSON.stringify(iso)}`);
   }
   return d;
+}
+
+/**
+ * As `extendedProperties.private` que marcam o evento como nosso.
+ *
+ * Uma função só, usada pelo POST e pelo PATCH (#4006): o PATCH que atualiza a
+ * lista de convidados da equipe precisa reenviar as MESMAS chaves, senão o
+ * evento deixaria de ser reconhecido como nosso na passada seguinte. O
+ * `deskcomm_guests` só aparece quando há convidados da equipe a registrar.
+ */
+export function propriedadesPrivadas(a: {
+  organization_id: string;
+  id: string;
+  convidados_equipe_ids?: readonly string[] | null;
+}): Record<string, string> {
+  return {
+    [`${PREFIXO_PROPRIEDADE}_org`]: a.organization_id,
+    [`${PREFIXO_PROPRIEDADE}_appointment`]: a.id,
+    [`${PREFIXO_PROPRIEDADE}_v`]: VERSAO_DA_PROPRIEDADE,
+    // A lista de convidados da EQUIPE, por id (#4006). É o que permite
+    // desconvidar quem saiu da lista: os checkpoints guardam hash, não e-mail,
+    // então sem este registro o worker não sabe de quem era o `attendee` que
+    // precisa sair.
+    ...(a.convidados_equipe_ids?.length
+      ? { [`${PREFIXO_PROPRIEDADE}_guests`]: a.convidados_equipe_ids.join(",") }
+      : {}),
+  };
 }
 
 /**
@@ -350,15 +447,12 @@ export function paraEventoDoGoogle(a: AgendamentoParaGoogle): CorpoDeEventoDoGoo
     transparency: "opaque",
     reminders: { useDefault: true },
     extendedProperties: {
-      private: {
-        [`${PREFIXO_PROPRIEDADE}_org`]: a.organization_id,
-        [`${PREFIXO_PROPRIEDADE}_appointment`]: a.id,
-        [`${PREFIXO_PROPRIEDADE}_v`]: VERSAO_DA_PROPRIEDADE,
-      },
+      private: propriedadesPrivadas(a),
     },
   };
 
-  const descricao = a.description?.trim();
+  // A descrição leva o texto da pessoa e, no fim, o bloco do negócio (#4006).
+  const descricao = descricaoDoEvento(a.description, a.contexto_do_negocio);
   if (descricao) corpo.description = descricao;
   const local = localDoEvento(a);
   if (local) corpo.location = local;

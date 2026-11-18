@@ -18,12 +18,13 @@ import { getConfig, SUBSCRIBED_EVENTS, eventToSlug } from "@/lib/nuvemshop/confi
 import { exchangeCodeForToken } from "@/lib/nuvemshop/oauth";
 import { NuvemshopApiClient } from "@/lib/nuvemshop/api-client";
 import { verifyState } from "@/lib/nuvemshop/state";
+import { comIdDaRequisicao } from "@/lib/api/wrappers";
 
 export const dynamic = "force-dynamic";
 
-function redirectTo(path: string): NextResponse {
+function redirectTo(path: string, req: NextRequest): NextResponse {
   const base = env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
-  return NextResponse.redirect(new URL(path, base));
+  return comIdDaRequisicao(NextResponse.redirect(new URL(path, base)), req);
 }
 
 export async function GET(req: NextRequest): Promise<NextResponse> {
@@ -33,7 +34,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
 
   const cfg = getConfig();
   if (!cfg) {
-    return redirectTo(`/app/integrations/nuvemshop?error=not_configured`);
+    return redirectTo(`/app/integrations/nuvemshop?error=not_configured`, req);
   }
 
   const state = verifyState(stateParam);
@@ -42,7 +43,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       action: "nuvemshop.oauth_failed",
       metadata: { reason: "invalid_state" },
     });
-    return redirectTo(`/app/integrations/nuvemshop?error=invalid_state`);
+    return redirectTo(`/app/integrations/nuvemshop?error=invalid_state`, req);
   }
 
   if (!code) {
@@ -51,10 +52,34 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       organizationId: state.orgId,
       metadata: { reason: "missing_code" },
     });
-    return redirectTo(`/app/integrations/nuvemshop?error=missing_code`);
+    return redirectTo(`/app/integrations/nuvemshop?error=missing_code`, req);
   }
 
-  if (!(await supportCallbackWriteAllowed(state.orgId, state.userId, state.authSessionId))) return redirectTo("/app/integrations/nuvemshop?error=invalid_state");
+  if (!(await supportCallbackWriteAllowed(state.orgId, state.userId, state.authSessionId))) return redirectTo("/app/integrations/nuvemshop?error=invalid_state", req);
+
+  const admin = createAdminClient();
+
+  // O retorno vale UMA vez: o nonce do `state` é queimado ANTES da troca, na
+  // mesma tabela e pela mesma razão do callback do Google Agenda
+  // (`app/api/v1/agenda/google/callback/route.ts`). Todo `state` emitido hoje
+  // carrega a pessoa (`connectNuvemshop`); sem ela não há linha a gravar, e
+  // sem gravar não há uso único a garantir — recusa, como qualquer outro erro.
+  const { error: erroDoNonce } = state.userId
+    ? await admin.from("calendar_oauth_nonces").insert({
+        nonce: state.nonce,
+        organization_id: state.orgId,
+        user_id: state.userId,
+        expira_em: new Date(state.expMs).toISOString(),
+      })
+    : { error: { code: "sem_pessoa" } };
+  if (erroDoNonce) {
+    await audit({
+      action: "nuvemshop.oauth_failed",
+      organizationId: state.orgId,
+      metadata: { reason: erroDoNonce.code === "23505" ? "state_reused" : "nonce_unavailable" },
+    });
+    return redirectTo(`/app/integrations/nuvemshop?error=invalid_state`, req);
+  }
 
   // Exchange code for access token.
   const tokenRes = await exchangeCodeForToken(code, cfg);
@@ -64,11 +89,10 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       organizationId: state.orgId,
       metadata: { reason: tokenRes.error, status: tokenRes.status ?? null },
     });
-    return redirectTo(`/app/integrations/nuvemshop?error=${tokenRes.error}`);
+    return redirectTo(`/app/integrations/nuvemshop?error=${tokenRes.error}`, req);
   }
 
   const { accessToken, scope, storeId } = tokenRes;
-  const admin = createAdminClient();
 
   // Encrypt access token + webhook secret (we keep the client_secret in env, but
   // tenant_integrations.webhook_secret_encrypted is NOT NULL — we store the
@@ -82,7 +106,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       organizationId: state.orgId,
       metadata: { reason: "encrypt_failed", error: encrypted.error?.message ?? "no_data" },
     });
-    return redirectTo(`/app/integrations/nuvemshop?error=encrypt_failed`);
+    return redirectTo(`/app/integrations/nuvemshop?error=encrypt_failed`, req);
   }
   const webhookSecretEnc = await admin.rpc("fn_encrypt_oauth", {
     plaintext: cfg.clientSecret,
@@ -96,7 +120,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
         error: webhookSecretEnc.error?.message ?? "no_data",
       },
     });
-    return redirectTo(`/app/integrations/nuvemshop?error=encrypt_failed`);
+    return redirectTo(`/app/integrations/nuvemshop?error=encrypt_failed`, req);
   }
 
   const webhookPathToken = randomBytes(24).toString("hex");
@@ -127,7 +151,7 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
       organizationId: state.orgId,
       metadata: { reason: "db_upsert_failed", error: upsertErr.message },
     });
-    return redirectTo(`/app/integrations/nuvemshop?error=db_upsert_failed`);
+    return redirectTo(`/app/integrations/nuvemshop?error=db_upsert_failed`, req);
   }
 
   // Register the 8 webhooks. Best-effort: log failures but don't roll back.
@@ -151,6 +175,24 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     .eq("organization_id", state.orgId)
     .eq("provider", "nuvemshop");
 
+  // CARGA INICIAL DO CATÁLOGO. Sem ela, a loja recém-conectada só ganhava
+  // material quando alguém editasse um produto — e o acervo do agente ficava
+  // vazio enquanto a tela dizia "conectado". O worker trata este evento
+  // listando a loja inteira, que é o único modo que `pedacosDeCatalogo` tem.
+  const { error: backfillErr } = await admin.rpc("emit_event", {
+    p_event_type: "nuvemshop.product_synced",
+    p_entity_kind: "nuvemshop_integration",
+    p_entity_id: null,
+    p_payload: { catalogo_inteiro: true, store_id: storeId },
+    p_metadata: { origem: "conexao" },
+    p_organization_id: state.orgId,
+  });
+  if (backfillErr) {
+    // Não derruba a conexão: ela está feita, e o catálogo pode ser
+    // sincronizado depois. O que não pode é a falha passar em silêncio.
+    console.error("[nuvemshop.callback] carga inicial não enfileirada", backfillErr.message);
+  }
+
   await audit({
     actorUserId: state.userId,
     actorAuthSessionId: state.authSessionId,
@@ -171,5 +213,5 @@ export async function GET(req: NextRequest): Promise<NextResponse> {
     },
   });
 
-  return redirectTo(`/app/integrations/nuvemshop?ok=1`);
+  return redirectTo(`/app/integrations/nuvemshop?ok=1`, req);
 }
