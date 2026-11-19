@@ -99,8 +99,12 @@ describe("a 0404 — comando_da_conversa sem reavaliar a RLS (issue #1571)", () 
     const idxDef0203 = baseline.indexOf(
       "create or replace function public.comando_da_conversa(c public.conversations)",
     );
-    const idxDrop = baseline.lastIndexOf(
-      "drop function if exists public.comando_da_conversa(public.conversations);",
+    // ⚠️ Âncora no COMENTÁRIO da 0404, e não no último `drop` do arquivo: a
+    // partir da 0645 existe OUTRO drop de `comando_da_conversa` (o que move a
+    // trava do contato para a coluna, issue #2739), e `lastIndexOf` passaria a
+    // fatiar o apêndice errado — a régua desta seção é o apêndice DA 0404.
+    const idxDrop = baseline.indexOf(
+      "-- `comando_da_conversa` segue a forma da 0404 (issue #1571, upstream):",
     );
 
     expect(idxDef0203, "a definição da 0203 sumiu do meio do baseline (não é esta que a 0404 corrige — ela continua lá, no formato antigo)").toBeGreaterThanOrEqual(0);
@@ -112,19 +116,28 @@ describe("a 0404 — comando_da_conversa sem reavaliar a RLS (issue #1571)", () 
     expect(apendice).toContain("notify pgrst, 'reload schema';");
   });
 
-  it("as duas subconsultas em contacts exigem a empresa da conversa, na migration e no apêndice", () => {
+  it("nenhuma subconsulta em contacts dispensa a empresa da conversa, na migration e no apêndice", () => {
     const PREDICADO = "where ct.id = $1.contact_id and ct.organization_id = $1.organization_id)";
-    const conta = (texto: string): number => texto.split(PREDICADO).length - 1;
 
     const sql = ler(path.join(DIR_MIGRACOES, arquivoDaMigration()!));
     const baseline = ler(path.join(RAIZ, "supabase", "baseline.sql"));
     const apendice = baseline.slice(
-      baseline.lastIndexOf("drop function if exists public.comando_da_conversa(public.conversations);"),
+      baseline.indexOf("-- `comando_da_conversa` segue a forma da 0404 (issue #1571, upstream):"),
     );
 
     const motivo =
       "subconsulta em contacts sem `ct.organization_id = $1.organization_id`: sob o definer, uma conversa apontada para contato de outra empresa leria force_human/is_blocked dele";
-    expect(conta(sql), `migration — ${motivo}`).toBe(2);
-    expect(conta(apendice), `apêndice do baseline — ${motivo}`).toBe(2);
+    // A régua é TODA subconsulta em contacts, e não um número fixo: a versão
+    // desta cerca cravava "exatamente 2", o que passou a abençoar subconsulta
+    // nova sem a empresa quando o total cresceu (#4012 acrescentou o caminho do
+    // telefone) e a exigir subconsulta quando a #2739 tirou o resto (o wrapper
+    // lê o bit da linha, `contato_trava_humano`). Medir por IGUALDADE entre
+    // subconsultas e subconsultas com o predicado vale para qualquer
+    // quantidade — inclusive zero.
+    const subconsulta = "from public.contacts ct where ct.id = $1.contact_id";
+    const semEmpresa = (texto: string): number =>
+      texto.split(subconsulta).length - 1 - (texto.split(PREDICADO).length - 1);
+    expect(semEmpresa(sql), `migration — ${motivo}`).toBe(0);
+    expect(semEmpresa(apendice), `apêndice do baseline — ${motivo}`).toBe(0);
   });
 });

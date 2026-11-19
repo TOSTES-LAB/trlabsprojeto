@@ -18,17 +18,40 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { auditMcpToolCall } from "@/lib/mcp/audit";
 import { McpAuthError, ensureRole, ensureScope } from "@/lib/mcp/auth";
 import type { McpAuthResult } from "@/lib/mcp/auth";
+import { recusaDaChamada, rotuloDaRecusa } from "@/lib/mcp/desfecho-da-chamada";
 import { logger } from "@/lib/logger";
 import { allTools, getToolByName } from "@/lib/mcp/tools";
+import {
+  definirFerramentasDoServidorDoAgente,
+  definirFerramentasRemotas,
+  ferramentaDeSolicitarAcesso,
+} from "@/lib/mcp/tools/externo";
+import type { ServidorMcpExternoMontado } from "@/lib/mcp/servidor-externo/carregar";
+import type { ServidorDoAgenteNoTurno } from "@/lib/mcp/servidor-externo/do-agente/carregar";
+import { escolhasDoServidor, escolhasRemotas } from "@/lib/mcp/servidor-externo/ids";
+import { marcarLeituraRemota } from "@/lib/mcp/servidor-externo/leitura-remota";
+import { resumirArgumentosDaEscrita } from "@/lib/mcp/servidor-externo/auditoria-da-escrita";
+import { recusaDaEscritaNaoLiberada } from "@/lib/mcp/servidor-externo/escrita-liberada";
 import { catalogEntry, deCapacidadeDesligada, deModuloDesligado } from "@/lib/mcp/tools/catalog";
 import type { CapacidadeDaOrganizacao } from "@/lib/organizacao/capacidades";
 import type { ModuloOpcional } from "@/lib/instalacao/modulos";
 import { higienizarUuidsDeAterro } from "@/lib/mcp/uuid-de-aterro";
 import { recusaDeCapacidadeParaOModelo } from "@/lib/mcp/recusa-para-o-modelo";
+import { tamanhoDoResultado } from "@/lib/mcp/resultado-bytes";
 import type { McpContext, McpToolDefinition } from "@/lib/mcp/types";
 import { resolveActiveLeadForContact, type LeadCandidate } from "@/lib/leads/active-lead";
+import { completarDestinoDoNegocio } from "@/lib/external-db/receitas/destino-pela-referencia";
 import { podeChamarFerramenta, recusaParaOModelo } from "@/lib/leads/escopo-de-funil";
 import { escritaCabeNoTurno } from "./escopo-das-escritas";
+import type { DesfechoDaEscrita, EfeitoDasEscrituras } from "./efeito-das-escritas";
+import { ESCRITAS_DE_AGENDAMENTO } from "./recibos-de-agendamento";
+import {
+  chaveDaEscritaDoNegocio,
+  criarFilaDeEscritasDoNegocio,
+  EscritaDoNegocioSemDesfechoError,
+  PRAZO_ESCRITA_NEGOCIO_MS,
+} from "./escritas-do-negocio";
+import { guardServiceEffect } from "@/lib/atendimento/fronteira-server";
 
 export interface RuntimeHandoffSignal {
   triggered: boolean;
@@ -75,6 +98,55 @@ export interface PickToolsInput {
    * do turno à mão, esse id é traduzido para o negócio aberto dele.
    */
   contatoDoTurno?: string;
+  /**
+   * Servidor MCP externo REGISTRADO pela instalação, já com as ferramentas que
+   * ele anunciou (#2147).
+   *
+   * Ausente = não existe servidor: o catálogo compilado continua sendo a
+   * única fonte de tool do turno, sem nenhuma chamada de rede. Quem monta é
+   * `carregarServidorMcpExternoDoTurno`, ANTES daqui — descobrir é rede e este montador
+   * é síncrono.
+   */
+  servidorMcpExterno?: ServidorMcpExternoMontado;
+  /**
+   * Servidores MCP DO AGENTE já carregados para este turno (migration 9095),
+   * por `carregarServidoresDoAgenteNoTurno`. Ausente/vazio = nenhum.
+   */
+  servidoresDoAgente?: readonly ServidorDoAgenteNoTurno[];
+  /**
+   * Coletor: recebe o nome de cada remota MONTADA como LEITURA
+   * (`category: "read"`) — do `servidorMcpExterno` da organização
+   * (`definirFerramentasRemotas`) e dos servidores MCP DO AGENTE
+   * (`definirFerramentasDoServidorDoAgente`, #4881). Quem passa é o turno, que
+   * registra o resultado delas como evidência da conferência de promessa. É o
+   * MESMO coletor e a MESMA evidência (`servidor_externo`) para os dois: quem
+   * lê a agenda do cliente pelo ERP da empresa e quem a lê pelo servidor do
+   * agente `oauth_por_contato` relatam um fato consultado, não uma promessa.
+   * Ausente = ninguém pergunta.
+   */
+  leiturasRemotas?: Set<string>;
+  /**
+   * Só monta remota que montou como LEITURA (as duas metades: marca `leitura`
+   * em `tool_ids` E `readOnlyHint` do servidor). É a mão do Operador no modo
+   * assistido: a marca no id sozinha é escolha de configuração, e o assistido
+   * promete que nada sai sem aprovação. Ausente = como sempre.
+   */
+  remotasSoLeitura?: boolean;
+  /**
+   * O PREDICADO ÚNICO do efeito deste turno (#3333) — ver
+   * `lib/ai/runtime/efeito-das-escritas.ts`.
+   *
+   * Esta ponte é o ÚNICO ponto que sabe o desfecho de uma escrita (ela decide o `success`
+   * do audit depois do escopo de contato, do negócio do turno, do escopo de funil, da
+   * recusa do handler e da escrita sem desfecho). Por isso é ELA que responde à pergunta
+   * "esta ação já produziu efeito?", uma vez por saída, em vez de cada call site
+   * reimplementar "deu certo?".
+   *
+   * Ausente = ninguém pergunta: um chamador que não conhece o campo simplesmente não
+   * registra desfecho. A direção segura aqui é NÃO registrar — o que desarma um gate,
+   * nunca libera uma escrita.
+   */
+  efeitos?: EfeitoDasEscrituras;
 }
 
 /**
@@ -173,22 +245,54 @@ const HANDOFF_TOOL_NAME = "crm_request_human_handoff";
 const DRAFT_PROPOSAL_TOOL_NAME = "crm_draft_proposal";
 const PREPARAR_PROPOSTA_TOOL_NAME = "crm_preparar_proposta";
 
-function shapeToZodObject(shape: Record<string, z.ZodTypeAny>): z.ZodTypeAny {
+export function shapeToZodObject(shape: Record<string, z.ZodTypeAny>): z.ZodTypeAny {
   // The MCP tool inputSchema is a Zod *raw shape* (object of zod types).
+  //
+  // Shape VAZIO vira registro livre, e não `z.object({})`: um servidor MCP
+  // externo pode anunciar ferramenta sem `properties` (#2147), e `z.object({})`
+  // faria o Zod DESCARTAR todo argumento antes do handler ver — a chamada
+  // sairia vazia para o ERP, sem erro em lugar nenhum. Nenhuma tool compilada
+  // tem shape vazio, então isto só muda o que é novo.
+  if (Object.keys(shape).length === 0) return z.record(z.string(), z.unknown());
   return z.object(shape);
 }
 
 function wrapMcpTool(
   def: McpToolDefinition,
   input: PickToolsInput,
+  executarEscrita: ReturnType<typeof criarFilaDeEscritasDoNegocio>,
 ): Tool {
   const inputSchema = shapeToZodObject(def.inputSchema as Record<string, z.ZodTypeAny>);
+
+  // ── A RESPOSTA ÚNICA PARA "ESTA AÇÃO JÁ PRODUZIU EFEITO?" (#3333) ────────
+  //
+  // Toda saída desta ponte que ENCERRA uma escrita passa por aqui, com o MESMO
+  // desfecho que já vai para o `api_audit_log`: o efeito não é uma segunda
+  // opinião sobre "deu certo?", é a que já existe, publicada para quem produz a
+  // fala (`guardrails/before-send.ts`, gate `registro_sem_efeito`).
+  //
+  // Leitura (`read`) não registra: ela não cria registro nenhum, e o predicado é
+  // sobre o que passou a existir.
+  const anotarEfeito = (desfecho: DesfechoDaEscrita): void => {
+    if (def.category === "read") return;
+    input.efeitos?.registrar(def.name, desfecho);
+  };
+
+  /**
+   * A ESCRITA de servidor MCP externo (#4445) — a única que não grava registro
+   * do CRM e a única que depende de liberação explícita para rodar no
+   * atendimento. A leitura remota não entra: ela já é escopada pela identidade
+   * do contato (`carregar.ts`).
+   */
+  const escritaRemota = def.remotoExterno !== undefined && def.category !== "read";
 
   return tool({
     description: def.description,
     inputSchema,
     execute: async (args: unknown) => {
       const startedAt = Date.now();
+      const geracaoDaAgenda = ESCRITAS_DE_AGENDAMENTO.has(def.name)
+        ? input.efeitos?.iniciarAgendamento() : undefined;
       // ── O UUID QUE O MODELO INVENTA PARA "NÃO SEI" ────────────────────────
       //
       // Aqui, na fronteira, e não em cada handler. Medido em produção: um
@@ -222,7 +326,23 @@ function wrapMcpTool(
       }
       // O que vai ao audit não é necessariamente o que vai ao handler: a tool
       // pode declarar como tirar PII dos args (ex.: valores de filtro).
-      const argsAudit = def.redigirParaAuditoria ? def.redigirParaAuditoria(argsRecord) : argsRecord;
+      //
+      // Na ESCRITA de servidor MCP externo (#4445) quem manda é o resumo: o
+      // argumento é o que o cliente ditou na conversa (nome, documento,
+      // endereço) e a chave pode ter qualquer nome — o `redactArgs` do audit só
+      // protege um punhado de nomes conhecidos. Vai FORMA (campo, tipo, tamanho,
+      // identificador curto), nunca o payload inteiro.
+      const argsAudit = def.redigirParaAuditoria
+        ? def.redigirParaAuditoria(argsRecord)
+        : def.remotoExterno && def.category !== "read"
+          ? resumirArgumentosDaEscrita(argsRecord)
+          : argsRecord;
+      // A conexão do servidor externo (#4445) — em toda saída do audit desta
+      // chamada, inclusive nas recusas: `metadata.conexao` é o que diz de qual
+      // sistema de fora veio a escrita (nome igual em duas conexões não é a
+      // mesma coisa).
+      const desfechoExterno = (desfecho: "ok" | "negado" | "erro_externo") =>
+        def.remotoExterno === undefined ? {} : { desfecho, conexao: def.remotoExterno.conexao };
       if (higiene.descartados.length > 0) {
         // Não é cosmético: sem esta linha o defeito passa a se curar em
         // silêncio e ninguém descobre que um modelo faz isso o tempo todo.
@@ -231,16 +351,111 @@ function wrapMcpTool(
           campos: higiene.descartados.join(","),
         });
       }
+      // O registro de uma criação de negócio que seguiu sem item conferido
+      // (#4763, item 2): vira o `motivo` da auditoria desta chamada.
+      let motivoDoNegocioAMao: string | null = null;
       try {
         ensureScope(input.auth.scopes, def.requiresScope);
         ensureRole(input.auth.role, def.requiresRole);
+
+        // ── A LIBERAÇÃO EXPLÍCITA DA ESCRITA REMOTA (#4445) ──────────────────
+        //
+        // Durante o atendimento, ferramenta de ESCRITA de servidor MCP externo
+        // só roda quando a organização a liberou POR NOME e POR CONEXÃO
+        // (`organizations.settings.mcp_externo_escrita`, lida por
+        // `escrita-liberada.ts`). A lista é explícita: curinga não é expandido —
+        // ele cai fora na leitura, e o nome que ele pretendia liberar continua
+        // recusado aqui.
+        //
+        // A recusa é NOMEADA (`escrita_nao_liberada`, com ferramenta e conexão
+        // na mensagem) e sobe para o modelo como texto, não como exceção: ele
+        // aprende que a ação depende de configuração e segue a conversa, em vez
+        // de repetir a chamada ou inventar que reservou.
+        //
+        // A escrita DELEGADA ao contato fica de fora: ela não usa a chave da
+        // empresa, e sim o token do próprio contato, concedido por ele no
+        // step-up (`do-agente/`). Quem consente ali é o dono da conta no
+        // terceiro, não a lista da organização.
+        if (
+          input.contatoDoTurno &&
+          escritaRemota &&
+          def.escritaDelegadaAoContato !== true &&
+          def.remotoExterno?.escritaLiberada !== true
+        ) {
+          void auditMcpToolCall({
+            ctx: input.ctx,
+            toolName: def.name,
+            args: argsAudit,
+            durationMs: Date.now() - startedAt,
+            success: false,
+            errorMessage: `contato_da_conversa:escrita_nao_liberada`,
+            motivo: "escrita_nao_liberada",
+            ...desfechoExterno("negado"),
+          });
+          anotarEfeito("falhou");
+          return recusaDaEscritaNaoLiberada(def.name, def.remotoExterno?.conexao ?? "desconhecida");
+        }
+
+        // Spec 25 (R5c): o agente pode abrir o negócio de um item do banco externo
+        // passando só a referência — o funil e a etapa saem da receita (sem referência
+        // nada muda: o handler recusa a ausência). Completado
+        // AQUI, antes do escopo de funil logo abaixo: a guarda julga o funil que vai
+        // ser escrito, e com o argumento ausente ela recusaria sempre.
+        //
+        // #4763, item 2: a guarda roda em TODA criação que tenha algo a
+        // conferir — com a referência, ou com o par funil+etapa à mão. Com o
+        // funil à mão e sem referência era aqui que o item deixava de ser
+        // olhado — a chamada passava direto para o escopo de funil, e o negócio
+        // "Casa com piscina — AU-9999" nasceu de um item que não existe. Quem
+        // decide se o funil exige a referência é a guarda (destino de receita
+        // ativa, num turno de conversa).
+        //
+        // Funil SEM etapa não entra: a guarda só devolveria a recusa de ensino
+        // (`funil_e_etapa_juntos`), que é do handler — antecipá-la aqui pula a
+        // ordem do wrap (escopo de escrita antes do handler) e o erro sai de um
+        // lugar que não valida o pedido.
+        const temReferencia = typeof argsRecord.referencia_externa === "string";
+        const temParDeFunil =
+          typeof argsRecord.pipeline_id === "string" && argsRecord.pipeline_id !== "" &&
+          typeof argsRecord.stage_id === "string" && argsRecord.stage_id !== "";
+        if (def.name === "crm_create_lead" && (temReferencia || temParDeFunil)) {
+          const completo = await completarDestinoDoNegocio(
+            input.supabase,
+            input.ctx.organizationId,
+            argsRecord,
+            { turnoComContato: !!input.contatoDoTurno },
+          );
+          if (!completo.ok) {
+            void auditMcpToolCall({
+              ctx: input.ctx,
+              toolName: def.name,
+              args: argsAudit,
+              durationMs: Date.now() - startedAt,
+              success: false,
+              errorMessage: `destino_do_interesse:${String(completo.resposta.erro)}`,
+            });
+            anotarEfeito("falhou");
+            return completo.resposta;
+          }
+          if (completo.declaracao !== undefined) motivoDoNegocioAMao = completo.declaracao;
+        }
 
         // ── DE QUEM É O REGISTRO QUE ESTA ESCRITA ALCANÇA — do contato do turno
         //
         // `write` E `handoff`: a passagem também age sobre uma conversa. A regra
         // e o mapa campo → dono moram em `escopo-das-escritas.ts`; o `lead_id`
         // segue com a guarda logo abaixo. Sem contato do turno, nada muda.
-        if (input.contatoDoTurno && def.category !== "read") {
+        //
+        // A escrita de servidor MCP EXTERNO fica FORA desta conferência (#4445):
+        // ela não grava registro do CRM — acontece no sistema do terceiro, com a
+        // identidade e a chave daquele sistema. Quem a governa é a liberação
+        // explícita logo acima (e, no caso delegado, o token do próprio contato).
+        if (
+          input.contatoDoTurno &&
+          def.category !== "read" &&
+          def.escritaDelegadaAoContato !== true &&
+          def.remotoExterno === undefined
+        ) {
           const escopo = await escritaCabeNoTurno(
             input.supabase,
             input.ctx.organizationId,
@@ -257,6 +472,7 @@ function wrapMcpTool(
               success: false,
               errorMessage: `contato_da_conversa:${escopo.motivo}`,
             });
+            anotarEfeito("falhou");
             return escopo;
           }
         }
@@ -279,6 +495,11 @@ function wrapMcpTool(
         if (
           input.contatoDoTurno &&
           def.category !== "read" &&
+          // `lead_id` de ferramenta remota é id DO SISTEMA DE FORA (#4445), não
+          // uuid de `crm_leads`: traduzir ali trocaria o argumento do terceiro
+          // por um negócio do CRM — ou recusaria a escrita por um id que nunca
+          // foi do CRM.
+          def.remotoExterno === undefined &&
           typeof argsRecord.lead_id === "string"
         ) {
           const alvo = await negocioDaEscritaDoTurno(
@@ -296,6 +517,7 @@ function wrapMcpTool(
               success: false,
               errorMessage: `negocio_da_conversa:${alvo.motivo}`,
             });
+            anotarEfeito("falhou");
             return { permitido: false, motivo: alvo.motivo, mensagem: alvo.mensagem };
           }
           if (alvo.trocado) {
@@ -321,7 +543,13 @@ function wrapMcpTool(
           ferramenta: def.name,
           argumentos: argsRecord,
           escopo: input.pipelineIds,
-          ehEscrita: def.category === "write",
+          // A escrita delegada ao contato age na conta DELE no terceiro, não em
+          // negócio do CRM: não há funil a escopar (e ela nunca é classificada
+          // em `ALVO_DE_FUNIL`, que a recusaria por vacuidade).
+          ehEscrita:
+            def.category === "write" &&
+            def.escritaDelegadaAoContato !== true &&
+            def.remotoExterno === undefined,
           resolvePipelineDoLead: async (leadId) => {
             const { data, error } = await input.supabase
               .from("crm_leads")
@@ -379,6 +607,7 @@ function wrapMcpTool(
           // Devolve TEXTO em vez de lançar: o modelo lê, entende por que foi
           // recusado e segue a conversa. Uma exceção viraria erro de execução e
           // o turno morreria — para o cliente, o assistente teria emudecido.
+          anotarEfeito("falhou");
           return { permitido: false, motivo: veredito.motivo, mensagem: explicacao };
         }
 
@@ -388,9 +617,24 @@ function wrapMcpTool(
         // aqui, no único ponto que tem `input`, para valer para todo chamador
         // de `pickToolsFromMcp` — quem não tem contato de turno (rota HTTP,
         // MCP externo, agente sem conversa) continua com o ctx de antes (#2158).
-        const result = await def.handler(
-          argsRecord as never,
-          input.contatoDoTurno ? { ...input.ctx, contatoDoTurno: input.contatoDoTurno } : input.ctx,
+        // Depois da tradução contato → negócio: ids diferentes podem mirar o mesmo card.
+        // Aguarda TODAS as escritas do handler, inclusive atividade que troca updated_at.
+        // A trava otimista nativa continua recusando interferência humana real.
+        const result = await executarEscrita(
+          chaveDaEscritaDoNegocio(input.ctx.organizationId, def, argsRecord),
+          async () => {
+            // O comando pode ter sido perdido enquanto esta escrita esperava na fila.
+            // A guarda anterior à chamada não autoriza começar um handler depois disso.
+            if (def.category === "write") await guardServiceEffect();
+            return def.handler(
+              argsRecord as never,
+              {
+                ...input.ctx,
+                amigoAgentToolIds: input.toolIds,
+                ...(input.contatoDoTurno ? { contatoDoTurno: input.contatoDoTurno } : {}),
+              },
+            );
+          },
         );
 
         // Capture handoff signal so the runtime can short-circuit the loop.
@@ -413,11 +657,28 @@ function wrapMcpTool(
         // Só quem declara é afetado: sem `motivoDoVazio` nada muda.
         const motivoDoVazio = def.motivoDoVazio?.(result) ?? null;
 
-        // Recusa devolvida PELO HANDLER também não é sucesso (#2158): a ficha de
-        // outro cliente recusada em `crm_get_contact` volta no mesmo formato da
-        // recusa de escrita acima, e entra no audit como ela — `success: false`
-        // e o motivo em `error` —, senão a recusa some contada como acerto.
-        const recusa = recusaDoHandler(result);
+        // O TERMO desta chamada, quando a tool declara um (#484, caminho 2).
+        //
+        // É o que deixa a leitura no painel contar "não achei POR TERMO" — a
+        // lista de compras do dono da loja — em vez de só "falhou por tool". O
+        // termo sobe mesmo quando a busca ACHOU: total × falhas por termo é o
+        // sinal que separa "termo difícil" de "termo que não existe", e só as
+        // falhas mostrariam o termo sem a régua dele. Sem `termoBuscado` nada
+        // muda — a chave nem aparece no `metadata` (mesma disciplina do motivo).
+        const termoBuscado = def.termoBuscado?.(argsRecord as never) ?? null;
+
+        // Recusa devolvida PELO HANDLER também não é sucesso (#2158, #4342): a
+        // ficha de outro cliente recusada em `crm_get_contact`, a escrita de
+        // funil e QUALQUER tool que recuse no formato do catálogo
+        // (`{ erro, mensagem }`) voltam no mesmo formato e entram no audit como
+        // recusa — `success: false`, o CÓDIGO em `error`/`motivo` —, senão a
+        // recusa some contada como acerto e o gate `registro_sem_efeito` lê
+        // `produziu_efeito` numa chamada que não criou nada.
+        //
+        // A régua é UMA (`lib/mcp/desfecho-da-chamada.ts`), a mesma do traço e
+        // da rota MCP externa: antes daqui, só `{ permitido: false }` era
+        // reconhecido, e o formato real das tools passava por sucesso.
+        const recusa = recusaDaChamada(result);
         if (recusa !== null) {
           void auditMcpToolCall({
             ctx: input.ctx,
@@ -425,8 +686,11 @@ function wrapMcpTool(
             args: argsAudit,
             durationMs: Date.now() - startedAt,
             success: false,
-            errorMessage: `contato_da_conversa:${recusa}`,
+            errorMessage: rotuloDaRecusa(recusa),
+            desfecho: "recusa",
+            ...(recusa.codigo === null ? {} : { motivo: recusa.codigo }),
           });
+          anotarEfeito("falhou");
           return result;
         }
 
@@ -436,10 +700,23 @@ function wrapMcpTool(
           args: argsAudit,
           durationMs: Date.now() - startedAt,
           success: motivoDoVazio === null,
+          resultBytes: tamanhoDoResultado(result),
           ...(motivoDoVazio === null
-            ? {}
+            ? desfechoExterno("ok")
             : { desfecho: "sem_resultado" as const, motivo: motivoDoVazio }),
+          ...(termoBuscado === null ? {} : { termo: termoBuscado }),
+          // #4763, item 2: o negócio que nasceu sem item conferido deixa o
+          // registro na trilha. `success` continua verdadeiro — o negócio
+          // existe; o que o motivo diz é que ele não veio de um item olhado.
+          ...(motivoDoNegocioAMao === null || motivoDoVazio !== null
+            ? {}
+            : { motivo: motivoDoNegocioAMao }),
         });
+        // O MESMO critério do audit: vazio declarado não é efeito (#484).
+        anotarEfeito(motivoDoVazio === null ? "produziu_efeito" : "falhou");
+        if (geracaoDaAgenda !== undefined && motivoDoVazio === null) {
+          input.efeitos?.registrarRecibosDeAgendamento(geracaoDaAgenda, result);
+        }
         return result;
       } catch (err) {
         const message = err instanceof Error ? err.message : "unknown_error";
@@ -450,7 +727,28 @@ function wrapMcpTool(
           durationMs: Date.now() - startedAt,
           success: false,
           errorMessage: message,
+          // O terceiro não respondeu, recusou ou estourou o tempo: `erro_externo`
+          // é o desfecho que separa "o ERP falhou" de "a configuração recusou"
+          // (`negado`) na trilha (#4445).
+          ...desfechoExterno("erro_externo"),
         });
+        // Escrita sem desfecho NÃO é falha: ninguém sabe se ela aconteceu. O predicado
+        // guarda a diferença (`incerto`) porque o ensino do veto muda — em `falhou` a fala
+        // pode dizer "não registrei"; em `incerto` ela não pode afirmar nem negar.
+        anotarEfeito(err instanceof EscritaDoNegocioSemDesfechoError ? "incerto" : "falhou");
+        if (err instanceof EscritaDoNegocioSemDesfechoError) {
+          logger.error("escrita do negócio sem desfecho; novas escritas recusadas", {
+            tool_name: def.name,
+            organization_id: input.ctx.organizationId,
+            request_id: input.ctx.requestId,
+            prazo_ms: PRAZO_ESCRITA_NEGOCIO_MS,
+          });
+          return {
+            error: message,
+            resultado_incerto: true,
+            mensagem: "Há uma escrita deste negócio ainda sem desfecho confirmado. Não confirme sucesso, não repita nem tente outra escrita: peça à equipe para conferir. A operação em andamento não foi cancelada.",
+          };
+        }
         // Recusa por papel/scope NAO e erro de execucao — e defeito de
         // configuracao: o humano ligou a capacidade na tela e ela nao existe na
         // pratica. Devolver so ao modelo faz a promessa quebrada sumir sem
@@ -475,6 +773,23 @@ function wrapMcpTool(
         if (err instanceof McpAuthError) {
           return { error: recusaDeCapacidadeParaOModelo(def.name) };
         }
+        // A FALHA DO SISTEMA EXTERNO NÃO DERRUBA O ATENDIMENTO (#4445). O
+        // texto que volta ao modelo diz o que aconteceu e proíbe a confirmação
+        // inventada; o motivo técnico do terceiro (`Timeout of 15000ms
+        // exceeded`, XML-RPC, 502) fica no audit e no log, onde serve para
+        // investigar. Sem esta tradução o modelo leria um erro de infraestrutura
+        // como resposta e poderia dizer ao cliente que a reserva está feita.
+        if (escritaRemota) {
+          return {
+            error: "erro_externo",
+            motivo: "erro_externo",
+            mensagem:
+              `o sistema externo não confirmou a ação de "${def.name}" (conexão "` +
+              `${def.remotoExterno?.conexao ?? "desconhecida"}"). NÃO diga ao cliente que ela foi ` +
+              "concluída. Avise que a equipe vai terminar esta etapa e siga a conversa com o que " +
+              "não depende dela.",
+          };
+        }
         // Return error to the model rather than throwing — keeps the loop alive.
         return { error: message };
       }
@@ -482,15 +797,9 @@ function wrapMcpTool(
   });
 }
 
-/** O `motivo` de uma recusa `{ permitido: false, motivo }` devolvida pelo handler, ou `null`. */
-function recusaDoHandler(result: unknown): string | null {
-  if (typeof result !== "object" || result === null) return null;
-  const r = result as { permitido?: unknown; motivo?: unknown };
-  return r.permitido === false && typeof r.motivo === "string" ? r.motivo : null;
-}
-
 export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
   const result: Record<string, Tool> = {};
+  const executarEscrita = criarFilaDeEscritasDoNegocio();
 
   for (const id of input.toolIds) {
     const def = getToolByName(id);
@@ -529,7 +838,7 @@ export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
     )
       continue;
 
-    result[def.name] = wrapMcpTool(def, input);
+    result[def.name] = wrapMcpTool(def, input, executarEscrita);
   }
 
   // Auto-inject handoff tool when enabled even if not in tool_ids — Spec 10
@@ -537,7 +846,7 @@ export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
   if (input.handoffToolEnabled && !result[HANDOFF_TOOL_NAME]) {
     const handoff = allTools.find((t) => t.name === HANDOFF_TOOL_NAME);
     if (handoff) {
-      result[HANDOFF_TOOL_NAME] = wrapMcpTool(handoff, input);
+      result[HANDOFF_TOOL_NAME] = wrapMcpTool(handoff, input, executarEscrita);
     }
   }
 
@@ -549,8 +858,132 @@ export function pickToolsFromMcp(input: PickToolsInput): Record<string, Tool> {
       if (deCapacidadeDesligada(nome, input.capacidadesLigadas ?? []) || result[nome]) continue;
       const tool = allTools.find((t) => t.name === nome);
       if (tool) {
-        result[nome] = wrapMcpTool(tool, input);
+        result[nome] = wrapMcpTool(tool, input, executarEscrita);
       }
+    }
+  }
+
+  // ── Ferramentas remotas ESCOLHIDAS pelo agente (#2147, itens 6, 7 e 8) ───
+  //
+  // Depois de tudo: as remotas somam às compiladas e nunca substituem nenhuma
+  // (o nome colidindo é descartado lá em `definirFerramentasRemotas`, com o
+  // motivo no log). Passam pelo MESMO `wrapMcpTool`, então auditoria, papel,
+  // escopo e a devolução de texto em vez de exceção valem para elas — e é
+  // passando por ele que uma remota classificada como ESCRITA cai na
+  // conferência de escopo do turno logo acima (`escrita_sem_escopo_do_turno`)
+  // em vez de atravessá-la.
+  //
+  // A ESCOLHA é do `tool_ids` da versão, com prefixo estável `mcp_externo:`
+  // (item 6, `servidor-externo/ids.ts`) — não do cadastro: registrar o servidor
+  // não dá ferramenta a agente nenhum. DESLIGADO POR PADRÃO (item 7): sem
+  // servidor, ou com servidor mas sem id remoto escolhido, este bloco não
+  // monta nada, e o turno é o catálogo de sempre sem rede nenhuma.
+  //
+  // Fora dos filtros de módulo e capacidade de ORGANIZAÇÃO por desenho: quem
+  // registra o servidor é a instalação, o endereço não vem de pacote nenhum e
+  // o catálogo compilado não sabe que essas ferramentas existem — filtrá-las
+  // por chave que só existe dentro dele as deixaria invisíveis para sempre.
+  if (input.servidorMcpExterno) {
+    const escolhas = escolhasRemotas(input.toolIds);
+    if (escolhas.length > 0) {
+      const ocupados = new Set(allTools.map((t) => t.name));
+      const remotas = definirFerramentasRemotas(
+        input.servidorMcpExterno.servidor,
+        input.servidorMcpExterno.ferramentas,
+        ocupados,
+        escolhas,
+        {
+          // Junta de teste (ver `ServidorMcpExternoMontado.fetch`): em produção
+          // vem vazia e a saída usa o guard anti-SSRF.
+          ...(input.servidorMcpExterno.fetch ? { fetch: input.servidorMcpExterno.fetch } : {}),
+          // A identidade do contato, resolvida no banco por `carregar.ts`.
+          ...(input.servidorMcpExterno.cabecalhos
+            ? { cabecalhos: input.servidorMcpExterno.cabecalhos }
+            : {}),
+        },
+        // #4445 — as escritas liberadas PARA ESTA CONEXÃO, já resolvidas pela
+        // carga. Sem a lista (instalação que nunca configurou), `[]`: toda
+        // escrita remota sai daqui recusável, que é o estado seguro de fábrica.
+        input.servidorMcpExterno.escritasLiberadas ?? [],
+      );
+      // O servidor carrega a identidade DESTE contato? Só então a leitura
+      // remota serve a uma conversa.
+      const identificado =
+        input.contatoDoTurno !== undefined &&
+        input.servidorMcpExterno.contato === input.contatoDoTurno;
+      // Com contato, a auditoria da remota leva o `contact_id` da conversa
+      // (`metadata.contact_id`, em `auditMcpToolCall`).
+      const entradaDaRemota = input.contatoDoTurno
+        ? { ...input, ctx: { ...input.ctx, contatoDoTurno: input.contatoDoTurno } }
+        : input;
+      for (const def of remotas) {
+        // ESCOLHA (b), item 8, em dois níveis. O primeiro é
+        // `carregarServidorMcpExterno`, que só carrega servidor para turno com
+        // contato quando o agente ligou a opção — este é o de defesa: sem a
+        // identidade do contato amarrada ao servidor, a LEITURA remota não
+        // monta (poderia devolver dado de outro cliente), e a ESCRITA monta
+        // para ser RECUSADA logo acima por `escrita_sem_escopo_do_turno`,
+        // nunca executada — com ou sem identidade.
+        if (input.contatoDoTurno && def.category === "read" && !identificado) continue;
+        if (input.remotasSoLeitura && def.category !== "read") continue;
+        const montada = wrapMcpTool(def, entradaDaRemota, executarEscrita);
+        // A prévia libera só a remota marcada aqui (ver `leitura-remota.ts`).
+        result[def.name] = def.category === "read" ? marcarLeituraRemota(montada) : montada;
+        if (def.category === "read") input.leiturasRemotas?.add(def.name);
+      }
+    }
+  }
+
+  // ── Servidores MCP DO AGENTE (migration 9095) ────────────────────────────
+  //
+  // Mesma porta das remotas acima — `wrapMcpTool`, auditoria, papel, escopo —,
+  // com nomes namespaced (`<slug>__<nome>`). Servidor `oauth_por_contato` só
+  // chega aqui em turno com contato (a carga não o monta sem contato), e
+  // sempre ganha a ferramenta `solicitar_acesso_<slug>`: sem token, ela é a
+  // ÚNICA desse servidor; com token, serve ao step-up de escopo.
+  for (const montado of input.servidoresDoAgente ?? []) {
+    const ocupados = new Set([...allTools.map((t) => t.name), ...Object.keys(result)]);
+    const entradaDaRemota = input.contatoDoTurno
+      ? { ...input, ctx: { ...input.ctx, contatoDoTurno: input.contatoDoTurno } }
+      : input;
+    if (montado.estado === "pronto") {
+      // Defesa em profundidade, a mesma do servidor compartilhado: em turno com
+      // contato, só monta o que está amarrado A ESTE contato.
+      if (input.contatoDoTurno && montado.contato !== input.contatoDoTurno) continue;
+      const defs = definirFerramentasDoServidorDoAgente(
+        montado,
+        ocupados,
+        escolhasDoServidor(input.toolIds, montado.servidor.id),
+        input.contatoDoTurno,
+      );
+      for (const def of defs) {
+        if (input.remotasSoLeitura && def.category !== "read") continue;
+        const montada = wrapMcpTool(def, entradaDaRemota, executarEscrita);
+        // #4317 — a MESMA marca do servidor externo da organização (#3575):
+        // `category === "read"` aqui JÁ é as duas metades juntas, decididas em
+        // `definirFerramentasDoServidorDoAgente` (marca `leitura` do admin em
+        // `tool_ids` E `somenteLeitura` capturado por `declarouSomenteLeitura`
+        // — `readOnlyHint === true` exato). Sem as duas, a definição sai
+        // `write` e NÃO recebe a marca: a prévia continua recusando.
+        result[def.name] = def.category === "read" ? marcarLeituraRemota(montada) : montada;
+        // #4881 — a MESMA evidência da remota da organização: sem esta linha o
+        // `mcp.leiturasRemotas.has(name)` do turno era falso para o servidor do
+        // agente, `registrarLeituraRemota` nunca rodava, e a conferência de
+        // promessa vetava TODO fato de agenda que o agente relatava (inclusive o
+        // `oauth_por_contato` que devolveu a consulta). A leitura que falha não
+        // vira evidência de sucesso — quem recusa o `isError` é
+        // `registrarLeituraRemota`, no mesmo caminho da plataforma.
+        if (def.category === "read") input.leiturasRemotas?.add(def.name);
+      }
+    } else if (!input.contatoDoTurno || montado.contato !== input.contatoDoTurno) {
+      continue;
+    }
+    const acesso =
+      montado.servidor.modo === "oauth_por_contato" && !input.remotasSoLeitura
+        ? ferramentaDeSolicitarAcesso(montado)
+        : null;
+    if (acesso && !ocupados.has(acesso.name)) {
+      result[acesso.name] = wrapMcpTool(acesso, entradaDaRemota, executarEscrita);
     }
   }
 

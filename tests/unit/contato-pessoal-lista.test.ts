@@ -1,0 +1,203 @@
+import fs from "node:fs";
+import path from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+import { ApiError } from "@/lib/api/types";
+import { getConversationHandler } from "@/app/api/v1/conversations/_handler";
+import { listMessagesHandler } from "@/app/api/v1/messages/_handler";
+
+/**
+ * ESCONDER DO INBOX (spec 21, etapa 7 — critérios 1, 2 e 3).
+ *
+ * Conversa de pessoal não aparece na lista, na busca (nome, telefone E prévia)
+ * nem nas contagens. O link direto dá 404 e o histórico recusa junto — a
+ * conversa some de tudo, com o histórico inteiro no banco para a volta.
+ *
+ * ─── SABOTAGEM (prova no CI) ───────────────────────────────────────────────
+ * - Tirar o `.not("contact_id", ...)` da lista mas manter o da busca: a busca
+ *   por prévia acha a conversa escondida (critério 2 acusa pelo `.not`).
+ * - Tirar o `is_personal = v_pessoal` de `fn_contatos_da_busca` (migration 9421):
+ *   busca por nome/telefone volta a achar pessoal.
+ * - Manter somando no counts: o badge diverge da lista (critério 3).
+ * - Tirar o 404 do `getConversationHandler`: o caso "link direto dá 404" cai.
+ * Linha para reverter: `app/api/v1/conversations/_handler.ts`,
+ * `supabase/migrations/*_9421_*.sql`,
+ * `app/api/v1/conversations/counts/route.ts`, `app/api/v1/messages/_handler.ts`.
+ */
+
+const RAIZ = process.cwd();
+const fonte = (...partes: string[]) => fs.readFileSync(path.join(RAIZ, ...partes), "utf8");
+const semComentarios = (src: string) =>
+  src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+
+const LISTA = semComentarios(fonte("app", "api", "v1", "conversations", "_handler.ts"));
+const CONTAS = semComentarios(fonte("app", "api", "v1", "conversations", "counts", "route.ts"));
+const HISTORICO = semComentarios(fonte("app", "api", "v1", "messages", "_handler.ts"));
+
+/**
+ * Onde o filtro de pessoal da BUSCA mora desde o #4326 (fatia 1).
+ *
+ * O casamento de texto saiu do handler para `fn_contatos_da_busca` — `like` e
+ * `ilike` não são `leakproof`, e a RLS de `contacts` impedia o índice de
+ * trigrama de ser usado. O filtro de pessoal foi junto com o casamento: ele
+ * continua existindo UMA vez, só não é mais nesta consulta do PostgREST. A
+ * asserção abaixo segue a linha que ele ocupa hoje; se a função perder o filtro,
+ * este teste fica vermelho, como antes.
+ */
+const MIGRACOES = path.join(RAIZ, "supabase", "migrations");
+const ARQUIVO_9421 = fs.readdirSync(MIGRACOES).find((nome) => nome.includes("_9421_"));
+const FUNCAO_DA_BUSCA = ARQUIVO_9421
+  ? semComentarios(fs.readFileSync(path.join(MIGRACOES, ARQUIVO_9421), "utf8"))
+  : "";
+
+describe("lista do inbox esconde pessoal (critério 1)", () => {
+  it("a query principal exclui os contatos pessoais", () => {
+    expect(LISTA).toMatch(/idsDeContatosPessoais/);
+    expect(LISTA).toMatch(/\.not\("contact_id",\s*"in"/);
+  });
+
+  it("a primitiva de ids é a mesma da busca (uma régua só)", () => {
+    expect(LISTA).toMatch(/export async function idsDeContatosPessoais/);
+    expect(LISTA).toMatch(/\.eq\("is_personal",\s*true\)/);
+  });
+});
+
+describe("busca zera para pessoal (critério 2: nome, telefone e prévia)", () => {
+  it("a subconsulta de contatos filtra pessoal pelo MESMO `querPessoal` da lista", () => {
+    // #4434: a régua deixou de ser a constante `false`. O que a spec 21 protegia
+    // continua protegido (padrão = pessoal fora da busca), e a aba Pessoal
+    // inverte pelo MESMO booleano em nome/telefone e na prévia — nunca por uma
+    // segunda condição que possa divergir.
+    expect(LISTA).toMatch(/const querPessoal = q\.pessoais === true \|\| q\.pessoais === "true"/);
+    // A catraca da doutrina antiga: ninguém pode voltar a FIXAR `false` numa
+    // ponta e deixar a outra invertida.
+    expect(LISTA).not.toMatch(/\.eq\("(?:contacts\.)?is_personal",\s*false\)/);
+
+    // #4326 (fatia 1): o casamento de texto saiu do handler para
+    // `fn_contatos_da_busca` (`security definer`), porque `like`/`ilike` não são
+    // `leakproof` e a RLS impediria o índice de trigrama. O filtro de pessoal foi
+    // junto — e foi junto como PARÂMETRO: o handler manda o mesmo `querPessoal`
+    // (e o dono) que a lista usa, e a função aplica nas DUAS pontas (ficha e
+    // telefone extra). A prova de COMPORTAMENTO (ficha pessoal não é achada) está
+    // em `tests/invariants/fn-contatos-da-busca-usa-o-indice.test.ts`; aqui fica a
+    // de FONTE, que é a que esta cerca sempre cobrou.
+    expect(LISTA, "a busca deixou de delegar o casamento à função").toMatch(
+      /fn_contatos_da_busca/,
+    );
+    expect(LISTA, "o booleano de pessoal não chega à função").toMatch(/p_pessoal:\s*querPessoal/);
+    expect(LISTA, "o dono da ficha pessoal não chega à função").toMatch(
+      /p_dono:\s*querPessoal\s*\?\s*atorHumanoId\s*:\s*null/,
+    );
+    expect(ARQUIVO_9421, "faltou a migration do filtro de pessoal").toBeDefined();
+    expect(FUNCAO_DA_BUSCA, "a função da busca não aplica o parâmetro de pessoal").toMatch(
+      /is_personal\s*=\s*v_pessoal/,
+    );
+    expect(FUNCAO_DA_BUSCA, "a função da busca voltou a FIXAR pessoal").not.toMatch(
+      /is_personal\s*=\s*false/,
+    );
+    // Duas tabelas, duas pontas: ficha (`contacts`) e telefone extra
+    // (`contact_phones`). Uma delas sem o filtro é a fresta que a spec 21 fecha.
+    expect(FUNCAO_DA_BUSCA.match(/is_personal\s*=\s*v_pessoal/g) ?? []).toHaveLength(3);
+  });
+
+  it("a prévia segue coberta pelo .not da query principal", () => {
+    // Sem ids casados a busca por conteúdo segue sozinha — mas a conversa de
+    // pessoal nunca está na query principal para ser achada por ela.
+    expect(LISTA).toMatch(/\.not\("contact_id",\s*"in"/);
+  });
+});
+
+describe("contagem cai junto com a lista (critério 3)", () => {
+  it("toda contagem nasce com a mesma exclusão", () => {
+    expect(CONTAS).toMatch(/idsDeContatosPessoais/);
+    expect(CONTAS).toMatch(/\.not\("contact_id",\s*"in"/);
+  });
+});
+
+describe("link direto e histórico recusam (defesa em profundidade)", () => {
+  interface EloLeitura {
+    eq(coluna: string, valor: unknown): EloLeitura;
+    limit(n: number): EloLeitura;
+    maybeSingle(): Promise<{ data: unknown; error: null }>;
+  }
+  function banco(conversa: unknown) {
+    const q: EloLeitura = {
+      eq: () => q,
+      limit: () => q,
+      async maybeSingle() {
+        return { data: conversa, error: null };
+      },
+    };
+    return { from: () => ({ select: () => q }) } as never;
+  }
+  // O histórico lê em DUAS consultas planas (sem embed, sem `maybeSingle` —
+  // o dublê do invariante de paginação traduz a cadeia em SQL literal):
+  // conversa → `contact_id`, contato → `is_personal`.
+  function bancoHistorico(pessoal: boolean) {
+    const q: EloLeitura & {
+      then(ok: (v: { data: unknown[]; error: null }) => unknown): unknown;
+    } = {
+      eq: () => q,
+      limit: () => q,
+      async maybeSingle() {
+        return { data: null, error: null };
+      },
+      then(ok) {
+        return Promise.resolve(
+          ok({ data: [{ contact_id: "ct-1", is_personal: pessoal }], error: null }),
+        );
+      },
+    };
+    return { from: () => ({ select: () => q }) } as never;
+  }
+
+  const ctx = {
+    organization_id: "11111111-1111-4111-8111-111111111111",
+    requestId: "req-1",
+    idioma: "pt-BR",
+    actor: { type: "user", id: "user-1" },
+  } as never;
+
+  const conversaPessoal = {
+    id: "conversa-1",
+    organization_id: "11111111-1111-4111-8111-111111111111",
+    contacts: { is_personal: true },
+  };
+  const conversaNormal = {
+    id: "conversa-1",
+    organization_id: "11111111-1111-4111-8111-111111111111",
+    contacts: { is_personal: false },
+  };
+
+  it("GET da conversa pessoal dá 404 (some até por link direto)", async () => {
+    const err = await getConversationHandler(banco(conversaPessoal), ctx, "conversa-1").catch(
+      (e: unknown) => e,
+    );
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(404);
+    expect((err as ApiError).code).toBe("not_found");
+  });
+
+  it("GET da conversa normal continua abrindo", async () => {
+    const conv = await getConversationHandler(banco(conversaNormal), ctx, "conversa-1");
+    expect((conv as { id: string }).id).toBe("conversa-1");
+  });
+
+  it("histórico da conversa pessoal é recusado com o mesmo 404", async () => {
+    const err = await listMessagesHandler(bancoHistorico(true), ctx, "conversa-1", {
+      limit: 50,
+    } as never).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toBeInstanceOf(ApiError);
+    expect((err as ApiError).status).toBe(404);
+  });
+
+  it("o corte do histórico está no fonte (duas consultas planas, antes de tudo)", () => {
+    expect(HISTORICO).toMatch(/\.select\("contact_id"\)/);
+    // #4434: o histórico precisa do DONO para deixar o dono ler — sem ele o
+    // corte teria de continuar sendo "pessoal some para todos", e a thread do
+    // dono abriria vazia.
+    expect(HISTORICO).toMatch(/\.select\("is_personal, personal_owner_user_id"\)/);
+  });
+});
