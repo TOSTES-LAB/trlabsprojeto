@@ -35,6 +35,16 @@ vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
 // Isola o handler do gate de suporte (autoridade própria testada em
 // lib/impersonate/support.test.ts) — nenhum teste aqui exercita acompanhamento.
 vi.mock("@/lib/impersonate/support", () => ({ requireSupportWrite: vi.fn(async () => null) }));
+// A rota tem o gate do módulo (`app/api/v1/financeiro/comandas/route.ts:38`):
+// `moduloLigado(admin, "financeiro")` lê `modulos_instalados` por fetch e, sem
+// rede, devolve false → 404 em todos os casos. O teste mede a MOEDA do payload,
+// não a instalação do módulo, então o gate fica ligado aqui. Molde de
+// `credenciais-login-codex-por-empresa.test.ts:64`: espalha o original e só
+// troca `moduloLigado`.
+vi.mock("@/lib/instalacao/modulos", async (orig) => ({
+  ...((await orig()) as Record<string, unknown>),
+  moduloLigado: vi.fn(async () => true),
+}));
 
 const ORG = "22222222-2222-4222-8222-222222222222";
 const ORG_DE_FORA = "99999999-9999-4999-8999-999999999999";
@@ -81,6 +91,7 @@ function montarMundo(opts: MundoOpts = {}) {
   const AGENDAMENTOS = [
     {
       id: APPOINTMENT,
+      organization_id: ORG,
       title: "Corte",
       contact_id: CONTACT,
       event_type_id: "77777777-7777-4777-8777-777777777777",
@@ -88,6 +99,16 @@ function montarMundo(opts: MundoOpts = {}) {
       calendar_event_types: { name: "Corte", default_price_cents: 5000 },
     },
   ];
+
+  // #4845 — a rota do lote passou a conferir também a empresa do CONTATO do
+  // atendimento (a venda não pode nascer na A carregando o cliente da B). Este
+  // dublê respondia `[]` para toda tabela que não fosse `calendar_appointments`
+  // e `organizations`, então o contato do próprio atendimento — declarado
+  // acima com `contact_id: CONTACT` — "não existia em empresa nenhuma" e o
+  // lote era recusado com 422 `financeiro_contato_fora_da_empresa`. O mundo do
+  // teste é que estava incompleto: o contato DESTA empresa precisa estar na
+  // tabela, como estaria no banco de verdade.
+  const CONTATOS = [{ id: CONTACT, organization_id: ORG }];
 
   const from = (tabela: string) => {
     const cadeia: Record<string, unknown> = {};
@@ -120,10 +141,15 @@ function montarMundo(opts: MundoOpts = {}) {
         : { data: null, error: null };
     cadeia.single = async () => ({ data: null, error: null });
     cadeia.then = (resolve: (v: unknown) => unknown, reject: (e: unknown) => unknown) =>
-      Promise.resolve({ data: tabela === "calendar_appointments" ? AGENDAMENTOS : [], error: null }).then(
-        resolve,
-        reject,
-      );
+      Promise.resolve({
+        data:
+          tabela === "calendar_appointments"
+            ? AGENDAMENTOS
+            : tabela === "contacts"
+              ? CONTATOS
+              : [],
+        error: null,
+      }).then(resolve, reject);
     return cadeia;
   };
 

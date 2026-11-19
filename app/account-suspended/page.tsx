@@ -5,14 +5,20 @@ import { signOut } from "@/app/actions/auth/signOut";
 import { LgpdRequestDetail } from "@/app/app/lgpd/requests/[id]/_client";
 import { RequestsTable } from "@/app/app/lgpd/requests/RequestsTable";
 import { OutrasOrganizacoes } from "@/app/onboarding/_components/OutrasOrganizacoes";
+import { AcoesDaAssinatura } from "@/components/cobranca/AcoesDaAssinatura";
+import { PainelDaAssinatura } from "@/components/cobranca/PainelDaAssinatura";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { orgAtivaSemPortao, requireAuth } from "@/lib/auth/server";
 import { ROLE_RANK } from "@/lib/auth/types";
 import { emailDeSuporte } from "@/lib/branding/saida";
+import { lerPainelDoHub, oQueOHubMostra } from "@/lib/cobranca/hub";
+import { CAMINHO_DA_CONTRATACAO, podeContinuarContratacao, primeiroPagamentoPendente } from "@/lib/cobranca/contratacao";
 import { IdiomaProvider } from "@/lib/i18n/IdiomaProvider";
 import { traduzir } from "@/lib/i18n/dicionario";
-import { ehOperante } from "@/lib/organizacao/operante";
+import { moduloLigado } from "@/lib/instalacao/modulos";
+import { logger } from "@/lib/logger";
+import { ehOperante, tipoDaSuspensao } from "@/lib/organizacao/operante";
 import { createAdminClient } from "@/lib/supabase/admin";
 
 export const dynamic = "force-dynamic";
@@ -28,7 +34,7 @@ const PEDIDO = z.uuid();
  *
  * Fica fora de `app/app/` de propósito: quem manda a empresa suspensa para cá é
  * o layout de `/app`, então nada aqui pode depender dele. Não lê `x-pathname`:
- * o `proxy.ts` grava esse cabeçalho DEPOIS do `NextResponse.next`.
+ * a tela não precisa do caminho.
  *
  * Esta tela entregava o NOSSO endereço de suporte ao cliente de um revendedor,
  * e aqui isso é ativamente errado: quem suspendeu a conta foi o revendedor, e
@@ -36,14 +42,13 @@ const PEDIDO = z.uuid();
  * (o do operador) e, quando ninguém configurou, o parágrafo do contato NÃO
  * renderiza.
  *
- * ponytail: nesta entrega ninguém produz a suspensão de kind `cobranca`, e se
- * ela aparecer recebe o mesmo texto administrativo. Por isso a página não lê
- * `suspended_kind`. O painel de pagamento entra com a régua (PR 3a).
+ * Suspensão de kind `cobranca` com a chave ligada: o painel de pagamento
+ * (`lib/cobranca/hub.ts` decide), e quem paga volta sozinho.
  */
 export default async function AccountSuspendedPage({
   searchParams,
 }: {
-  searchParams: Promise<{ pedido?: string }>;
+  searchParams: Promise<{ pedido?: string; voltou?: string; ajuda?: string }>;
 }) {
   const user = await requireAuth();
   const ativa = await orgAtivaSemPortao(user);
@@ -53,14 +58,19 @@ export default async function AccountSuspendedPage({
   // próprio usuário), nunca da URL. Uma leitura responde as duas perguntas:
   // a ativa opera? e quais das outras operam?
   const ids = [...new Set([ativa.orgId, ...user.organizations.map((o) => o.organization_id)])];
-  const { data: orgs, error } = await createAdminClient()
+  const admin = createAdminClient();
+  const { data: orgs, error } = await admin
     .from("organizations")
-    .select("id, status")
+    .select("id, status, suspended_kind")
     .in("id", ids);
   // Leitura que não aconteceu não vira resposta: redirecionar por palpite
   // prenderia a pessoa num laço com o layout de `/app`.
   if (error) throw new Error(`account_suspended_status_indisponivel: ${error.message}`);
   const statusDe = new Map((orgs ?? []).map((o) => [o.id, o.status]));
+  const tipoDaAtiva = tipoDaSuspensao(
+    statusDe.get(ativa.orgId),
+    (orgs ?? []).find((o) => o.id === ativa.orgId)?.suspended_kind ?? null,
+  );
   // Volta para `/app` só quando AS DUAS réguas que o layout de `/app` usa dizem
   // que a org opera: a da sessão (`org_status`, a do `resolveActiveOrg`) e a do
   // banco (a leitura por service role, a do `orgRow.status` do layout). O layout
@@ -69,7 +79,7 @@ export default async function AccountSuspendedPage({
   // Com `?pedido=` (o e-mail de prazo da LGPD chega aqui por
   // `app/lgpd/pedido/[id]/route.ts`), volta ao PEDIDO: é aqui que o link decide
   // no clique se a empresa opera.
-  const { pedido } = await searchParams;
+  const { pedido, voltou, ajuda } = await searchParams;
   const pedidoValido = PEDIDO.safeParse(pedido).success ? pedido : undefined;
   if (ehOperante(ativa.org_status) && ehOperante(statusDe.get(ativa.orgId))) {
     redirect(pedidoValido ? `/app/lgpd/requests/${pedidoValido}` : "/app");
@@ -80,7 +90,31 @@ export default async function AccountSuspendedPage({
   // A MESMA régua da página `/app/lgpd/requests` e das rotas `/api/v1/lgpd/**`.
   const administra =
     (user.is_platform_admin && !user.support) || ROLE_RANK[ativa.role] >= ROLE_RANK.admin;
-  const suporte = administra ? await emailDeSuporte() : "";
+  // Spec da cobrança §9: suspensa POR FALTA DE PAGAMENTO + quem administra →
+  // o painel de pagamento. Leitura do painel que falha NÃO derruba o hub: cai para "contato".
+  const cobrancaLigada = tipoDaAtiva === "cobranca" && (await moduloLigado(admin, "cobranca"));
+  const painel = cobrancaLigada && administra ? await lerPainelDoHub(admin, ativa.orgId) : null;
+  // A apresentação não confunde uma compra nova com dívida vencida. Usuário
+  // comum continua sem ações financeiras; pedido LGPD nunca perde o destino.
+  const inicial = cobrancaLigada
+    ? await admin.from("cobranca_assinaturas")
+      .select("estado, pagamento_inicial_pendente, periodo_pago_desde").eq("organization_id", ativa.orgId).maybeSingle()
+    : null;
+  // Leitura que falha NÃO derruba o hub (Sair, suporte e LGPD moram aqui): segue
+  // como "conta suspensa", que é o que a tela mostrava antes de saber da compra.
+  if (inicial?.error) {
+    logger.warn("account_suspended.primeiro_pagamento_indisponivel", { organizationId: ativa.orgId, code: inicial.error.code });
+  }
+  const primeiroPagamento = inicial?.error ? false : primeiroPagamentoPendente(inicial?.data ?? null);
+  const podeContratar = podeContinuarContratacao(user, ativa.role);
+  if (primeiroPagamento && podeContratar && !pedidoValido && ajuda !== "1") {
+    redirect(`${CAMINHO_DA_CONTRATACAO}${voltou === "1" ? "?voltou=1&retomar=1" : ""}`);
+  }
+  const mostra = oQueOHubMostra({ administra, tipo: tipoDaAtiva, cobrancaLigada, temAssinatura: painel?.assinatura != null });
+  // "Precisa de ajuda?" (da contratação) chega com `?ajuda=1`: quem administra
+  // vê o contato mesmo quando a tela mostra o pagamento.
+  const pedeAjuda = ajuda === "1";
+  const suporte = administra && (mostra === "contato" || pedeAjuda) ? await emailDeSuporte() : "";
   const outras = user.organizations
     .filter((o) => o.organization_id !== ativa.orgId && ehOperante(statusDe.get(o.organization_id)))
     .map((o) => ({ id: o.organization_id, nome: o.organization_name }));
@@ -90,10 +124,16 @@ export default async function AccountSuspendedPage({
     <IdiomaProvider locale={idioma}>
       <main className="flex min-h-screen flex-col items-center gap-8 p-4 sm:p-8">
         <Card className="w-full max-w-md space-y-4 p-8 text-center">
-          <h1 className="text-2xl font-semibold">{t("Conta suspensa")}</h1>
+          <h1 className="text-2xl font-semibold">{t(primeiroPagamento ? "Aguardando primeiro pagamento" : "Conta suspensa")}</h1>
           {/* Quem participa de várias empresas precisa saber QUAL parou. Dado, não interface: sem t(). */}
           <p className="text-base font-medium">{ativa.name}</p>
-          {!administra ? (
+          {primeiroPagamento ? (
+            <p className="text-sm text-muted-foreground">{t("A contratação ainda não foi concluída. Quem administra esta empresa pode continuar para o pagamento.")}</p>
+          ) : mostra === "pagamento" ? (
+            <p className="text-sm text-muted-foreground">
+              {t("A conta foi suspensa por falta de pagamento. O acesso é reavaliado após a confirmação do pagamento.")}
+            </p>
+          ) : !administra ? (
             <p className="text-sm text-muted-foreground">
               {t("Sua conta está suspensa. Avise o administrador da sua empresa.")}
             </p>
@@ -115,6 +155,14 @@ export default async function AccountSuspendedPage({
               )}
             </p>
           )}
+          {pedeAjuda && suporte && (primeiroPagamento || mostra === "pagamento") && (
+            <p className="text-sm text-muted-foreground">
+              {t("Precisa de ajuda?")} {t("Fale com o suporte:")}{" "}
+              <a href={`mailto:${suporte}`} className="underline underline-offset-4 hover:text-foreground transition-colors">
+                {suporte}
+              </a>
+            </p>
+          )}
           <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
             <OutrasOrganizacoes outras={outras} />
             {/* Encerra a sessão, como a irmã /acesso-revogado: um link para /login
@@ -126,6 +174,33 @@ export default async function AccountSuspendedPage({
             </form>
           </div>
         </Card>
+        {primeiroPagamento && podeContratar && (
+          <Button asChild><a href={CAMINHO_DA_CONTRATACAO}>{t("Continuar para pagamento")}</a></Button>
+        )}
+        {!primeiroPagamento && mostra === "pagamento" && painel?.assinatura && (
+          <section aria-label={t("Pagamento")} className="w-full max-w-xl space-y-4">
+            <PainelDaAssinatura dados={painel} idioma={idioma} />
+            <AcoesDaAssinatura
+              estado={painel.assinatura.estado}
+              temProvedor={painel.assinatura.provedor !== null}
+              assinaturasVivas={painel.assinatura.assinaturas_vivas}
+              linkDePagamento={painel.assinatura.link_de_pagamento}
+              cancelaNoFim={painel.assinatura.cancela_no_fim}
+              planosParaTroca={[]}
+              planoAtual={painel.plano ? { id: painel.plano.id, nome: painel.plano.nome, preco_cents: painel.plano.preco_cents, moeda: painel.plano.moeda, intervalo: painel.plano.intervalo, max_assentos: painel.plano.max_assentos, max_canais: painel.plano.max_canais, teto_ia_usd_cents: painel.plano.teto_ia_usd_cents } : null}
+              periodoPagoDesde={painel.assinatura.periodo_pago_desde}
+              proximoVencimento={painel.assinatura.proximo_vencimento}
+              trocaPagamentoUrl={painel.assinatura.troca_pagamento_url}
+              trocaStatus={painel.assinatura.troca_status}
+              instanteCalculo={new Date().toISOString()}
+              provedor={painel.checkout.provedor}
+              documentoDoCadastro={painel.checkout.documentoDoCadastro}
+              fuso={painel.fuso}
+              voltouDoCheckout={voltou === "1"}
+              noHub
+            />
+          </section>
+        )}
         {administra && (
           <section aria-labelledby="lgpd-no-hub" className="w-full max-w-5xl space-y-4">
             <header className="space-y-1">

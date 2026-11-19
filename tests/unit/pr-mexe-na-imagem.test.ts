@@ -104,7 +104,18 @@ describe("pr-mexe-na-imagem", () => {
   const SO_FORA_DA_IMAGEM = new Set([
     // seed das credenciais do E2E: roda no job de e2e, contra o Supabase local.
     "scripts/seed-e2e-credentials.ts",
+    // smoke do Asaas contra o sandbox (fora do CI, com a chave do dono): importa o
+    // dublê de tests/ DE PROPÓSITO — o trabalho dele é medir se as suposições do
+    // dublê (somarCiclo, cobranças geradas de saída) batem com o Asaas de verdade.
+    "scripts/smoke-asaas.ts",
   ]);
+
+  // O backup.sh grava em $PROJECT_DIR/backups por padrão (dump do banco, sessão
+  // do WhatsApp, anexos), ao lado do código que o `COPY . .` leva para a imagem.
+  it("a pasta de backups da instalação fica fora do contexto de build", () => {
+    expect(readFileSync("hostgator-setup-kit/backup.sh", "utf-8")).toContain("$PROJECT_DIR/backups");
+    expect(ignorados).toContain("backups");
+  });
 
   it("nenhum arquivo que entra na imagem importa de pasta que o .dockerignore exclui", () => {
     const pastasFora = new Set(ignorados.filter((e) => !e.includes("*") && !e.includes(".")));

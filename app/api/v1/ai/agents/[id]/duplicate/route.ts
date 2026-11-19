@@ -4,7 +4,9 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
  *
  * Spec 10 §4.3. Cria novo agent kind='mcp_agent' clonando o "current draft"
  * (versão draft mais recente; se não houver, clona a published). A nova versão
- * vira v1 status='draft' do novo agent. Nome recebe sufixo " (cópia)".
+ * vira v1 status='draft' do novo agent. O nome é o primeiro livre na
+ * organização: " (cópia)", " (cópia 2)"… — duplicar o mesmo agente duas vezes
+ * não pode tentar o mesmo nome (o índice é `unique (organization_id, name)`).
  *
  * Não copia: published_version_id, archived_at, runs, audit history.
  */
@@ -16,6 +18,7 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { duplicateAgentWithVersion } from "@/lib/ai/agents/duplicate";
+import { MENSAGEM_PROVEDOR_DESLIGADO } from "@/lib/ai/pontos/provedores-oferecidos";
 import { traduzir } from "@/lib/i18n/dicionario";
 
 export const dynamic = "force-dynamic";
@@ -51,6 +54,9 @@ export async function POST(_req: NextRequest, ctx: Ctx): Promise<Response> {
   if (!result.ok) {
     if (result.error === "not_found") {
       return fail("not_found", t("Agent não encontrado."), 404, { requestId });
+    }
+    if (result.error === "provedor_desligado") {
+      return fail("provedor_desligado", MENSAGEM_PROVEDOR_DESLIGADO, 422, { requestId });
     }
     if (result.error === "no_version_to_duplicate") {
       return fail("state_conflict", t("Agent não tem versão para duplicar."), 409, { requestId });

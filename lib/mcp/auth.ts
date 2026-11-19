@@ -37,9 +37,19 @@ export interface McpAuthResult {
   orgSuspensa?: true;
 }
 
-/** Opção de quem valida o token: aceitar o da empresa suspensa, marcado. */
+/**
+ * Marca do token que só vale no `/api/mcp` — a emitida pelo OAuth do MCP
+ * (migration 9390). A tela de API Tokens não a grava; quem a carrega é a
+ * conexão de um aplicativo, que consentiu em usar o MCP e nada além dele.
+ */
+export const ESCOPO_SO_MCP = "aud:mcp";
+
+/** Opções de quem valida o token. */
 export interface OpcoesDoToken {
+  /** Aceitar o token da empresa suspensa, marcado. */
   permiteOrgSuspensa?: boolean;
+  /** A porta é o `/api/mcp`: aceita o token marcado `aud:mcp`. Só o `/api/mcp` passa isto. */
+  portaDoMcp?: boolean;
 }
 
 export class McpAuthError extends Error {
@@ -62,14 +72,25 @@ function parseScopes(raw: unknown): string[] {
   return raw.filter((s): s is string => typeof s === "string");
 }
 
+/**
+ * O MAIOR papel entre os `role:*` do token. A tela de tokens oferece "gerente"
+ * e "administrador" como caixas independentes, e grava os escopos na ordem dos
+ * CLIQUES (`[...prev, s]` em `ApiTokensClient.tsx`); nem a rota nem o schema
+ * reordenam. Com "o primeiro `role:` vence", quem clicava em gerente antes de
+ * administrador recebia um token que valia `manager` e fechava em 403
+ * `forbidden_role` nas portas que cobram admin (configurar o agente, #2052);
+ * na ordem inversa, o mesmo par valia `admin`. Só uma regra que não depende da
+ * ordem resolve. O padrão `agent` vale só para token SEM papel: com
+ * `role:viewer` sozinho, o token continua `viewer`.
+ */
 function scopesRole(scopes: string[]): Role {
+  let papel: Role | null = null;
   for (const s of scopes) {
-    if (s.startsWith("role:")) {
-      const r = s.slice("role:".length) as Role;
-      if (VALID_ROLES.has(r)) return r;
-    }
+    if (!s.startsWith("role:")) continue;
+    const r = s.slice("role:".length) as Role;
+    if (VALID_ROLES.has(r) && (papel === null || ROLE_RANK[r] > ROLE_RANK[papel])) papel = r;
   }
-  return "agent";
+  return papel ?? "agent";
 }
 
 /**
@@ -102,7 +123,14 @@ export function extractBearer(authHeader: string | null): string | null {
 /** Por que um `dsk_...` não validou — neutro, sem código MCP nem HTTP status. */
 export class ApiTokenError extends Error {
   constructor(
-    public readonly reason: "malformed" | "not_found" | "revoked" | "expired" | "lookup_failed" | "org_suspended",
+    public readonly reason:
+      | "malformed"
+      | "not_found"
+      | "revoked"
+      | "expired"
+      | "lookup_failed"
+      | "org_suspended"
+      | "wrong_audience",
     message: string,
   ) {
     super(message);
@@ -175,10 +203,16 @@ export async function resolveApiToken(
   if (orgSuspensa && !opcoes.permiteOrgSuspensa) {
     throw new ApiTokenError("org_suspended", "Organization suspended.");
   }
+  const scopes = parseScopes(data.scopes);
+  // Token de conexão OAuth fora do `/api/mcp`: recusa antes de registrar uso.
+  if (scopes.includes(ESCOPO_SO_MCP) && !opcoes.portaDoMcp) {
+    throw new ApiTokenError("wrong_audience", "This token only works on the MCP endpoint (/api/mcp).");
+  }
 
   supabase
     .from("api_tokens")
     .update({ last_used_at: new Date().toISOString() })
+    .eq("organization_id", data.organization_id)
     .eq("id", data.id)
     .then(({ error: updErr }) => {
       if (updErr) console.error("[mcp.auth] last_used_at update failed", updErr.message);
@@ -187,7 +221,7 @@ export async function resolveApiToken(
   return {
     id: data.id,
     organizationId: data.organization_id,
-    scopes: parseScopes(data.scopes),
+    scopes,
     createdBy: data.created_by,
     ...(orgSuspensa ? { orgSuspensa: true as const } : {}),
   };
@@ -229,6 +263,10 @@ export async function validateBearerToken(
         // Token VÁLIDO: nem chute nem token morto. Debitar o balde trancaria a
         // integração do cliente por minutos depois da reativação.
         throw new McpAuthError(-32002, 403, err.message, "org_suspended");
+      }
+      if (err.reason === "wrong_audience") {
+        // Também VÁLIDO, só que para outra porta: 403 sem debitar balde.
+        throw new McpAuthError(-32002, 403, err.message);
       }
       if (err.reason !== "lookup_failed") {
         // Chute (malformado/desconhecido) debita o balde por ORIGEM; token real
