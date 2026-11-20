@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 # Diagnóstico rápido: estado dos containers + saúde do app (Supabase/Redis/WAHA).
+#
+# CÓDIGO DE SAÍDA: 0 só quando o app se declara `healthy` no /api/v1/health
+# (e a sonda conseguiu responder). Qualquer outro desfecho — `degraded`,
+# `unhealthy`, app mudo, JSON ilegível — sai 1, depois de imprimir o resto do
+# diagnóstico. Até o #4087 ele saía 0 sempre, então nem cron nem monitor
+# conseguiam usar isto como alarme.
 source "$(dirname "$0")/_common.sh"
 enter_project
+
+# Assume reprovado até a sonda provar o contrário (falha fechada).
+saude_app_ok=1
 
 step "Containers"
 # MEDIDO (#1955): com o resolver do Docker saturado (`dial udp 8.8.4.4:53:
@@ -23,14 +32,21 @@ step "Saúde interna do app (/api/v1/health)"
 # Mesmo prazo do `ps` acima, pelo mesmo motivo (#1955): um `docker exec` com o
 # resolver saturado travava aqui também, e este era o segundo ponto em que o
 # healthcheck ficava sem resposta nenhuma.
-out="$(com_prazo 30 docker compose $(dc_files) exec -T app node -e "
-fetch('http://127.0.0.1:3000/api/v1/health').then(r=>r.text()).then(t=>{console.log(t);process.exit(0)}).catch(e=>{console.error(e.message);process.exit(1)})
-" 2>/dev/null || echo '')"
-if [ -n "$out" ]; then
-  printf '%s\n' "$out"
-  printf '%s' "$out" | grep -q '"status":"ok"' && c_grn "✓ app saudável" || c_ylw "⚠ algum subsistema degradado (veja o JSON acima)."
+#
+# #4087: quem responde "saudável ou não" é o status GERAL da rota, e a decisão
+# mora num lugar só (relatar_saude_do_app, _common.sh) — a mesma sonda que o
+# install.sh e o update.sh usam. Aqui havia um grep pelo status `ok` no JSON
+# cru: `ok` é o vocabulário dos CHECKS (ok|degraded|down), não o do status
+# geral (healthy|degraded|unhealthy), então `checks.redis.status` casava e a
+# linha verde saía com o BANCO FORA.
+saida="$(app_health_probe 30)"
+if [ -n "$saida" ]; then
+  case "$saida" in
+    *$'\n'*) printf '%s\n' "${saida#*$'\n'}" ;;   # o corpo, para o dono ver
+  esac
+  relatar_saude_do_app "$saida" && saude_app_ok=0
 else
-  c_ylw "⚠ app não respondeu. Logs: docker compose $(dc_files) logs --tail=50 app"
+  c_ylw "⚠ app não respondeu ao /api/v1/health. Logs: docker compose $(dc_files) logs --tail=50 app"
 fi
 
 step "Atualização pela tela (agente do host)"
@@ -48,7 +64,15 @@ if crontab -l 2>/dev/null | grep -q 'hostgator-setup-kit/agent.sh'; then
   # agente que está falhando agora. `find -mmin` é portátil.
   if [ -s "$log" ] && [ -n "$(find "$log" -mmin -120 2>/dev/null)" ]; then
     c_ylw "⚠ o agente falhou recentemente ao falar com o app:"
-    c_ylw "  $(tail -2 "$log" | head -1)"
+    # A última ENTRADA, não a penúltima linha: uma falha de POST ocupa várias
+    # linhas (`<data> [agent] POST <url> -> <corpo>`, o código HTTP numa linha
+    # própria, e uma linha vazia no meio quando o corpo termina em \n) — o
+    # `tail -2 | head -1` de antes caía na vazia. Junta as linhas não vazias
+    # desde o último cabeçalho `[agent]`. O log não leva o Bearer (agent.sh, post()).
+    # Cortada em 300 caracteres: o corpo pode ser uma página de erro HTML de KBs
+    # (proxy na frente do app). O `sub` tira o espaço da frente quando o
+    # `tail -n 200` do log_err já levou o cabeçalho embora.
+    c_ylw "  $(awk '/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[^ ]* \[agent\] /{e=$0; next} NF{e=e" "$0} END{sub(/^ +/, "", e); if (length(e) > 300) e = substr(e, 1, 300) "..."; print e}' "$log")"
     c_ylw "  Se o botão de atualizar não aparece na tela, é por isto."
     c_ylw "  Quase sempre resolve rodando: bash hostgator-setup-kit/update.sh"
   else
@@ -122,12 +146,30 @@ fetch('http://127.0.0.1:3000/email-templates/confirmation').then(r=>r.text()).th
       c_ylw "⚠ nenhum GoTrue desta máquina aponta para o molde do app."
       c_ylw "  Os e-mails de acesso vão sair no modelo padrão, e o link dele NÃO fecha"
       c_ylw "  a sessão quando o clique vem do webmail."
-      c_ylw "  Acrescente ao serviço 'auth' do SEU Supabase (não a este compose):"
-      c_ylw "    GOTRUE_MAILER_TEMPLATES_CONFIRMATION=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/confirmation"
-      c_ylw "    GOTRUE_MAILER_TEMPLATES_RECOVERY=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/recovery"
-      c_dim "  (se o seu Supabase roda em outra máquina, confira lá — daqui não dá para ver)"
+      if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+        # O Supabase é do kit: quem grava é o update.sh, pela rede privada (#2587).
+        c_ylw "  Rode: bash hostgator-setup-kit/update.sh  (ele grava os moldes no auth deste Supabase:"
+        c_ylw "    GOTRUE_MAILER_TEMPLATES_CONFIRMATION=${BASE_INTERNA_DO_APP:-http://app:3000}/email-templates/confirmation"
+        c_ylw "    GOTRUE_MAILER_TEMPLATES_RECOVERY=${BASE_INTERNA_DO_APP:-http://app:3000}/email-templates/recovery )"
+      else
+        c_ylw "  Acrescente ao serviço 'auth' do SEU Supabase (não a este compose):"
+        c_ylw "    GOTRUE_MAILER_TEMPLATES_CONFIRMATION=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/confirmation"
+        c_ylw "    GOTRUE_MAILER_TEMPLATES_RECOVERY=${NEXT_PUBLIC_APP_URL:-https://SEU_DOMINIO}/email-templates/recovery"
+        c_dim "  (se o seu Supabase roda em outra máquina, confira lá — daqui não dá para ver)"
+      fi
     else
+      # #2587 — no single-server, o padrão ANTIGO do kit (o domínio público) faz
+      # o auth buscar o molde pelo IP da própria VPS; atrás de um Traefik externo
+      # isso dá timeout. O update.sh migra esse valor para a rede privada.
+      if [ "${SINGLE_SERVER:-0}" = "1" ] && [ -n "${NEXT_PUBLIC_APP_URL:-}" ] \
+         && [ "$apontado" = "${NEXT_PUBLIC_APP_URL%/}/email-templates/confirmation" ]; then
+        c_ylw "⚠ o GoTrue ($dono) busca o molde pelo domínio público, não pela rede privada."
+        c_ylw "  Atrás de um proxy externo essa busca pode dar timeout. Rode: bash hostgator-setup-kit/update.sh"
+        c_dim "  $apontado"
+        apontado=""  # já avisado: não cair no ✓ abaixo, que diria o contrário
+      fi
       case "$apontado" in
+        "") ;;
         http*/email-templates/*)
           c_grn "✓ o GoTrue ($dono) busca o molde do app"
           c_dim "  $apontado" ;;
@@ -172,3 +214,10 @@ else
   done <<< "$tls_dito"
   c_dim "  (a verificação de certificado continua ligada — nada foi desligado para este teste.)"
 fi
+
+# Veredito. Só aqui, no fim, para o dono ver o diagnóstico INTEIRO mesmo quando o
+# app está fora — e para o cron/monitor ter um sinal de máquina. `degraded` sai 1
+# junto com `unhealthy`: na instalação o `degraded` passa (wait_app_healthy, ele
+# quer dizer "opcional ainda não configurado"), mas um diagnóstico chamado à mão
+# não pode chamar de saudável um app com subsistema fora.
+exit "$saude_app_ok"

@@ -41,6 +41,42 @@ owner: Rafael Melgaço
 
 ## 2. Transport & Auth
 
+### Execução no turno interno
+
+`lib/ai/runtime/tools.ts` monta a ponte em processo usada pelo atendimento e pelo
+Operador. Dentro de cada montagem, escritas que recebem `lead_id` e
+`crm_manage_tags` com `target_kind='lead'` aguardam a conclusão do handler
+anterior para o mesmo par organização/negócio, incluindo suas atividades e
+eventos. A chave usa o negócio efetivo após a tradução do contato do turno.
+Leituras e negócios diferentes continuam em paralelo. Papel, escopo, auditoria
+e o filtro otimista de `moveLeadHandler` continuam nativos.
+Ao começar um handler de escrita, a ponte revalida a fronteira de atendimento
+com `guardServiceEffect`, depois de qualquer espera na fila. A autoridade que
+valia quando a chamada chegou não é reutilizada como permissão para executá-la.
+
+A fila é local ao turno: não ordena requisições HTTP/MCP externas, turnos
+distintos, ações humanas nem ferramentas que resolvem o negócio indiretamente
+pela agenda. Não substitui proteção no banco e não repete conflitos. Um handler
+que assenta com falha libera a próxima chamada, conservando a recusa e sua
+auditoria para o modelo.
+Uma chamada da fila tem teto de retorno igual à janela padrão do token MCP
+(`EPHEMERAL_TOKEN_TTL_SEC`, atualmente 300 segundos), contado da entrada na
+fila, incluindo a espera. Não é o prazo restante da credencial. Ao excedê-lo,
+o modelo recebe `lead_write_outcome_unknown` e `resultado_incerto`, com
+orientação para não confirmar nem repetir a escrita e pedir conferência humana.
+A recusa continua em `mcp.tool_called` e no log estruturado da ponte.
+
+Esse teto **não cancela** o handler nem libera o próximo: a chave fica recusada
+na montagem vencida. Um registro compartilhado em processo impede novas
+montagens/turnos de iniciar escrita nesse par organização/negócio até todos os
+handlers vencidos assentarem realmente; a liquidação retira esse impedimento
+automaticamente. Outros negócios, organizações e leituras continuam livres.
+Um efeito já iniciado pode completar tarde. O registro não coordena processos
+distintos ou escritas fora da ponte; um handler que nunca assenta conserva o
+impedimento até a recuperação/reinício do processo. Não há retry automático.
+Regressão: `tests/unit/escritas-do-negocio-no-turno.test.ts` reproduz a colisão
+com handlers nativos e adaptador em memória, sem banco ou modelo externo.
+
 ### 2.1 Endpoint
 
 ```
@@ -60,6 +96,35 @@ Authorization: Bearer dsk_xxxxxxxxxxxxxxxxxxxx
 - Token resolve `organization_id` + `role` + `actor_type` (`user` ou `system`).
 - Para agentes (Spec 10), o runner mints um token efêmero (TTL 5min) escopado: `actor_type='ai_agent'`, `agent_run_id=run.id`. Não aparece na UI; é interno.
 - Token escopo: tools podem checar `tok.role >= manager` para mutations sensíveis (mesmas regras do REST).
+
+#### 2.2.1 OAuth 2.1 para clientes que não aceitam cabeçalho (migration 9390)
+
+O ChatGPT (e outros clientes de MCP) só oferece OAuth ou "sem autenticação" — não há onde colar o
+`dsk_`. O CRM é o servidor de autorização do próprio recurso, conforme a especificação de
+autorização do MCP:
+
+| Passo | Endereço | Norma |
+|---|---|---|
+| 401 do `/api/mcp` leva `WWW-Authenticate: Bearer resource_metadata="…"` | `app/api/mcp/route.ts` | RFC 9728 §5.1 |
+| Metadados do recurso | `GET /.well-known/oauth-protected-resource` (e `…/api/mcp`) | RFC 9728 |
+| Metadados do servidor | `GET /.well-known/oauth-authorization-server` | RFC 8414 |
+| Registro dinâmico | `POST /api/mcp/oauth/register` | RFC 7591 |
+| Autorização (ponte → `/oauth/mcp/consentir`) | `GET /api/mcp/oauth/authorize` | OAuth 2.1 + PKCE S256 + `resource` (RFC 8707) |
+| Token e renovação (rotação) | `POST /api/mcp/oauth/token` | OAuth 2.1 §4.1.3 / §4.3 |
+| Revogação | `POST /api/mcp/oauth/revoke` | RFC 7009 |
+
+- **O access token é um `dsk_` de `api_tokens`.** O `/api/mcp` valida pelo caminho de sempre: mesmo
+  ator (`api_token`), escopos `mcp:read` / `mcp:write` + `role:admin`, mesma auditoria e isolamento.
+  A marca `aud:mcp` prende o token ao `/api/mcp`: no `/api/v1` ele recebe 403 (`resolveApiToken`).
+  Uma conexão = uma linha de `api_tokens` (nome `<cliente> (OAuth)`); a renovação troca o hash na
+  mesma linha. Revogar na tela API Tokens desliga a conexão na renovação seguinte.
+- Só **admin** da organização escolhida autoriza (a régua de quem emite token na tela). A renovação
+  (a cada hora) re-confere que a pessoa segue admin; se não, revoga.
+- Prazos: código 5 min, access 1 h, refresh 60 dias (renovado a cada uso; cada refresh vale uma vez, e
+  reapresentar um já rotacionado desliga a conexão — a pessoa reconecta). Origem anunciada =
+  `NEXT_PUBLIC_APP_URL`, nunca o `Host`.
+- Mapa: `docs/architecture/mcp-oauth-servidor.architecture.json`. Prova de banco:
+  `tests/invariants/mcp-oauth-servidor.test.ts`.
 
 ### 2.3 Erros
 
@@ -166,6 +231,25 @@ inputSchema: z.object({
 })
 ```
 
+#### `crm_count_leads`
+**Maps to**: `countLeadsHandler` (`app/api/v1/leads/_handler.ts`) — sem rota REST própria.
+
+Conta negócios **sem listá-los**. Existe porque `crm_list_leads` só pagina por cursor e não informa o total: quem precisa de "quantos?" acabava paginando a lista inteira e levando todos os negócios ao modelo. Devolve só números — nenhum nome, contato ou id.
+
+```ts
+inputSchema: z.object({
+  pipeline_id: z.string().uuid().optional(),
+  stage_id: z.string().uuid().optional(),
+  status: z.enum(['open', 'won', 'lost']).optional()
+})
+outputSchema: z.object({
+  total: z.number().int(),
+  by_status: z.object({ open: z.number(), won: z.number(), lost: z.number() }).optional() // só sem filtro de status
+})
+```
+
+Mesma régua de visibilidade da listagem: `organization_id` na primeira cláusula (client service-role), negócio de contato pessoal não conta e, em conversa de atendimento, conta apenas os negócios do contato do turno. Contagem feita no banco (`head: true`, `count: 'exact'`).
+
 #### `crm_get_lead`
 **Maps to**: `GET /api/v1/leads/:id`
 
@@ -173,14 +257,24 @@ inputSchema: z.object({
 **Maps to**: `GET /api/v1/pipelines`
 
 ```ts
-inputSchema: z.object({})  // sem args
+inputSchema: z.object({ include_archived: z.boolean().optional() })
 outputSchema: z.object({
   pipelines: z.array(z.object({
-    id, name, vocabulary: z.record(z.string()),
-    stages: z.array(z.object({ id, name, position }))
+    id, name, slug, description, is_default, is_archived, position,
+    vocabulary: z.record(z.string()),
+    // #4667: as DEFINIÇÕES dos campos personalizados, nunca valor de negócio.
+    campos: z.array(z.object({
+      key, label, type, escopo,
+      options: z.array(z.object({ value, label })).optional(),
+    })),
   }))
 })
 ```
+
+As etapas não vêm aqui: saem de `crm_list_stages`. A forma que vale é a do `map` em
+`lib/mcp/tools/pipelines.ts`; em dúvida, leia lá. Desde a #4667, `crm_update_lead` e
+`crm_create_lead` chamados pelo agente de IA recusam, em `custom_fields`, a chave que o funil
+não declara (`lib/mcp/conferencia-de-campos.ts`).
 
 ### 3.2 Write tools (mutations, role >= manager)
 
@@ -281,7 +375,7 @@ A versão do agente armazena `tool_ids text[]` (Spec 10 §3.2). Validação no p
 const VALID_TOOL_IDS = [
   'crm_search_contacts', 'crm_get_contact',
   'crm_list_conversations', 'crm_get_conversation', 'crm_get_conversation_history',
-  'crm_list_leads', 'crm_get_lead', 'crm_list_pipelines',
+  'crm_list_leads', 'crm_count_leads', 'crm_get_lead', 'crm_list_pipelines',
   'crm_send_whatsapp_message', 'crm_create_lead', 'crm_update_lead', 'crm_move_lead_stage',
   'crm_request_human_handoff'
 ]
