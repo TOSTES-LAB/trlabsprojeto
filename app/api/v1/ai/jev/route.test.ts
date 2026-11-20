@@ -15,6 +15,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
 import { haQuemAtendaAOrganizacao } from "@/lib/ai/agents/quem-atende-a-sessao";
+import { MODELO_NA_OPENROUTER } from "@/lib/ai/decisao/origem";
 import { TAREFA_DO_FOLLOWUP } from "@/lib/ai/decisao/tarefas";
 import { resolverModeloDoPonto } from "@/lib/ai/gateway-binding";
 import { DEFAULT_SENTIMENT_THRESHOLD } from "@/lib/ai/prompts/sentiment";
@@ -28,6 +29,7 @@ import { createClient } from "@/lib/supabase/server";
 import { GET, PATCH } from "./route";
 
 import type * as Credenciais from "@/lib/agent-engine/edge/llm/credentials";
+import type * as Catalogo from "@/lib/ai/decisao/catalogo";
 
 vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
 vi.mock("@/lib/impersonate/support", () => ({ requireSupportWrite: vi.fn(async () => null) }));
@@ -44,6 +46,26 @@ vi.mock("@/lib/agent-engine/edge/llm/credentials", async (original) => ({
   ...(await original<typeof Credenciais>()),
   temIaDeSempre,
 }));
+// O catálogo de modelos de decisão é rede: a conferência é a de verdade, com a
+// lista servida por um dublê (dois modelos que declaram `decisions`).
+vi.mock("@/lib/ai/decisao/catalogo", async (original) => {
+  const real = await original<typeof Catalogo>();
+  const fetchImpl = (async () =>
+    new Response(
+      JSON.stringify({
+        data: [
+          { id: "perplexity/decisor:free", output_modalities: ["decisions"] },
+          { id: "liquid/decisor-2", output_modalities: ["decisions"] },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as typeof fetch;
+  return {
+    ...real,
+    conferirModeloDaConfig: (pedido: Catalogo.PedidoDeConferencia) =>
+      real.conferirModeloDaConfig({ ...pedido, deps: { fetchImpl, baseUrl: "https://openrouter.ai/api" } }),
+  };
+});
 
 const ORG = "22222222-2222-4222-8222-222222222222";
 const OUTRA_ORG = "99999999-9999-4999-8999-999999999999";
@@ -235,6 +257,9 @@ beforeEach(() => {
     model: {} as never,
     modelId: "anthropic/claude-haiku-4-5",
     origem: "padrao",
+    // O provedor EFETIVO do endereço — o resolvedor o devolve desde a #3098, e
+    // é ele que o chamador entrega ao log de invocação.
+    provider: "anthropic",
   });
   vi.mocked(haQuemAtendaAOrganizacao).mockResolvedValue(true);
 });
@@ -276,6 +301,7 @@ describe("GET /api/v1/ai/jev", () => {
       "jailbreak_detect",
       "intent_router",
       "followup_classify",
+      "afirmacao_de_fato",
     ]);
     expect(d.tem_ia_de_sempre).toBe(true);
     expect(d.numeros).toEqual({
@@ -713,6 +739,146 @@ describe("PATCH /api/v1/ai/jev", () => {
   });
 });
 
+describe("PATCH — trocar a origem para a OpenRouter com aceite já gravado (#2964)", () => {
+  // O aceite gravado foi dado a um texto que nomeava só a TypeSafe AI. Via
+  // OpenRouter a mensagem passa por mais um operador nos EUA: sem aceite novo,
+  // ela sairia por um caminho que ninguém aceitou.
+  beforeEach(() => {
+    estado.credenciais = [credencial({ provider: "openrouter", label: "Conversa" })];
+    estado.settings = { jev: { ligado: true, modo: "observacao", aceite: ACEITE_ANTIGO } };
+  });
+
+  it("sem aceite_lgpd, a troca é recusada com jev_exige_aceite e nada é escrito", async () => {
+    const { status, corpo } = await mudar({ origem: "openrouter" });
+    expect(status).toBe(422);
+    expect(corpo.error.code).toBe("jev_exige_aceite");
+    expect(corpo.error.message).toMatch(/pela OpenRouter/);
+    expect(escritas()).toEqual([]);
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it("com aceite_lgpd, troca e regrava o aceite com quem e quando", async () => {
+    const { status, corpo } = await mudar({ origem: "openrouter", aceite_lgpd: true });
+    expect(status).toBe(200);
+    const jev = estado.settings.jev as Linha;
+    expect(jev.origem).toBe("openrouter");
+    expect(corpo.data.config.aceite.por).toBe(USUARIO);
+    expect(corpo.data.config.aceite.em).not.toBe(ACEITE_ANTIGO.em);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "ai.jev.origem_alterada",
+        metadata: expect.objectContaining({ aceite_registrado: true }),
+      }),
+    );
+  });
+});
+
+describe("PATCH — trocar o MODELO do decisor pede aceite novo (doc 369)", () => {
+  // Trocar o modelo troca QUEM recebe a mensagem do cliente. Cada troca para um
+  // modelo que não é o Jev pede o "concordo" de novo, nomeando o fornecedor;
+  // voltar ao Jev não pede.
+  const FORA = "perplexity/decisor:free";
+  beforeEach(() => {
+    estado.credenciais = [credencial({ provider: "openrouter", label: "Conversa" })];
+    estado.settings = { jev: { ligado: true, modo: "observacao", origem: "openrouter", aceite: ACEITE_ANTIGO } };
+  });
+
+  it("sem aceite_lgpd, a troca é recusada nomeando o fornecedor, e nada é escrito", async () => {
+    const { status, corpo } = await mudar({ modelo: FORA });
+    expect(status).toBe(422);
+    expect(corpo.error.code).toBe("jev_exige_aceite");
+    expect(corpo.error.message).toContain("para perplexity (modelo perplexity/decisor:free), pela OpenRouter");
+    expect(corpo.error.message).toContain("a empresa assume essa conferência");
+    // A recaída de `decidirNoPonto` está no texto: o aceite cobre os dois destinos.
+    expect(corpo.error.message).toContain(
+      "se esse modelo falhar, a mensagem vai para o Jev, da TypeSafe AI, pela OpenRouter",
+    );
+    expect(escritas()).toEqual([]);
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it("com aceite_lgpd, grava o modelo e regrava o aceite com quem e quando", async () => {
+    const { status } = await mudar({ modelo: FORA, aceite_lgpd: true });
+    expect(status).toBe(200);
+    const jev = estado.settings.jev as Linha;
+    expect(jev.modelo).toBe(FORA);
+    expect((jev.aceite as Linha).por).toBe(USUARIO);
+    expect((jev.aceite as Linha).em).not.toBe(ACEITE_ANTIGO.em);
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "ai.jev.modelo_alterado",
+        metadata: expect.objectContaining({ modelo: FORA, aceite_registrado: true }),
+      }),
+    );
+  });
+
+  it("de um modelo de fora para OUTRO, o aceite é pedido de novo", async () => {
+    estado.settings = { jev: { ...(estado.settings.jev as Linha), modelo: FORA } };
+    const { status, corpo } = await mudar({ modelo: "liquid/decisor-2" });
+    expect(status).toBe(422);
+    expect(corpo.error.code).toBe("jev_exige_aceite");
+    expect(corpo.error.message).toContain("para liquid (modelo liquid/decisor-2)");
+    expect(escritas()).toEqual([]);
+  });
+
+  it("voltar ao Jev não pede aceite, apaga o modelo e não mexe no aceite", async () => {
+    estado.settings = { jev: { ...(estado.settings.jev as Linha), modelo: FORA } };
+    const { status } = await mudar({ modelo: null });
+    expect(status).toBe(200);
+    const jev = estado.settings.jev as Linha;
+    expect("modelo" in jev).toBe(false);
+    expect(jev.aceite).toEqual(ACEITE_ANTIGO);
+  });
+
+  it("o nome do Jev no formato da TypeSafe é gravado como o padrão, sem pedir aceite", async () => {
+    estado.settings = { jev: { ...(estado.settings.jev as Linha), modelo: FORA } };
+    const { status } = await mudar({ modelo: "jev-1.13.0" });
+    expect(status).toBe(200);
+    expect("modelo" in (estado.settings.jev as Linha)).toBe(false);
+  });
+
+  it("voltar a origem para a TypeSafe apaga o modelo escolhido", async () => {
+    estado.credenciais.push(credencial());
+    estado.settings = { jev: { ...(estado.settings.jev as Linha), modelo: FORA } };
+    const { status } = await mudar({ origem: "typesafe" });
+    expect(status).toBe(200);
+    const jev = estado.settings.jev as Linha;
+    expect(jev.origem).toBe("typesafe");
+    expect("modelo" in jev).toBe(false);
+  });
+
+  it("openrouter → typesafe → openrouter não reaproveita o modelo de fora sob o aceite que só nomeia a TypeSafe", async () => {
+    estado.credenciais.push(credencial());
+    estado.settings = { jev: { ...(estado.settings.jev as Linha), modelo: FORA } };
+    expect((await mudar({ origem: "typesafe" })).status).toBe(200);
+    // A volta à OpenRouter pede o aceite da origem, cujo texto nomeia só a
+    // TypeSafe AI — ele não pode trazer o modelo de fora de volta.
+    const volta = await mudar({ origem: "openrouter", aceite_lgpd: true });
+    expect(volta.status).toBe(200);
+    const jev = estado.settings.jev as Linha;
+    expect(jev.origem).toBe("openrouter");
+    expect("modelo" in jev).toBe(false);
+    expect((await ler()).corpo.data.modelo).toBe(MODELO_NA_OPENROUTER);
+  });
+
+  it("sem aceite gravado (Jev nunca ligado), a troca com aceite grava um de cada mensagem", async () => {
+    estado.settings = { jev: { ligado: false, modo: "observacao", origem: "openrouter", aceite: null } };
+    // O aceite que nasce aqui, sem um da TypeSafe antes, foi dado a um texto
+    // que nomeia os DOIS destinos: o fornecedor e a recaída no Jev.
+    const recusa = await mudar({ modelo: FORA });
+    expect(recusa.status).toBe(422);
+    expect(recusa.corpo.error.message).toContain("para perplexity (modelo perplexity/decisor:free), pela OpenRouter");
+    expect(recusa.corpo.error.message).toContain(
+      "se esse modelo falhar, a mensagem vai para o Jev, da TypeSafe AI, pela OpenRouter",
+    );
+    const { status } = await mudar({ modelo: FORA, aceite_lgpd: true });
+    expect(status).toBe(200);
+    expect((estado.settings.jev as Linha).aceite).toEqual(
+      expect.objectContaining({ por: USUARIO, alcance: "mensagem" }),
+    );
+  });
+});
+
 describe("o Jev por tarefa na rota", () => {
   it("GET: cada tarefa com o estado que vale agora — o clima, pelo `modo`, sem nada gravado", async () => {
     expect((await ler()).corpo.data.por_tarefa).toEqual([
@@ -725,6 +891,10 @@ describe("o Jev por tarefa na rota", () => {
       expect.objectContaining({ id: "followup", ponto: "followup_classify", estado: "desligada", novo: false }),
       // A conferência de campo (#2234) tem alcance "conversa": nasce desligada até o aceite dela.
       expect.objectContaining({ id: "campo_do_negocio", ponto: null, estado: "desligada", novo: false }),
+      // O sinal de urgência da mensagem represada (#2232): também em cascata, também sem ponto.
+      expect.objectContaining({ id: "sinal_de_urgencia", ponto: null, estado: "desligada", novo: false }),
+      // A conferência de fato (#2231) cabe no aceite de cada mensagem, mas com o Jev desligado nada roda.
+      expect.objectContaining({ id: "afirmacao_de_fato", ponto: "afirmacao_de_fato", estado: "desligada", novo: false }),
     ]);
 
     estado.settings = { jev: { ligado: true, modo: "decide", aceite: ACEITE_ANTIGO } };
@@ -748,6 +918,7 @@ describe("o Jev por tarefa na rota", () => {
       expect.objectContaining({ id: "jailbreak_detect", rotulo: "Perceber tentativa de manipulação" }),
       expect.objectContaining({ id: "intent_router", rotulo: "Escolher qual agente atende" }),
       expect.objectContaining({ id: "followup_classify", rotulo: "Ler a resposta ao follow-up" }),
+      expect.objectContaining({ id: "afirmacao_de_fato", rotulo: "Conferir afirmações de fato na resposta" }),
     ]);
   });
 
@@ -824,6 +995,8 @@ describe("o Jev por tarefa na rota", () => {
       ["opt_out", false],
       ["followup", false],
       ["campo_do_negocio", false],
+      ["sinal_de_urgencia", false],
+      ["afirmacao_de_fato", false],
     ]);
     estado.camadas = [
       { organization_id: ORG, layer: "jailbreak", enabled: false },
@@ -837,6 +1010,8 @@ describe("o Jev por tarefa na rota", () => {
       ["opt_out", false],
       ["followup", false],
       ["campo_do_negocio", false],
+      ["sinal_de_urgencia", false],
+      ["afirmacao_de_fato", false],
     ]);
   });
 
@@ -852,6 +1027,8 @@ describe("o Jev por tarefa na rota", () => {
       ["opt_out", false],
       ["followup", false],
       ["campo_do_negocio", false],
+      ["sinal_de_urgencia", false],
+      ["afirmacao_de_fato", false],
     ]);
     // O ativo de OUTRA empresa não conta — o filtro é o da sessão.
     const intencoes = (n: number) => [{ count: n }];
@@ -864,6 +1041,8 @@ describe("o Jev por tarefa na rota", () => {
       ["opt_out", false],
       ["followup", false],
       ["campo_do_negocio", false],
+      ["sinal_de_urgencia", false],
+      ["afirmacao_de_fato", false],
     ]);
     // Ativo, mas sem intenção nenhuma (o estado logo depois de criar um) ou com
     // mais do que cabe numa pergunta: o Jev nunca é perguntado, e "Só observa"
@@ -881,6 +1060,8 @@ describe("o Jev por tarefa na rota", () => {
       ["opt_out", false],
       ["followup", false],
       ["campo_do_negocio", false],
+      ["sinal_de_urgencia", false],
+      ["afirmacao_de_fato", false],
     ]);
     // E o cartão segue dizendo que a tarefa observa: é o que ela faz quando há roteador.
     const roteador = (await ler()).corpo.data.por_tarefa.find((t: { id: string }) => t.id === "roteador");
@@ -1024,7 +1205,7 @@ describe("o Jev por tarefa na rota", () => {
     // As outras tarefas não têm pedidos percebidos.
     expect(d.por_tarefa.find((t: { id: string }) => t.id === "manipulacao").percebidos).toBeNull();
     const lidas = estado.consultas.filter((c) => c.tabela === "jev_observacoes" && !c.head);
-    expect(lidas.length, "a leitura dos pedidos percebidos (controle positivo)").toBe(2);
+    expect(lidas.length, "a leitura dos pedidos percebidos (controle positivo)").toBe(3);
     expect(
       lidas.every(
         (c) =>
@@ -1053,7 +1234,17 @@ describe("o Jev por tarefa na rota", () => {
     vi.mocked(haQuemAtendaAOrganizacao).mockResolvedValue(haQuem);
     const d = (await ler()).corpo.data;
     const motivos = Object.fromEntries(d.por_tarefa.map((t: { id: string; sem_atendente: unknown }) => [t.id, t.sem_atendente]));
-    expect(motivos).toEqual({ clima: null, manipulacao: null, roteador: null, humano: motivo, opt_out: motivo, followup: null, campo_do_negocio: null });
+    expect(motivos).toEqual({
+      clima: null,
+      manipulacao: null,
+      roteador: null,
+      humano: motivo,
+      opt_out: motivo,
+      followup: null,
+      campo_do_negocio: null,
+      sinal_de_urgencia: motivo,
+      afirmacao_de_fato: null,
+    });
     // A organização é a da sessão, e a pergunta é a do portão do worker.
     expect(vi.mocked(haQuemAtendaAOrganizacao).mock.calls.map(([, org]) => org)).toEqual([ORG]);
   });
