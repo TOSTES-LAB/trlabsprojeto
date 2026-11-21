@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { ExtensionError, type ExtensionErrorCode } from "./errors";
 import {
   checkCompatibility,
+  temConfiguracaoDeCard,
   parseManifest,
   type CatalogEntry,
   type ExtensionConfiguration,
@@ -97,6 +98,7 @@ export function montarInstalada({
     version: string;
     revision: number;
     removed_at: string | null;
+    disabled_at?: string | null;
   };
   artifact: ArtefatoGravado | undefined;
   catalog: { origin: string } | undefined;
@@ -106,6 +108,7 @@ export function montarInstalada({
         revision: number;
         configuration: ExtensionConfiguration;
         deactivated_by_removal_at: string | null;
+        consented_areas?: string[];
       }
     | undefined;
   previous?: PreviousVersionView | null;
@@ -129,6 +132,8 @@ export function montarInstalada({
     active_organizations: activeOrganizations,
     removed_at: item.removed_at,
     deactivated_by_removal_at: binding?.deactivated_by_removal_at ?? null,
+    disabled_at: item.disabled_at ?? null,
+    consented_areas: binding?.consented_areas ?? [],
   };
   if (!leitura?.ok) {
     const identidade = `${item.publisher}/${item.name}`;
@@ -141,6 +146,12 @@ export function montarInstalada({
         icon: "BookOpen",
       },
       configuration: binding?.configuration ?? { density: "comfortable", show_description: true },
+      // Pacote que esta versão não lê não OFERECE tema: o campo não pode nascer de um
+      // manifesto que o host recusou (a mesma razão pela qual a paleta gravada continua
+      // preservada no vínculo — a tela só não a edita por aqui).
+      theme_palette: null,
+      // Sem manifesto legível não há perfil, e a tela não oferece o interruptor.
+      profile: null,
       compatible: false,
       compatibility_reason: MOTIVO_PACOTE_ILEGIVEL,
     };
@@ -150,7 +161,21 @@ export function montarInstalada({
     ...comum,
     display: leitura.manifest.display,
     permissions: leitura.manifest.permissions,
-    configuration: binding?.configuration ?? leitura.manifest.configuration,
+    // Um pacote de DADOS não tem card para configurar, então o manifesto dele traz `configuration`
+    // vazia (ADR-0005). A view, que alimenta a tela de extensões, sempre entrega uma configuração
+    // utilizável — a mesma padrão que a linha 143 já usa para o pacote ilegível. Sem isto, a tela
+    // receberia `{}` e leria `density`/`show_description` como `undefined`.
+    configuration:
+      binding?.configuration ??
+      (temConfiguracaoDeCard(leitura.manifest.configuration)
+        ? leitura.manifest.configuration
+        : { density: "comfortable", show_description: true }),
+    // O QUE O MANIFESTO DECLARA, e nada mais: a tela alimenta o campo de paleta com
+    // esta chave em vez de uma lista fixa de paletas, e a extensão que não declara
+    // `contributions.theme` fica sem campo. O manifesto já passou pelo contrato desta
+    // versão em `lerManifestoAdmitido`, então o valor é uma paleta conhecida.
+    theme_palette: leitura.manifest.contributions.theme?.palette ?? null,
+    profile: leitura.manifest.profile,
     compatible: compatibility.compatible,
     compatibility_reason: compatibility.compatible ? null : MOTIVO_API_INCOMPATIVEL,
   };

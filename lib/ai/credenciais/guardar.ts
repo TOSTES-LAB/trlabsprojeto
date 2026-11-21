@@ -21,7 +21,7 @@
 import { audit } from "@/lib/audit";
 import { bufToBytea, encryptKey } from "@/lib/crypto/aes_gcm";
 import { PROVEDOR_POR_ASSINATURA, type ProvedorComChave } from "@/lib/ai/pontos/provedores";
-import { validateProviderKey } from "@/lib/ai/provider-validators";
+import { validateProviderKey, type ServiceProvider } from "@/lib/ai/provider-validators";
 import type { createAdminClient } from "@/lib/supabase/admin";
 
 export type ResultadoDeGuardar =
@@ -32,9 +32,17 @@ export type ResultadoDeGuardar =
        * `label_em_uso` é o único que o chamador precisa distinguir: é escolha do
        * usuário e tem conserto óbvio (mudar o nome). O resto é falha nossa.
        */
-      motivo: "cifragem" | "label_em_uso" | "banco";
+      motivo: "cifragem" | "label_em_uso" | "banco" | "assinatura_so_pelo_login";
       detalhe?: string;
     };
+
+/**
+ * A recusa de quem tenta CADASTRAR a assinatura do ChatGPT colando um texto.
+ * Os chamadores (rota REST e onboarding) mostram esta frase quando o motivo é
+ * `assinatura_so_pelo_login`.
+ */
+export const MENSAGEM_ASSINATURA_SO_PELO_LOGIN =
+  "A conta do ChatGPT não se cadastra colando uma chave: ela se conecta pelo botão de login em IA › Credenciais.";
 
 export type ResultadoDeRotacionar =
   | { ok: true; id: string; last4: string | null; trocouChave: boolean }
@@ -53,7 +61,7 @@ export interface PedidoDeGuardar {
   admin: ReturnType<typeof createAdminClient>;
   orgId: string;
   userId: string;
-  provider: ProvedorComChave;
+  provider: ProvedorComChave | ServiceProvider;
   label: string;
   /** Plaintext. Vive só no escopo desta chamada — nunca persistido nem logado. */
   apiKey: string;
@@ -73,7 +81,7 @@ export interface PedidoDeGuardar {
  * diferentes (ou, pior, um caminho que gravasse plaintext) divergiria em
  * silêncio, e o ajuste que divergisse seria o de segurança.
  */
-function colunasCifradas(apiKey: string, provider: ProvedorComChave) {
+function colunasCifradas(apiKey: string, provider: ProvedorComChave | ServiceProvider) {
   const encrypted = encryptKey(apiKey);
   const last4 = provider === PROVEDOR_POR_ASSINATURA ? ultimo4DoLogin(apiKey) : encrypted.last4;
   return {
@@ -107,7 +115,32 @@ function ultimo4DoLogin(json: string): string {
   return json.slice(-4);
 }
 
+/**
+ * O cadastro GENÉRICO — rota REST e onboarding, onde a pessoa cola uma chave.
+ *
+ * Recusa a assinatura do ChatGPT SEMPRE, com o módulo `login_codex` ligado ou
+ * não: a linha dela nasce marcada como validada (#1672, item 4) porque quem a
+ * prova é a troca do código do login. Um texto colado por aqui viraria uma
+ * credencial "validada" que ninguém provou, desviando do login inteiro. A guarda
+ * mora no miolo, e não na borda, porque todo cadastro passa por aqui — um
+ * chamador novo herda a recusa sem saber dela.
+ */
 export async function guardarCredencial(p: PedidoDeGuardar): Promise<ResultadoDeGuardar> {
+  if (p.provider === PROVEDOR_POR_ASSINATURA) return { ok: false, motivo: "assinatura_so_pelo_login" };
+  return inserirCredencial(p);
+}
+
+/**
+ * O ÚNICO caminho de nascimento da credencial da assinatura: `guardarLoginCodex`
+ * (`./login-codex.ts`), depois de o login provar o par de tokens.
+ */
+export async function guardarCredencialDoLogin(
+  p: Omit<PedidoDeGuardar, "provider" | "baseUrl">,
+): Promise<ResultadoDeGuardar> {
+  return inserirCredencial({ ...p, provider: PROVEDOR_POR_ASSINATURA });
+}
+
+async function inserirCredencial(p: PedidoDeGuardar): Promise<ResultadoDeGuardar> {
   let cifrada: ReturnType<typeof colunasCifradas>;
   try {
     cifrada = colunasCifradas(p.apiKey, p.provider);
@@ -184,11 +217,18 @@ export interface PedidoDeRotacionar {
   /** `null` só na renovação automática do login por assinatura: a coluna é uuid. */
   userId: string | null;
   credentialId: string;
-  provider: ProvedorComChave;
+  provider: ProvedorComChave | ServiceProvider;
   /** Presente = trocar a chave. Ausente = manter a atual. Plaintext: nunca logado. */
   apiKey?: string;
   /** Presente = trocar o rótulo. Ausente = manter. */
   label?: string;
+  /**
+   * Só para a assinatura: a renovação automática do token é a MESMA conta, então a lista
+   * de modelos continua valendo. Sem isto, cada renovação apagava `models_available` e todo
+   * "Publicar" seguinte respondia `model_not_found`. Reconectar (conta que pode ser outra)
+   * não passa este campo e continua zerando a lista.
+   */
+  manterModelos?: boolean;
   requestId?: string;
 }
 
@@ -218,7 +258,7 @@ export async function rotacionarCredencial(
       // renovação acabou de confirmar (item 4).
       patch.validated_at = new Date().toISOString();
       patch.validation_error = null;
-      patch.models_available = null;
+      if (!p.manterModelos) patch.models_available = null;
     } else {
       // Chave nova = veredito antigo deixa de valer. Sem zerar, a tela mostraria
       // "Validada" (e os modelos da chave anterior) sobre uma chave que ninguém
@@ -296,7 +336,7 @@ async function validarEmSegundoPlano(
   admin: ReturnType<typeof createAdminClient>,
   credentialId: string,
   organizationId: string,
-  provider: ProvedorComChave,
+  provider: ProvedorComChave | ServiceProvider,
   apiKey: string,
 ): Promise<void> {
   // O RAMO DO LOGIN POR ASSINATURA (#1672, item 3): não existe endpoint de

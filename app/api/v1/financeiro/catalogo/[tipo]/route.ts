@@ -1,10 +1,15 @@
 /**
  * O catálogo financeiro: contas, formas de pagamento e plano de contas.
  *
- * ⚠️ USA O CLIENT DE SESSÃO, nunca o admin. A RLS já diz quem lê (a organização)
- * e quem escreve (manager+), e repetir a regra aqui criaria uma segunda fonte da
- * mesma verdade — a que roda em TypeScript seria a pior das duas. `requireRole`
- * é só a borda de autenticação.
+ * ⚠️ COM SESSÃO usa o client de SESSÃO: a RLS já diz quem lê (a organização) e
+ * quem escreve (manager+), e repetir a regra aqui criaria uma segunda fonte da
+ * mesma verdade. `resolveAuthDual` (GET) e `requireRole` (escritas) são só a
+ * borda de autenticação.
+ *
+ * ⚠️ COM TOKEN só a LEITURA (`mcp:read`, Spec 33 R2, doc 376): o client é a
+ * service role e a RLS deixa de proteger, então o GET filtra `organization_id`
+ * da linha do token. POST, PATCH e DELETE seguem só de sessão e recusam o
+ * Bearer com 401 no `requireRole` — abrir a escrita por token é fatia própria.
  *
  * ⚠️ DELETE INATIVA, não apaga. Conta com lançamento é história; apagá-la
  * deixaria o lançamento órfão ou o levaria junto. É a mesma decisão de
@@ -15,18 +20,24 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 import { z } from "zod";
 
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
+import { moedaDaOrganizacao } from "@/lib/catalogo/moeda-da-org";
 import {
   COLUNAS_POR_ENTIDADE,
   ENTIDADES_DO_CATALOGO,
   ROTULO_DA_ENTIDADE,
   SCHEMA_POR_ENTIDADE,
   ehEntidadeDoCatalogo,
+  lerAlteracao,
+  temColunaDeMoeda,
 } from "@/lib/financeiro/catalogo";
 import { requireSupportWrite } from "@/lib/impersonate/support";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { moduloLigado } from "@/lib/instalacao/modulos";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
@@ -42,6 +53,15 @@ async function entidade(ctx: Ctx, requestId: string) {
       response: fail("not_found", "Catálogo desconhecido.", 404, { requestId }),
     };
   }
+  // #1907: `commission_rules` é tabela do módulo `financeiro` (a comanda). Sem ele
+  // instalado ela não existe, e este catálogo também não — 404, como as rotas de
+  // comandas. As outras entidades são do caixa, que é núcleo.
+  if (tipo === "regras_de_comissao" && !(await moduloLigado(createAdminClient(), "financeiro"))) {
+    return {
+      ok: false as const,
+      response: fail("not_found", "Catálogo desconhecido.", 404, { requestId }),
+    };
+  }
   return { ok: true as const, tipo, tabela: ENTIDADES_DO_CATALOGO[tipo] };
 }
 
@@ -50,17 +70,25 @@ export async function GET(req: NextRequest, ctx: Ctx): Promise<Response> {
   const e = await entidade(ctx, requestId);
   if (!e.ok) return e.response;
 
-  const authz = await requireRole("viewer", { requestId, resource: "financeiro" });
+  // Leitura do catálogo: sessão OU token `mcp:read`. O papel mínimo é o da sessão.
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "financeiro",
+    role: "viewer",
+    scope: "mcp:read",
+  });
   if (!authz.ok) return authz.response;
+  const teto = await tetoDeEscritaDoToken(authz, "financeiro_catalogo", requestId);
+  if (teto) return teto;
 
-  const supabase = await createClient();
+  const supabase = authz.supabase;
   // `inativos=1` para quem precisa ver o que saiu de uso — a tela normal não
   // mostra, mas o histórico existe e alguém vai perguntar por ele.
   const incluirInativos = new URL(req.url).searchParams.get("inativos") === "1";
   let q = supabase
     .from(e.tabela)
     .select(COLUNAS_POR_ENTIDADE[e.tipo])
-    .eq("organization_id", authz.org.orgId)
+    .eq("organization_id", authz.organizationId)
     .order("name", { ascending: true })
     .limit(500);
   if (!incluirInativos) q = q.eq("is_active", true);
@@ -90,9 +118,24 @@ export async function POST(req: NextRequest, ctx: Ctx): Promise<Response> {
   }
 
   const supabase = await createClient();
+
+  // ─── A MOEDA É DA ORGANIZAÇÃO, NUNCA DO CORPO (#3379) ──────────────────
+  //
+  // `financial_accounts.currency` e `recurring_entries.currency` têm
+  // `default 'BRL'` no banco, e nenhum dos dois schemas declara o campo: sem
+  // esta linha a conta e o molde de uma organização em dólar nasciam em real —
+  // e o cron da recorrência copiava essa moeda para cada lançamento do mês, para
+  // sempre. O leitor é o mesmo do cadastro de produto (`moedaDaOrganizacao`),
+  // porque são a mesma pergunta: qual é a moeda desta organização.
+  const linha: Record<string, unknown> = {
+    ...lido.data,
+    organization_id: authz.org.orgId,
+  };
+  if (temColunaDeMoeda(e.tipo)) linha.currency = await moedaDaOrganizacao(supabase, authz.org.orgId);
+
   const { data, error } = await supabase
     .from(e.tabela)
-    .insert({ ...lido.data, organization_id: authz.org.orgId })
+    .insert(linha)
     .select(COLUNAS_POR_ENTIDADE[e.tipo])
     .single();
 
@@ -149,23 +192,20 @@ export async function PATCH(req: NextRequest, ctx: Ctx): Promise<Response> {
   const base = alterarSchema.safeParse(corpo);
   if (!base.success) return fail("validation_failed", t("id inválido."), 422, { requestId });
 
-  // `.partial()` sobre o schema da entidade: alterar um campo não obriga a
-  // reenviar os outros, e um campo desconhecido é recusado em vez de ignorado.
+  // Cada campo opcional: alterar um não obriga a reenviar os outros. E só o que
+  // veio no corpo é gravado — ver `lerAlteracao`.
   const { id: _id, ...resto } = corpo as Record<string, unknown>;
-  const campos = SCHEMA_POR_ENTIDADE[e.tipo].partial().safeParse(resto);
-  if (!campos.success) {
-    return fail("validation_failed", t(campos.error.issues[0]?.message ?? "corpo inválido"), 422, {
-      requestId,
-    });
-  }
-  if (Object.keys(campos.data).length === 0) {
+  const lido = lerAlteracao(e.tipo, resto);
+  if (!lido.ok) return fail("validation_failed", t(lido.mensagem), 422, { requestId });
+  const campos = lido.campos;
+  if (Object.keys(campos).length === 0) {
     return fail("validation_failed", t("Nenhum campo para alterar."), 422, { requestId });
   }
 
   const supabase = await createClient();
   const { data, error } = await supabase
     .from(e.tabela)
-    .update(campos.data)
+    .update(campos)
     .eq("id", base.data.id)
     .eq("organization_id", authz.org.orgId)
     .select(COLUNAS_POR_ENTIDADE[e.tipo])
@@ -174,6 +214,18 @@ export async function PATCH(req: NextRequest, ctx: Ctx): Promise<Response> {
   if (error) {
     if (error.code === "23505") {
       return fail("conflict", `${t(ROTULO_DA_ENTIDADE[e.tipo])}: ${t("esse nome já existe.")}`, 409, {
+        requestId,
+      });
+    }
+    // Os mesmos da criação: 23503 é conta de outra organização (ou inexistente),
+    // 23514 é a regra de comissão que ficaria sem alvo. Recusa, não erro.
+    if (error.code === "23503") {
+      return fail("validation_failed", t("A conta informada não existe nesta organização."), 422, {
+        requestId,
+      });
+    }
+    if (error.code === "23514") {
+      return fail("validation_failed", t("Escolha ao menos uma pessoa ou um serviço."), 422, {
         requestId,
       });
     }
@@ -188,7 +240,7 @@ export async function PATCH(req: NextRequest, ctx: Ctx): Promise<Response> {
     resourceType: e.tabela,
     resourceId: base.data.id,
     requestId,
-    metadata: { tipo: e.tipo, campos: Object.keys(campos.data) },
+    metadata: { tipo: e.tipo, campos: Object.keys(campos) },
   });
 
   return ok(data, { requestId });
@@ -213,9 +265,12 @@ export async function DELETE(req: NextRequest, ctx: Ctx): Promise<Response> {
 
   // INATIVA. Ver o cabeçalho: o passado não se reescreve.
   const supabase = await createClient();
+  // Na recorrência, desligar pelo catálogo é decisão da equipe: zera a marca de
+  // "desligado pela perda", e o re-ganho do negócio não o religa (#4256).
+  const desliga = e.tipo === "recorrencias" ? { is_active: false, desativada_pela_perda: false } : { is_active: false };
   const { data, error } = await supabase
     .from(e.tabela)
-    .update({ is_active: false })
+    .update(desliga)
     .eq("id", lido.data.id)
     .eq("organization_id", authz.org.orgId)
     .select("id")

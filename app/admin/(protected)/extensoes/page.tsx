@@ -3,6 +3,7 @@ import { notFound } from "next/navigation";
 
 import { Card } from "@/components/ui/card";
 import { loadAuthUser } from "@/lib/auth/server";
+import { tagDeIdioma } from "@/lib/i18n/datas";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { normalizarIdioma } from "@/lib/i18n/idiomas";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -58,7 +59,7 @@ export default async function Page() {
     // (`lib/extensions/service.ts`) filtra no banco pelo mesmo motivo.
     db
       .from("extension_installations")
-      .select("id,publisher,name,version,installed_at")
+      .select("id,publisher,name,version,installed_at,disabled_at")
       .is("removed_at", null)
       .order("installed_at", { ascending: false }),
     db.from("organization_extensions").select("installation_id,enabled"),
@@ -73,7 +74,7 @@ export default async function Page() {
   }
 
   const dataLegivel = (iso: string) =>
-    new Date(iso).toLocaleDateString(idioma === "es" ? "es" : "pt-BR", {
+    new Date(iso).toLocaleDateString(tagDeIdioma(idioma), {
       day: "2-digit",
       month: "short",
       year: "numeric",
@@ -148,6 +149,13 @@ export default async function Page() {
                     {" · "}
                     {t("instalada em")} {dataLegivel(e.installed_at)}
                   </p>
+                  {/* O interruptor do módulo conectado (spec 33, D8): desligado continua instalado.
+                      Só `connected` tem `disabled_at`; ligar e desligar se faz na tela da empresa. */}
+                  {e.disabled_at ? (
+                    <p data-testid={`extensao-desligada-${e.publisher}-${e.name}`} className="text-xs font-medium">
+                      {t("Desligado nesta instalação")} · {dataLegivel(e.disabled_at)}
+                    </p>
+                  ) : null}
                 </div>
               );
             })
