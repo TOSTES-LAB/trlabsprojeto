@@ -1,5 +1,6 @@
 import { z } from "zod";
 
+import { ehPermissaoDeArea } from "./areas";
 import {
   EXTENSION_CAPABILITIES,
   EXTENSION_PERMISSIONS,
@@ -42,9 +43,25 @@ export type ExtensionConfiguration = {
   theme?: PaletaDeTema;
 };
 
+/** Um objeto que o módulo DECLARA. O host é quem compila isto em tabela (ADR-0005, D3). */
+export type ObjetoDeclarado = {
+  slug: string;
+  rotulo: LocalizedText;
+  campos: {
+    slug: string;
+    tipo: "texto" | "texto_longo" | "inteiro" | "booleano" | "data" | "data_hora" | "dinheiro";
+    obrigatorio?: boolean;
+  }[];
+  refs?: { slug: string; entidade: "contato"; obrigatorio?: boolean; ao_apagar?: "cascata" }[];
+};
+
 export type ExtensionManifest = {
   format_version: 1;
-  profile: "declarative";
+  /**
+   * `connected`: um serviço externo que lê/altera áreas do CRM (spec 33, F1). Não tem card nem
+   * dados próprios, e só aceita permissão de área. O endereço do serviço não é deste manifesto.
+   */
+  profile: "declarative" | "data" | "connected";
   publisher: string;
   name: string;
   version: string;
@@ -52,16 +69,22 @@ export type ExtensionManifest = {
   host_api: { min: number; max: number };
   permissions: ExtensionPermission[];
   dependencies: [];
-  data: { mode: "none" };
+  /** `none` no perfil declarativo; no perfil `data`, os objetos que o host vai compilar. */
+  data: { mode: "none" } | { mode: "declarado"; objetos: ObjetoDeclarado[] };
   display: {
     title: LocalizedText;
     summary: LocalizedText;
     category: "productivity" | "sales" | "service";
     icon: "ListChecks" | "BookOpen" | "Lightbulb";
   };
-  configuration: ExtensionConfiguration;
+  /**
+   * A configuração padrão da organização. O perfil de DADOS não tem card para configurar, então
+   * vem vazia — e o tipo diz isso, em vez de o schema aceitar uma forma que o tipo nega. O par
+   * perfil↔forma é amarrado no `superRefine` do schema.
+   */
+  configuration: ExtensionConfiguration | Record<string, never>;
   contributions: {
-    crm_cards: Array<{
+    crm_cards?: Array<{
       id: string;
       title: LocalizedText;
       description: LocalizedText;
@@ -92,6 +115,13 @@ export type CatalogEntry = Pick<
   repository?: string;
   tags?: string[];
   published_at?: string;
+  /**
+   * Endereço do SERVIÇO de um módulo conectado (spec 33, F1). Mora aqui, na entrada do catálogo
+   * revisado, e nunca no pacote: o pacote não tem URL (ADR-0003, D3). Origem exata: `https`, sem
+   * credencial, caminho, query ou fragmento. A admissão reaplica a regra de download
+   * (`assertServiceOrigin`); o schema só garante a forma.
+   */
+  service_origin?: string;
 };
 
 export type ExtensionCatalog = {
@@ -200,10 +230,65 @@ const permissionsSchema = z
   });
 const dependenciesSchema: z.ZodType<[]> = z.tuple([]);
 
+/** Os objetos declarados. O vocabulário de tipos é FECHADO e espelha o do compilador no banco:
+ * `fn_modulo_dados_compilar` levanta `modulo_tipo_de_campo_desconhecido` para qualquer outro valor,
+ * e um tipo que passasse aqui e morresse lá daria recibo de instalação sem tabela. */
+const objetosDeclaradosSchema = z
+  .object({
+    mode: z.literal("declarado"),
+    objetos: z
+      .array(
+        z
+          .object({
+            slug: slugSchema,
+            rotulo: localizedTextSchema(EXTENSION_LIMITS.titleCharacters),
+            campos: z
+              .array(
+                z
+                  .object({
+                    slug: slugSchema,
+                    tipo: z.enum([
+                      "texto",
+                      "texto_longo",
+                      "inteiro",
+                      "booleano",
+                      "data",
+                      "data_hora",
+                      "dinheiro",
+                    ]),
+                    obrigatorio: z.boolean().optional(),
+                  })
+                  .strict(),
+              )
+              .min(1)
+              .max(50),
+            refs: z
+              .array(
+                z
+                  .object({
+                    slug: slugSchema,
+                    // Allowlist de entidades do núcleo, igual à do compilador.
+                    entidade: z.literal("contato"),
+                    obrigatorio: z.boolean().optional(),
+                    // Onda 1a: só `cascata`. `anula` espera o `set null (coluna)` do compilador.
+                    ao_apagar: z.literal("cascata").optional(),
+                  })
+                  .strict(),
+              )
+              .max(10)
+              .optional(),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(10),
+  })
+  .strict();
+
 const manifestSchema: z.ZodType<ExtensionManifest> = z
   .object({
     format_version: z.literal(1),
-    profile: z.literal("declarative"),
+    profile: z.enum(["declarative", "data", "connected"]),
     publisher: slugSchema,
     name: slugSchema,
     version: semverSchema,
@@ -211,9 +296,9 @@ const manifestSchema: z.ZodType<ExtensionManifest> = z
     host_api: hostApiSchema,
     permissions: permissionsSchema,
     dependencies: dependenciesSchema,
-    data: z.object({ mode: z.literal("none") }).strict(),
+    data: z.union([objetosDeclaradosSchema, z.object({ mode: z.literal("none") }).strict()]),
     display: displaySchema,
-    configuration: configurationSchema,
+    configuration: z.union([configurationSchema, z.object({}).strict()]),
     contributions: z
       .object({
         crm_cards: z
@@ -251,12 +336,78 @@ const manifestSchema: z.ZodType<ExtensionManifest> = z
             if (new Set(cards.map((card) => card.id)).size !== cards.length) {
               ctx.addIssue({ code: "custom", message: "id de card repetido" });
             }
-          }),
+          })
+          // Opcional no SCHEMA, exigido por PERFIL no refine abaixo: um módulo de dados não
+          // contribui card nenhum, e um declarativo sem card não teria o que mostrar.
+          .optional(),
         theme: esquemaDaContribuicaoDeTema.optional(),
       })
       .strict(),
   })
-  .strict();
+  .strict()
+  // A COERÊNCIA entre perfil e forma. As uniões acima abrem duas formas para `data` e para
+  // `configuration`; sem este amarrado, elas afrouxariam OS DOIS perfis — um pacote declarativo
+  // poderia vir sem configuração, e um de dados poderia vir com `{"mode":"none"}` e nenhum objeto,
+  // instalando um módulo de dados que não guarda nada. É o mesmo par de regras que o banco confere
+  // em `fn_extensions_finish_install`, e os dois lados precisam dizer a mesma coisa.
+  .superRefine((manifest, context) => {
+    // Permissão de área (spec 33) é do perfil conectado e de mais nenhum: um guia ou um pacote de
+    // dados que a declarasse ganharia uma porta de leitura do CRM que o perfil não justifica.
+    if (manifest.profile === "connected") {
+      if (!manifest.permissions.every(ehPermissaoDeArea)) {
+        context.addIssue({
+          code: "custom",
+          message: "perfil conectado só declara permissão de área",
+        });
+      }
+      if (manifest.data.mode !== "none") {
+        context.addIssue({ code: "custom", message: "perfil conectado não declara dados" });
+      }
+      if ("density" in manifest.configuration) {
+        context.addIssue({
+          code: "custom",
+          message: "perfil conectado não tem configuração de card",
+        });
+      }
+      if (
+        manifest.contributions.crm_cards !== undefined ||
+        manifest.contributions.theme !== undefined
+      ) {
+        context.addIssue({
+          code: "custom",
+          message: "perfil conectado não contribui card nem tema",
+        });
+      }
+      return;
+    }
+    if (manifest.permissions.some(ehPermissaoDeArea)) {
+      context.addIssue({
+        code: "custom",
+        message: "permissão de área só existe no perfil conectado",
+      });
+    }
+    if (manifest.profile === "declarative") {
+      if (manifest.data.mode !== "none") {
+        context.addIssue({ code: "custom", message: "perfil declarativo não declara dados" });
+      }
+      if (!("density" in manifest.configuration)) {
+        context.addIssue({ code: "custom", message: "perfil declarativo exige configuração" });
+      }
+      if (manifest.contributions.crm_cards === undefined) {
+        context.addIssue({ code: "custom", message: "perfil declarativo contribui cards" });
+      }
+      return;
+    }
+    if (manifest.contributions.crm_cards !== undefined) {
+      context.addIssue({ code: "custom", message: "perfil de dados não contribui card" });
+    }
+    if (manifest.data.mode !== "declarado") {
+      context.addIssue({ code: "custom", message: "perfil de dados declara objetos" });
+    }
+    if ("density" in manifest.configuration) {
+      context.addIssue({ code: "custom", message: "perfil de dados não tem configuração de card" });
+    }
+  });
 
 function isExactOrigin(value: string) {
   try {
@@ -294,6 +445,7 @@ const catalogEntrySchema: z.ZodType<CatalogEntry> = z
       .string()
       .regex(/^\d{4}-\d{2}-\d{2}$/)
       .optional(),
+    service_origin: z.string().refine(isExactOrigin).optional(),
   })
   .strict();
 
@@ -421,6 +573,21 @@ function validateSnapshotStructure(root: unknown) {
   }
 }
 
+/**
+ * O manifesto tem configuração de CARD, ou veio vazio (perfil de dados)?
+ *
+ * Existe como type guard, e não como `"density" in configuration` no ponto de uso, porque
+ * `Record<string, never>` tem índice genérico: o `in` casa com qualquer chave e o TypeScript NÃO
+ * estreita a união. O primeiro conserto que eu tentei fazia exatamente isso e o `tsc` continuou
+ * reprovando — com a mensagem igual, no mesmo lugar, o que é a assinatura de conserto que não tocou
+ * a causa.
+ */
+export function temConfiguracaoDeCard(
+  configuration: ExtensionManifest["configuration"],
+): configuration is ExtensionConfiguration {
+  return "density" in configuration && typeof configuration.density === "string";
+}
+
 export function parseManifest(bytes: Uint8Array): ExtensionManifest {
   return parseWithSchema(bytes, EXTENSION_LIMITS.packageBytes, manifestSchema);
 }
@@ -445,7 +612,10 @@ export function checkCompatibility(subject: CompatibilitySubject): Compatibility
   if (subject.format_version !== undefined && subject.format_version !== 1) {
     return incompatible("format_version_unsupported");
   }
-  if (subject.profile !== undefined && subject.profile !== "declarative") {
+  if (
+    subject.profile !== undefined &&
+    !["declarative", "data", "connected"].includes(subject.profile)
+  ) {
     return incompatible("profile_unsupported");
   }
   if (subject.host_api.min > HOST_API_VERSION || subject.host_api.max < HOST_API_VERSION) {
@@ -460,7 +630,7 @@ export function checkCompatibility(subject: CompatibilitySubject): Compatibility
   if (subject.dependencies !== undefined && subject.dependencies.length !== 0) {
     return incompatible("dependency_unsupported");
   }
-  const capacidades = subject.contributions?.crm_cards.map((card) => card.action.capability) ?? [];
+  const capacidades = subject.contributions?.crm_cards?.map((card) => card.action.capability) ?? [];
   if (capacidades.some((capacidade) => !EXTENSION_CAPABILITIES.includes(capacidade))) {
     return incompatible("capability_unsupported");
   }

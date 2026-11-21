@@ -4,10 +4,13 @@ import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
 import { ROLE_RANK } from "@/lib/auth/types";
 import { listSelectableChannels } from "@/lib/channels/selectable";
 import { createClient } from "@/lib/supabase/server";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { idsDosProvedoresOferecidos } from "@/lib/ai/pontos/provedores-oferecidos";
 import type { CredentialRow } from "@/hooks/ai/useCredentials";
 
 import { lerAmbiente } from "@/lib/instalacao/ambiente";
 import { fusoUtilizavel } from "@/lib/tempo/fusos";
+import { skillsDisponiveis } from "@/lib/ai/skills/skills-do-agente";
 
 import { AgentForm } from "../[id]/_components/AgentForm";
 
@@ -63,8 +66,10 @@ export default async function NewAgentPage() {
         mode="create"
         credentials={credentials}
         provedoresDaInstalacao={provedoresDaInstalacao()}
+        provedoresOferecidos={await idsDosProvedoresOferecidos(createAdminClient())}
         provedorPadrao={llmDaOrg?.provider}
         channelSessions={channelSessions}
+        skills={await skillsDisponiveis(createAdminClient(), activeOrg.orgId)}
         organizationTimezone={fusoUtilizavel(activeOrg.timezone)}
       />
     </div>

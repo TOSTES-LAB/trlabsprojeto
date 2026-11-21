@@ -106,10 +106,18 @@ class ReadQuery {
     }
     const order = this.ordering.length ? ` order by ${this.ordering.join(",")}` : "";
     const sql = `select ${projection} from ${ident(this.table)}${where}${order}${this.size === undefined ? "" : ` limit ${this.size}`} offset ${this.offset}`;
-    const result = await pool.query(
-      `with result as (${sql}) select to_jsonb(result) r from result`,
-      this.values,
-    );
+    let result;
+    try {
+      result = await pool.query(
+        `with result as (${sql}) select to_jsonb(result) r from result`,
+        this.values,
+      );
+    } catch (erro) {
+      // Tabela de módulo não instalado: o PostgREST devolve o erro, não lança.
+      const { code, message } = erro as { code?: string; message: string };
+      if (code === "42P01") return { data: null, error: { code, message } };
+      throw erro;
+    }
     const data = result.rows.map((row) => row.r);
     return { data: this.one ? (data[0] ?? null) : data, error: null };
   }
@@ -134,6 +142,13 @@ const request = {
 };
 
 beforeAll(async () => {
+  // #1907 item 3 — o módulo financeiro INSTALADO antes de semear: o export lê `sales`
+  // (`lib/lgpd/export-collector.ts:1470`) e as cinco tabelas da comanda nascem SÓ em
+  // `fn_financeiro_provisionar()` (ADR-0002 D2/D3). A D8 manda esta varredura rodar sobre
+  // um banco COM o módulo instalado — sem a chamada o `from("sales")` do export morre com
+  // `relation "sales" does not exist` e este arquivo inteiro cai por um módulo que não é o
+  // assunto dele (o assunto é agenda/Meet no relatório do titular).
+  await pool.query("select public.fn_financeiro_provisionar();");
   vi.mocked(createAdminClient).mockReturnValue({
     from: (table: string) => new ReadQuery(table),
   } as never);

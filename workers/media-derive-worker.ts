@@ -7,26 +7,52 @@
 import { generateText } from "ai";
 import type pg from "pg";
 
-import { extractPdfText } from "@/lib/ai/rag/extractors/pdf";
+import { extractPdfText, PdfExtractError } from "@/lib/ai/rag/extractors/pdf";
+import { provedorDaChamada } from "@/lib/ai/log-invocation";
 import { visaoEmVigor } from "@/lib/ai/pontos/capacidade-em-vigor";
-import { resolveOrgLlmConfig, type LlmEdgeConfig } from "@/lib/agent-engine/edge/llm/credentials";
+import { PONTO_TRANSCRICAO_DE_AUDIO, PONTO_VISAO_DE_IMAGEM } from "@/lib/ai/pontos/registro";
+import { costCents, type TokenUsage } from "@/lib/agent-engine/edge/llm/pricing";
+import { custoDoModeloForaDoMotor } from "@/lib/agent-engine/edge/llm/pricing-do-catalogo";
+import { decidirCustoDaChamada, haUsoMedido } from "@/lib/agent-engine/edge/llm/custo-da-chamada";
+import {
+  aplicarOrcamento,
+  LlmBudgetExceededError,
+  normalizarErro,
+  tetoDeSaida,
+  tetoDeSaidaDaOrganizacao,
+} from "@/lib/agent-engine/edge/llm/run-model-call";
+import { normalizarChaveDeOrcamento } from "@/lib/agent-engine/edge/llm/orcamento";
+import { chaveDeOrcamentoDaInstalacao } from "@/lib/instalacao/comportamento";
+import {
+  resolveOrgLlmConfig,
+  type LlmEdgeConfig,
+  type OrgLlmConfig,
+} from "@/lib/agent-engine/edge/llm/credentials";
 import { createDefaultRegistry } from "@/lib/agent-engine/edge/llm/providers";
 import { createPool } from "@/lib/agent-engine/db/pool";
 import { env } from "@/lib/env";
 import type { EventRow, HandlerResult } from "@/lib/event-log/dispatcher";
 import { deriveMediaText, type DeriveDeps } from "@/lib/messaging/media/derive";
+import { isMediaPathInOrganization } from "@/lib/messaging/media/upload-validation";
 import { MARCADOR_NAO_LIDA, TIPOS_DERIVAVEIS } from "@/lib/messaging/media/derivable";
 import { deriveVideoText } from "@/lib/messaging/media/video-derive";
 import {
   decidirTranscricao,
   type DecisaoDeTranscricao,
+  type OrigemDaTranscricao,
 } from "@/lib/messaging/media/escada-de-transcricao";
+import { TranscriptionTooLargeError, type TranscriptionProvider } from "@/lib/messaging/media/transcription";
 import { logger } from "@/lib/logger";
+import { traduzir } from "@/lib/i18n/dicionario";
+import { idiomaDoAviso, preencher } from "@/lib/i18n/idioma-do-aviso";
+import { IDIOMA_PADRAO, type Idioma } from "@/lib/i18n/idiomas";
+import { validarParProvedorModelo } from "@/lib/ai/par-provedor-modelo";
 import { reagirAConclusaoDeDerivacao } from "@/lib/escalacao/handoff-tecnico";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { motivoDaRecusaDeDestino } from "@/lib/automation/destinos-internos-autorizados";
 import { DETALHE_TECNICO } from "@/lib/event-log/aviso-de-evento-morto";
 import { MENSAGEM_REDIGIDA } from "@/lib/lgpd/cascata";
+import { lerPessoalDaConversa } from "@/lib/contacts/contato-pessoal";
 import { avaliarPedidosFalados } from "@/workers/media-derive-worker.pedidos";
 
 export const MEDIA_DERIVE_CONSUMER_KEY = "media_derive_v1";
@@ -99,11 +125,23 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
   // que espera a mídia da CONVERSA, segurava a resposta do texto seguinte até o
   // teto de 120s por uma leitura que nunca ia acontecer.
   const markSkipped = async (detail: string): Promise<HandlerResult> => {
-    await admin.from("messages")
-      .update({ media_derived_status: "skipped" })
-      .eq("id", msg.id).eq("organization_id", msg.organization_id);
-    return { consumer_key, status: "skipped", detail };
+    try {
+      const { error } = await admin.from("messages")
+        .update({ media_derived_status: "skipped" })
+        .eq("id", msg.id).eq("organization_id", msg.organization_id);
+      if (!error) return { consumer_key, status: "skipped", detail };
+    } catch {
+      // O dreno precisa tentar de novo; a causa externa não vai para o recibo.
+    }
+    return { consumer_key, status: "error", detail: "skip_status_update_failed" };
   };
+
+  // A linha é da org do evento; o objeto apontado por ela ainda precisa ser.
+  // O admin ignora a RLS do Storage: marque só a desistência terminal antes
+  // de baixar, resolver credencial ou derivar; falha da marca pede nova tentativa.
+  if (msg.media_storage_path && !isMediaPathInOrganization(msg.media_storage_path, row.organization_id)) {
+    return markSkipped("invalid_media_path");
+  }
 
   // A retenção já retirou esta mídia (migration 0557, #1534): não há o que
   // derivar e, principalmente, nada a baixar do provedor — o `media_storage_path`
@@ -113,6 +151,50 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
 
   if (!msg.media_storage_path) return markSkipped("no media");
   if (msg.media_derived_status === "ready") return { consumer_key, status: "skipped", detail: "already derived" };
+
+  // ⚠️ CONTATO PESSOAL (spec 21) NÃO É LEITURA DE IA — #3592.
+  //
+  // A marca tira o contato da operação inteira: a conversa fechada, o
+  // follow-up, a campanha e a prospecção param, o RAG esquece, e a entrada de
+  // mensagem pula os efeitos. A derivação de mídia era o único caminho que
+  // olhava só a mensagem — baixava o arquivo do bucket e mandava o áudio
+  // (transcrição), a foto (visão), o vídeo (quadros) ou o documento ao
+  // provedor. Dois custos, e o segundo não se paga com dinheiro: token da
+  // organização em conteúdo que ninguém da operação vai ler, e a vida privada
+  // de alguém indo parar num terceiro — exatamente o que a marca promete
+  // evitar. O arquivo CONTINUA salvo e tocável na conversa; o que não nasce é
+  // o `media_derived_text`.
+  //
+  // A régua é uma só (`contacts.is_personal`, via
+  // `lib/contacts/contato-pessoal.ts`): este worker só conhece a conversa, e
+  // resolver o dono aqui dentro com um SELECT próprio criaria a segunda régua
+  // que divergiria na primeira condição nova. O corte vem DEPOIS do
+  // `already derived` de propósito: rebaixar `ready` para `skipped` sem apagar
+  // o texto faria a linha mentir sobre o próprio estado.
+  //
+  // `skipped` é TERMINAL no dreno do turno (`DERIVACAO_TERMINADA`): sem a
+  // marca, o drain da conversa esperaria o teto de 120s por uma leitura que
+  // ninguém vai fazer.
+  const donoDaMidia = await lerPessoalDaConversa(admin, {
+    organizationId: msg.organization_id,
+    conversationId: msg.conversation_id,
+  });
+  // Falha de leitura FECHA O GASTO em vez de abrir. Na entrada de mensagem a
+  // mesma dúvida segue o fluxo (a mensagem já está gravada; falhar ali viraria
+  // 500 para o provider) — aqui a política é a inversa e é de propósito: sem
+  // saber de quem é o arquivo, mandar o áudio de alguém a um terceiro é o dano
+  // que não tem desfazer, e o dreno ainda tem cinco tentativas para a leitura
+  // voltar. A causa vai para o log; o recibo do evento leva um código estável.
+  if (donoDaMidia.erro) {
+    logger.warn("[media-derive] leitura de is_personal falhou; a mídia não vai ao provedor", {
+      organization_id: msg.organization_id,
+      conversation_id: msg.conversation_id,
+      detail: donoDaMidia.erro,
+    });
+    return { consumer_key, status: "error", detail: "personal_check_failed" };
+  }
+  if (donoDaMidia.pessoal) return markSkipped("contato pessoal");
+
   if (!TIPOS_DERIVAVEIS.has(msg.type)) return { consumer_key, status: "skipped", detail: `type ${msg.type}` };
   // Vídeo é opt-in (custo: ffmpeg + N chamadas de visão): só deriva se algum agente
   // publicado da org tem video_frames_enabled=true (flag da migration 0058).
@@ -156,7 +238,7 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
   // derivação é `failed` + a razão, gravada em `metadata.media_derived_motivo`,
   // que é o que o operador lê antes de sair mexendo em Provedores de IA.
   const markFailed = async (motivo: string) => {
-    await admin.from("messages")
+    return admin.from("messages")
       .update({
         media_derived_text: MARCADOR_NAO_LIDA,
         media_derived_status: "failed",
@@ -217,6 +299,9 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
     // que o turno usa.
     let baseUrlDaVisao: string | null = null;
     let llm: Awaited<ReturnType<typeof resolveOrgLlmConfig>> | null = null;
+    // De onde veio o MODELO que vai sair (binding do ponto ou padrão da org) —
+    // é metade do log estruturado da chamada (issue #2377).
+    let origemDoModelo = "padrao";
 
     if (bindingDaVisao) {
       try {
@@ -225,6 +310,7 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
           credentialId: bindingDaVisao.credential_id,
         });
         llm = { ...comBinding, defaultModel: bindingDaVisao.model_id };
+        origemDoModelo = "binding";
         // Só vale se a credencial do binding resolveu: no catch abaixo o worker
         // volta para o padrão da org, e aí o endpoint do padrão é o correto.
         baseUrlDaVisao = bindingDaVisao.base_url;
@@ -302,6 +388,28 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
           ? { provider: conversa.provider, apiKey: conversa.apiKey, modelId: conversa.defaultModel }
           : null,
       chaveOpenai,
+      // Degrau 0: o Scribe que a organização escolheu no painel. Binding
+      // apontando para ElevenLabs sem chave utilizável NÃO derruba a derivação —
+      // a escada segue para o degrau seguinte e o log diz por quê, a mesma
+      // regra do binding de visão acima.
+      elevenlabsEscolhido: async () => {
+        if (!precisaTranscricao) return null;
+        const binding = await lerBindingDoPonto(admin, row.organization_id, "transcricao_de_audio");
+        if (binding?.provider !== "elevenlabs") return null;
+        try {
+          const el = await resolveOrgLlmConfig(derivePool(), llmCfg, row.organization_id, {
+            provider: "elevenlabs",
+            credentialId: binding.credential_id,
+          });
+          return { apiKey: el.apiKey, modelId: binding.model_id || "scribe_v1" };
+        } catch (err) {
+          logger.warn("[media-derive] ElevenLabs escolhido para transcrever, sem credencial utilizável; seguindo a escada", {
+            organization_id: row.organization_id,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          return null;
+        }
+      },
     });
     logger.info("[media-derive] transcrição resolvida", {
       organization_id: row.organization_id,
@@ -352,7 +460,7 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
 
     // O 5º argumento é a `base_url` do binding: o factory precisa dela para não
     // cair no endpoint padrão do provedor (ver o comentário lá em cima).
-    const deps = buildDeriveDeps(llm, decisao, row.organization_id, admin, baseUrlDaVisao, chaveEhDaInstalacao);
+    const deps = buildDeriveDeps(llm, decisao, row.organization_id, admin, baseUrlDaVisao, chaveEhDaInstalacao, origemDoModelo);
 
     const text = await deriveMediaText(msg.type, buffer, msg.media_mime ?? "application/octet-stream", deps);
 
@@ -369,7 +477,10 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
       await avisarMidiaNaoLida(
         msg.organization_id,
         rotuloDoTipo,
-        motivo,
+        {
+          chave: "o modelo devolveu a transcrição do áudio vazia ({origem}: {motivo})",
+          valores: { origem: decisao.origem, motivo: { traduzivel: decisao.motivo } },
+        },
         "O provedor respondeu sem texto. Confira o modelo em Provedores de IA: se ele aceita áudio mas devolve vazio, troque por outro modelo com capacidade audio.",
       );
       return { consumer_key, status: "ok", detail: "transcricao_vazia" };
@@ -442,6 +553,50 @@ export async function deriveMessageMedia(row: EventRow): Promise<HandlerResult> 
     }
     return { consumer_key, status: "ok" };
   } catch (err) {
+    if (err instanceof TranscriptionTooLargeError) {
+      const motivo = "o áudio excede o limite de 25 MB da transcrição pela OpenRouter e não foi enviado ao serviço";
+      try {
+        const { error } = await markFailed(motivo);
+        if (error) return { consumer_key, status: "error", detail: "failed_status_update_failed" };
+      } catch {
+        return { consumer_key, status: "error", detail: "failed_status_update_failed" };
+      }
+      await avisarMidiaNaoLida(
+        msg.organization_id, rotuloDoTipo, motivo,
+        "Envie um áudio menor, de até 25 MB, para que o conteúdo possa ser transcrito.",
+      );
+      return { consumer_key, status: "skipped", detail: "transcription_audio_too_large" };
+    }
+    // ─── PDF escaneado não é falha de infraestrutura (#4889) ────────────────
+    //
+    // O extrator distingue os dois casos por `motivo`: `sem_texto` = o arquivo
+    // abriu inteiro e não tem letra selecionável; `falha` = a engine não
+    // conseguiu ler. Aqui os dois caíam no MESMO `catch`, e o PDF sem texto
+    // custava o que só o erro real deveria custar: cinco tentativas, descrição
+    // inventada pelo agente, aviso de "a leitura deu erro em todas as
+    // tentativas" e um `event_dead` aberto. Com o índice único
+    // `agent_inbox_event_dead_aberto_unico` (migration 0491), esse evento morto
+    // silencioso ocupa a única vaga da organização e ESCONDE a próxima falha de
+    // verdade — foi o que a issue mediu.
+    //
+    // Desfecho TERMINAL: `failed` com a razão (para o turno seguinte saber que
+    // existe arquivo ilegível, em vez de supor o conteúdo), `skipped` para o
+    // dreno não recontar, e NADA na Central — não há o que o operador consertar
+    // num PDF que o cliente mandou escaneado. O `motivo` é contrato do erro;
+    // a frase inglesa não decide nada aqui.
+    if (err instanceof PdfExtractError && err.motivo === "sem_texto") {
+      const motivo = "o PDF não tem texto selecionável (é escaneado ou só imagem)";
+      logger.info("[media-derive] PDF sem texto: derivação encerrada sem nova tentativa", {
+        message_id: msg.id,
+      });
+      try {
+        const { error } = await markFailed(motivo);
+        if (error) return { consumer_key, status: "error", detail: "failed_status_update_failed" };
+      } catch {
+        return { consumer_key, status: "error", detail: "failed_status_update_failed" };
+      }
+      return { consumer_key, status: "skipped", detail: "pdf_sem_texto" };
+    }
     const detail = err instanceof Error ? err.message : String(err);
     if (row.attempts >= DRAIN_MAX_ATTEMPTS - 1) {
       logger.error("[media-derive] failed permanently", { message_id: msg.id, detail });
@@ -535,7 +690,7 @@ async function lerBindingDoPonto(
 }
 
 function buildDeriveDeps(
-  llm: { provider: string; apiKey: string; defaultModel: string | null },
+  llm: Pick<OrgLlmConfig, "provider" | "apiKey" | "defaultModel" | "orcamento" | "orcamentoIndisponivelPorque" | "origemDaChave" | "params">,
   decisao: DecisaoDeTranscricao,
   orgId: string,
   admin: ReturnType<typeof createAdminClient>,
@@ -543,6 +698,9 @@ function buildDeriveDeps(
   // do provedor, que é o comportamento do turno do agente sem `baseUrl`.
   baseUrlDaVisao: string | null = null,
   chaveEhDaInstalacao = false,
+  // De onde veio o MODELO (issue #2377): o log da recusa de par precisa dizer
+  // se veio do binding do ponto ou do padrao da organizacao.
+  origemDoModelo = "padrao",
 ): DeriveDeps {
   const registry = createDefaultRegistry();
   // Thunk, não consulta: nada vai ao banco até a visão ser de fato perguntada,
@@ -565,6 +723,56 @@ function buildDeriveDeps(
       .is("deprecated_at", null)
       .maybeSingle();
     return data?.supports_vision ?? null;
+  };
+  // O gate de orçamento do seam, não uma cópia: mesmo veredito, mesmo item
+  // `budget_exceeded` na Central, mesma linha `orcamento_esgotado` em
+  // Execuções. Vale para toda chamada de LLM cobrada por token que este
+  // worker faz — a visão e o degrau 4 da transcrição (o modelo de conversa da
+  // organização). Os serviços dos degraus 1 a 3 conservam o comportamento
+  // anterior, sem este gate de LLM. O custo informado pela OpenRouter pode
+  // entrar na soma de gastos; sua ausência continua null, sem estimativa.
+  const barradoPeloTeto = async (d: {
+    tipo: "imagem" | "áudio";
+    oQueNaoSaiu: string;
+    purpose: string;
+    provider: string;
+    model: string;
+    origem: string;
+  }): Promise<boolean> => {
+    try {
+      await aplicarOrcamento({
+        db: derivePool(),
+        organizationId: orgId,
+        orcamentoDaConfig: llm.orcamento,
+        orcamentoIndisponivelPorque: llm.orcamentoIndisponivelPorque,
+        // A mesma chave efetiva do seam: a tela de admin vence, o `.env` é o piso.
+        chave: chaveDeOrcamentoDaInstalacao(normalizarChaveDeOrcamento(env.AI_BUDGET_ENFORCEMENT)),
+        // O teto do PLANO só vincula a chave da instalação (cobrança do revendedor §5).
+        origemDaChave: llm.origemDaChave,
+        purpose: d.purpose,
+        provider: d.provider,
+        model: d.model,
+        origem: d.origem,
+        input: { tenantId: orgId },
+        log: logger,
+      });
+      return false;
+    } catch (err) {
+      if (!(err instanceof LlmBudgetExceededError)) throw err;
+      await avisarMidiaNaoLida(
+        orgId,
+        d.tipo,
+        {
+          chave:
+            "o limite de gasto com IA deste mês foi atingido e a IA está configurada para parar nele, então {o_que_nao_saiu} ao provedor",
+          valores: { o_que_nao_saiu: { traduzivel: d.oQueNaoSaiu } },
+        },
+        "Enquanto o limite valer, a IA também não responde: as conversas vão para a fila de atendimento humano.",
+        undefined,
+        "Para resolver, suba o limite ou desligue a parada em Uso de IA › Orçamento.",
+      );
+      return true;
+    }
   };
   const describeImage: DeriveDeps["describeImage"] = async (buffer, mime) => {
     // ⚠️ A resposta é resolvida AQUI, não na montagem das deps, porque num
@@ -595,10 +803,14 @@ function buildDeriveDeps(
       // `{image:false}` por conservadorismo — afirmar ao operador que ele "não
       // enxerga imagens" seria gravar uma alegação que ninguém verificou (e
       // era o que acontecia com todo modelo da OpenRouter).
-      const motivo = visao.sabemos
-        ? `o modelo ${llm.defaultModel ?? "configurado"} não enxerga imagens`
-        : `não sei se o modelo ${llm.defaultModel ?? "configurado"} enxerga imagens, ` +
-          `então não arrisquei enviar a foto — escolha um modelo do catálogo em Agente de IA → Provedores`;
+      const modeloDaVisao = llm.defaultModel ?? { traduzivel: "configurado" };
+      const motivo: FraseDoAviso = visao.sabemos
+        ? { chave: "o modelo {modelo} não enxerga imagens", valores: { modelo: modeloDaVisao } }
+        : {
+            chave:
+              "não sei se o modelo {modelo} enxerga imagens, então não arrisquei enviar a foto — escolha um modelo do catálogo em Agente de IA → Provedores",
+            valores: { modelo: modeloDaVisao },
+          };
       await avisarMidiaNaoLida(orgId, "imagem", motivo);
       return MARCADOR_NAO_LIDA;
     }
@@ -634,21 +846,105 @@ function buildDeriveDeps(
     }
     const factory = registry[llm.provider];
     if (!factory) {
-      await avisarMidiaNaoLida(orgId, "imagem", `o provedor ${llm.provider} não está disponível nesta instalação`);
+      await avisarMidiaNaoLida(orgId, "imagem", {
+        chave: "o provedor {provedor} não está disponível nesta instalação",
+        valores: { provedor: llm.provider },
+      });
       return MARCADOR_NAO_LIDA;
     }
-    const res = await generateText({
-      model: factory(llm.apiKey, llm.defaultModel ?? "", baseUrlDaVisao ?? undefined),
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: "Descreva objetivamente esta imagem em 1-2 frases, em português, para um atendente de vendas entender o que o cliente enviou." },
-            // AI SDK v7: file part com mediaType (o antigo image part é deprecated).
-            { type: "file", data: buffer, mediaType: mime.split(";")[0]! },
-          ],
-        },
-      ],
+    // ─── O PAR ANTES DE ENVIAR A FOTO ──────────────────────────────────────
+    //
+    // Caminho especializado: era um dos que falhavam sozinhos enquanto o
+    // atendimento de texto ia bem, porque o `default_model` resolvido aqui
+    // podia ser um id da Anthropic sobre o provedor da OpenAI (issue #2377).
+    // A recusa abre o MESMO aviso da Central das outras de mídia — o operador
+    // vê o motivo em vez de o worker tentar de novo até esgotar — e o log leva
+    // provedor, modelo, propósito e origem da configuração.
+    const parDaVisao = validarParProvedorModelo(llm.provider, llm.defaultModel ?? "");
+    if (!parDaVisao.valido) {
+      logger.warn("ia: par provedor+modelo recusado antes da chamada", {
+        organization_id: orgId,
+        purpose: "visao_de_imagem",
+        provider: llm.provider,
+        model: llm.defaultModel ?? "",
+        origem_da_configuracao: origemDoModelo,
+        motivo: parDaVisao.motivo,
+      });
+      await avisarMidiaNaoLida(orgId, "imagem", parDaVisao.motivo);
+      return MARCADOR_NAO_LIDA;
+    }
+    const modelo = llm.defaultModel ?? "";
+    // ─── O TETO DE GASTO, ANTES DE SAIR BYTE ───────────────────────────────
+    //
+    // A visão grava custo em `llm_calls` e soma no gasto do mês, mas chama o
+    // provedor fora do `runModelCall` — então o "Parar a IA ao chegar no
+    // limite" barrava o atendimento e deixava a foto seguir saindo, paga.
+    // Fica depois de `validarParProvedorModelo` pela razão do seam: a recusa
+    // grava o modelo em `llm_calls` (`model text not null`), e antes dessa
+    // validação o nome não é confiável — gravar um valor inventado numa tabela
+    // de auditoria é pior que a linha faltando. De quebra, não se consulta o
+    // gasto de uma chamada que a configuração já impediu.
+    if (
+      await barradoPeloTeto({
+        tipo: "imagem",
+        oQueNaoSaiu: "a foto não foi enviada",
+        purpose: PONTO_VISAO_DE_IMAGEM,
+        provider: llm.provider,
+        model: modelo,
+        origem: origemDoModelo,
+      })
+    ) {
+      return MARCADOR_NAO_LIDA;
+    }
+    const inicio = Date.now();
+    let res: Awaited<ReturnType<typeof generateText>>;
+    try {
+      res = await generateText({
+        model: factory(llm.apiKey, modelo, baseUrlDaVisao ?? undefined),
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Descreva objetivamente esta imagem em 1-2 frases, em português, para um atendente de vendas entender o que o cliente enviou." },
+              // AI SDK v7: file part com mediaType (o antigo image part é deprecated).
+              { type: "file", data: buffer, mediaType: mime.split(";")[0]! },
+            ],
+          },
+        ],
+        // Sem teto, a OpenRouter reserva o MÁXIMO do modelo contra o saldo da
+        // chave e recusa com crédito baixo. O mesmo teto das respostas do
+        // agente: o que a organização configurou, ou 4096, muito acima da
+        // saída medida (máx. 182 tokens).
+        maxOutputTokens: tetoDeSaida(tetoDeSaidaDaOrganizacao(llm.params), undefined),
+      });
+    } catch (err) {
+      registrarChamadaDeMidia(admin, orgId, () =>
+        linhaDeFalha(err, { purpose: PONTO_VISAO_DE_IMAGEM, provider: llm.provider, model: modelo, inicio }),
+      );
+      throw err;
+    }
+    registrarChamadaDeMidia(admin, orgId, () => {
+      const latency_ms = Date.now() - inicio;
+      const uso = {
+        inputTokens: res.usage.inputTokens ?? 0,
+        outputTokens: res.usage.outputTokens ?? 0,
+        cacheReadTokens: res.usage.inputTokenDetails.cacheReadTokens ?? 0,
+        cacheWriteTokens: res.usage.inputTokenDetails.cacheWriteTokens ?? 0,
+      };
+      const linhaCom = (cost_cents: number | null): ChamadaDeMidia => ({
+        purpose: PONTO_VISAO_DE_IMAGEM,
+        provider: llm.provider,
+        model: modelo,
+        input_tokens: uso.inputTokens,
+        output_tokens: uso.outputTokens,
+        cache_read_tokens: uso.cacheReadTokens,
+        cache_write_tokens: uso.cacheWriteTokens,
+        cost_cents,
+        latency_ms,
+      });
+      // A mesma régua do seam: tabela estática primeiro; o catálogo da instalação só
+      // quando ela não conhece o modelo — e depois de o texto já ter voltado.
+      return custoComCatalogo(modelo, llm.provider, uso, linhaCom);
     });
     return res.text;
   };
@@ -699,22 +995,340 @@ function buildDeriveDeps(
   //
   // Só o degrau 1 (o serviço de transcrição do `.env`) aponta para um
   // endereço configurado à mão — por isso é o único que ainda passa pela
-  // recusa de destino interno antes da chave sair. Os degraus 2 e 3 vão para
+  // recusa de destino interno antes da chave sair. Os degraus 2, 3 e 4 vão para
   // o endereço público do provedor com a chave da própria organização.
   // `semTranscricao` continua sendo o fallback de quem não é áudio (vídeo e
-  // imagem têm o caminho deles), porque o degrau 4 `nada` já foi tratado no
+  // imagem têm o caminho deles), porque o degrau 5 `nada` já foi tratado no
   // corpo do handler — lá em cima, com `failed` + motivo.
+  //
+  // Todo degrau que transcreve passa por `comCustoRegistrado`: a chamada paga
+  // vira linha em `llm_calls`, sucesso ou falha. O provedor é o do ANÚNCIO da
+  // escada (#4697) — uma regra só, a mesma que a tela mostra.
+  // ─── O PROVEDOR DA LINHA É O QUE A ESCADA ANUNCIOU (#4697) ───────────────
+  //
+  // Aqui havia uma SEGUNDA regra de provedor, só para este ramo: com
+  // `TRANSCRIPTION_BASE_URL` preenchido, a linha saía com
+  // `provider = 'desconhecido'` mesmo quando a escada já sabia quem ouviu o
+  // áudio — era o `whisper-large-v3-turbo` da instalação real sempre como
+  // `desconhecido`, e o painel de uso não conseguia agrupar o gasto de áudio.
+  //
+  // O anúncio da escada (`escada-de-transcricao.ts`) já é a fonte única do que
+  // a tela mostra; nos degraus 1 e 2 ele diz `openai` como PROTOCOLO
+  // (`/v1/audio/transcriptions`), não como empresa — está escrito no tipo
+  // `AnuncioDaTranscricao`. Uma regra só, a mesma que o operador vê.
+  const comCusto = (servico: TranscriptionProvider): TranscriptionProvider =>
+    comCustoRegistrado(servico, {
+      admin,
+      orgId,
+      provider: decisao.anuncio.provider,
+      model: decisao.anuncio.modelId ?? "desconhecido",
+      origem: decisao.origem,
+    });
+  // O degrau 4 é o modelo de conversa da organização: chamada de LLM cobrada
+  // por token, então passa pelo teto antes de o áudio sair, como a visão.
+  const transcriberDoModelo = (servico: TranscriptionProvider): TranscriptionProvider => ({
+    transcribe: async (audio, mime) => {
+      if (
+        await barradoPeloTeto({
+          tipo: "áudio",
+          oQueNaoSaiu: "o áudio não foi enviado",
+          purpose: PONTO_TRANSCRICAO_DE_AUDIO,
+          provider: decisao.anuncio.provider,
+          model: decisao.anuncio.modelId ?? "",
+          origem: decisao.origem,
+        })
+      ) {
+        return MARCADOR_NAO_LIDA;
+      }
+      return servico.transcribe(audio, mime);
+    },
+  });
   const transcriber: DeriveDeps["transcriber"] = !decisao.transcriber
     ? semTranscricao
     : decisao.origem === "servico_da_instalacao"
-      ? transcriberDeServico(decisao.transcriber)
-      : decisao.transcriber;
+      ? transcriberDeServico(comCusto(decisao.transcriber))
+      : decisao.origem === "modelo_da_organizacao"
+        ? transcriberDoModelo(comCusto(decisao.transcriber))
+        : comCusto(decisao.transcriber);
   return {
     transcriber,
     describeImage,
     extractPdf: extractPdfText,
     // Onda 3.1: vídeo → ffmpeg (áudio+frames) reusando transcrição e visão da org.
     deriveVideo: (buffer) => deriveVideoText(buffer, { transcriber, describeImage }),
+  };
+}
+
+/** A linha de `llm_calls` de uma chamada deste worker, sem a organização. */
+interface ChamadaDeMidia {
+  purpose: typeof PONTO_VISAO_DE_IMAGEM | typeof PONTO_TRANSCRICAO_DE_AUDIO;
+  provider: string;
+  model: string;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  /** null = preço desconhecido; 0 diria "grátis" à tela de uso e ao teto. */
+  cost_cents: number | null;
+  latency_ms: number;
+  /**
+   * Na transcrição, o degrau da escada que ouviu o áudio. É o que separa a
+   * ausência de custo informado por serviço (degraus 1 a 3) do preço de LLM
+   * desconhecido (degrau 4), que acende o aviso.
+   */
+  origem_da_escolha?: OrigemDaTranscricao;
+  /** Ausente = `ok`. */
+  status?: "erro";
+  error_code?: string;
+  error_message?: string;
+  http_status?: number | null;
+}
+
+/**
+ * A linha de uma chamada que SAIU e falhou no provedor. Sem ela a tabela que
+ * explica ficava vazia justo no caso que precisa de explicação (a mesma lição
+ * de `registrarFalha` em `run-model-call.ts`, cuja classificação é reusada para
+ * as duas telas darem o mesmo nome ao mesmo erro).
+ */
+function linhaDeFalha(
+  err: unknown,
+  d: {
+    purpose: ChamadaDeMidia["purpose"];
+    provider: string;
+    model: string;
+    inicio: number;
+    origem?: OrigemDaTranscricao;
+  },
+): ChamadaDeMidia {
+  return {
+    purpose: d.purpose,
+    provider: d.provider,
+    model: d.model,
+    ...(d.origem ? { origem_da_escolha: d.origem } : {}),
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_write_tokens: 0,
+    cost_cents: null,
+    latency_ms: Date.now() - d.inicio,
+    status: "erro",
+    ...normalizarErro(err),
+  };
+}
+
+/**
+ * Grava em `llm_calls` uma chamada que JÁ saiu — visão, transcrição e os frames
+ * de vídeo, que passam pelas mesmas deps —, deu certo ou falhou. Sem esta linha
+ * o gasto de mídia ficava fora da tela de uso e do teto de orçamento, que leem
+ * `llm_calls`, e a falha ficava fora de Execuções.
+ *
+ * Insert direto, não `logInvocation`: o `InvocationKind` de lá espelha o CHECK
+ * de `ai_invocations` (invariante de vocabulário), e `llm_calls.purpose` não
+ * tem CHECK. Fire-and-forget: a linha de custo nunca derruba a derivação — e
+ * por isso a montagem também fica dentro do try.
+ *
+ * O provedor EFETIVO do binding já vinha informado por quem chama (a visão
+ * passa `llm.provider`) e continua vindo — o que muda é que ele atravessa a
+ * MESMA régua dos outros dois escritores (`provedorDaChamada`, #3098), para a
+ * coluna não voltar a ser preenchida por caminhos diferentes: o ponto de visão
+ * de imagem era o outro citado na issue como atribuído à OpenRouter por causa
+ * da barra no id do modelo.
+ */
+function registrarChamadaDeMidia(
+  admin: ReturnType<typeof createAdminClient>,
+  orgId: string,
+  montar: () => ChamadaDeMidia | Promise<ChamadaDeMidia>,
+): void {
+  const avisoDeMontagem = (err: unknown) => {
+    logger.warn("[media-derive] não consegui montar a linha de custo", {
+      organization_id: orgId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  };
+  const gravar = (linha: ChamadaDeMidia) => {
+    try {
+      void Promise.resolve(
+        admin.from("llm_calls").insert({
+          organization_id: orgId,
+          status: "ok",
+          ...linha,
+          provider: provedorDaChamada(linha.provider, linha.model),
+        }),
+      ).then(
+        ({ error }) => {
+          if (error) {
+            logger.warn("[media-derive] o banco recusou a linha de custo", {
+              organization_id: orgId,
+              purpose: linha.purpose,
+              error: error.message,
+            });
+          }
+        },
+        (err: unknown) => {
+          logger.warn("[media-derive] não consegui gravar a linha de custo", {
+            organization_id: orgId,
+            purpose: linha.purpose,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        },
+      );
+    } catch (err) {
+      avisoDeMontagem(err);
+    }
+  };
+  let montada: ChamadaDeMidia | Promise<ChamadaDeMidia>;
+  try {
+    montada = montar();
+  } catch (err) {
+    avisoDeMontagem(err);
+    return;
+  }
+  // Linha síncrona grava NA HORA, como sempre; só a que espera o catálogo vai
+  // para a cadeia que ninguém espera — o texto da mídia nunca depende dela.
+  if (montada instanceof Promise) void montada.then(gravar, avisoDeMontagem);
+  else gravar(montada);
+}
+
+/**
+ * O custo de uma chamada de mídia cobrada por token, pela MESMA régua do seam
+ * (`run-model-call.ts`): a tabela estática do motor primeiro; quando ela não conhece
+ * o modelo (provedor personalizado, modelo de catálogo), o preço do catálogo da
+ * instalação. Síncrono quando a tabela resolve — o INSERT sai na hora, como antes
+ * —, e uma promessa só no caso do catálogo. `custoDoModeloForaDoMotor` nunca
+ * rejeita: banco fora do ar vira custo nulo com aviso.
+ */
+function custoComCatalogo(
+  model: string,
+  provider: string,
+  uso: TokenUsage,
+  linhaCom: (cost_cents: number | null) => ChamadaDeMidia,
+): ChamadaDeMidia | Promise<ChamadaDeMidia> {
+  const daTabelaDoMotor = costCents(model, uso);
+  // A MESMA função que o seam usa (#4697): a ordem e a marca do custo saem de
+  // `custo-da-chamada.ts`, não de uma segunda cópia aqui.
+  const decidir = (doCatalogoDaInstalacao?: number | null) =>
+    decidirCustoDaChamada({
+      provider,
+      // Mesmo corte de DADO do seam: modelo tarifado com `usage` zerado daria
+      // `0` ("de graça") — vira nulo com motivo `sem_uso`.
+      temUso: haUsoMedido(uso),
+      informadoPeloProvedor: undefined,
+      daTabelaDoMotor,
+      doCatalogoDaInstalacao,
+    });
+  if (daTabelaDoMotor !== null) return linhaCom(decidir().costCents);
+  return custoDoModeloForaDoMotor(derivePool(), { model, provider, usage: uso, log: logger }).then((doCatalogo) =>
+    linhaCom(decidir(doCatalogo).costCents),
+  );
+}
+
+/**
+ * "Custo nulo por tarifa desconhecida" DITO, uma vez por (provedor, modelo) —
+ * a metade explícita do contrato da #4697, a mesma que
+ * `custoDoModeloForaDoMotor` já aplica ao modelo cobrado por token. Sem este
+ * aviso, uma transcrição cobrada por duração e sem tarifa na tabela gravava
+ * `cost_cents` nulo em silêncio: indistinguível de "grátis" para quem lê o log.
+ *
+ * `Set` de módulo, como `avisados` do catálogo: a nota de voz é o caminho mais
+ * quente do worker e um aviso por áudio inundaria o log sem dizer nada novo.
+ */
+const tarifasDeAudioAvisadas = new Set<string>();
+function avisarTarifaDeAudioDesconhecida(provider: string, model: string): void {
+  const chave = `${provider}|${model}`;
+  if (tarifasDeAudioAvisadas.has(chave)) return;
+  tarifasDeAudioAvisadas.add(chave);
+  logger.warn("[media-derive] transcrição cobrada por duração sem tarifa conhecida — a linha grava custo nulo", {
+    provider,
+    model,
+  });
+}
+
+/**
+ * Embrulha o provedor que de fato chama o serviço pago. As recusas (sem chave,
+ * destino não aceito, teto de gasto) ficam FORA deste embrulho, então não
+ * gravam linha de custo.
+ *
+ * Dois tipos de cobrança passam aqui. O modelo de conversa (degrau 4) é LLM
+ * cobrado por token e devolve o uso (`transcribeMedindo`): a linha leva tokens
+ * e o custo pela régua do seam — a tabela de preços e, quando ela não conhece o
+ * modelo, o catálogo da instalação —, nulo só quando nenhum dos dois o conhece.
+ * O serviço `/v1/audio/transcriptions` (degraus 1 a 3) usa o custo informado
+ * pela API: o `usage.cost` em USD da OpenRouter, ou a duração que a OpenAI
+ * cobra (`usage.seconds` do `whisper-1`) vezes o preço por minuto. Sem esse
+ * dado, fica null; não se estima preço por tokens nem se inventa zero.
+ */
+function comCustoRegistrado(
+  servico: TranscriptionProvider,
+  ctx: {
+    admin: ReturnType<typeof createAdminClient>;
+    orgId: string;
+    provider: string;
+    model: string;
+    origem: OrigemDaTranscricao;
+  },
+): TranscriptionProvider {
+  return {
+    transcribe: async (audio, mime) => {
+      const inicio = Date.now();
+      let texto: string;
+      let uso: TokenUsage | null = null;
+      let custoInformado: number | null | undefined;
+      try {
+        if (servico.transcribeMedindo) {
+          ({ texto, uso, custoCents: custoInformado } = await servico.transcribeMedindo(audio, mime));
+        } else {
+          texto = await servico.transcribe(audio, mime);
+        }
+      } catch (err) {
+        // Limite recusado antes do fetch não é chamada paga nem falha da API.
+        if (err instanceof TranscriptionTooLargeError) throw err;
+        registrarChamadaDeMidia(ctx.admin, ctx.orgId, () =>
+          linhaDeFalha(err, {
+            purpose: PONTO_TRANSCRICAO_DE_AUDIO,
+            provider: ctx.provider,
+            model: ctx.model,
+            inicio,
+            origem: ctx.origem,
+          }),
+        );
+        throw err;
+      }
+      registrarChamadaDeMidia(ctx.admin, ctx.orgId, () => {
+        const latency_ms = Date.now() - inicio;
+        const linhaCom = (cost_cents: number | null): ChamadaDeMidia => ({
+          purpose: PONTO_TRANSCRICAO_DE_AUDIO,
+          provider: ctx.provider,
+          model: ctx.model,
+          origem_da_escolha: ctx.origem,
+          input_tokens: uso?.inputTokens ?? 0,
+          output_tokens: uso?.outputTokens ?? 0,
+          cache_read_tokens: uso?.cacheReadTokens ?? 0,
+          cache_write_tokens: uso?.cacheWriteTokens ?? 0,
+          cost_cents,
+          latency_ms,
+        });
+        // Custo informado pelo serviço (USD da OpenRouter, duração cobrada pela
+        // OpenAI) vence; o modelo de conversa (degrau 4) vai pela régua do seam.
+        if (custoInformado !== undefined) return linhaCom(custoInformado);
+        if (uso) return custoComCatalogo(ctx.model, ctx.provider, uso, linhaCom);
+        // Sem uso e sem tarifa informada, o custo é DESCONHECIDO — nulo, nunca
+        // zero (0 diria "grátis" ao painel e ao teto). A #4697 pede que o nulo
+        // não seja CALADO: o motivo sai uma vez por (provedor, modelo), como o
+        // aviso de sem-preço do catálogo. A decisão é a da MESMA regra do seam.
+        avisarTarifaDeAudioDesconhecida(ctx.provider, ctx.model);
+        return linhaCom(
+          decidirCustoDaChamada({
+            provider: ctx.provider,
+            // Aqui o uso EXISTE (a duração gravada é a medida do áudio); o que
+            // falta é a TARIFA. Marcar `sem_uso` mentiria sobre o motivo.
+            temUso: true,
+            informadoPeloProvedor: undefined,
+            daTabelaDoMotor: null,
+          }).costCents,
+        );
+      });
+      return texto;
+    },
   };
 }
 
@@ -737,25 +1351,75 @@ export { MARCADOR_NAO_LIDA };
  * fazer, em português; a frase crua do provedor, quando existe, no fim e
  * rotulada (`DETALHE_TECNICO`) — mesma regra do aviso de evento morto.
  */
-export function textoDoAvisoDeMidiaNaoLida(aviso: {
-  tipo: string;
-  motivo: string;
-  consequencia: string;
-  detalheTecnico?: string;
-}): { title: string; body: string } {
+/**
+ * Uma frase do aviso que leva valor de runtime (nome de modelo, de provedor):
+ * a CHAVE vai ao dicionário com `{marcadores}` e os valores entram depois da
+ * tradução. Valor `{ traduzivel }` é frase fixa do produto e também é traduzido.
+ */
+export interface FraseDoAviso {
+  chave: string;
+  valores: Readonly<Record<string, string | number | { traduzivel: string }>>;
+}
+
+/** A frase no idioma da organização. `pt-BR` devolve o texto de antes, byte a byte. */
+function fraseNoIdioma(frase: string | FraseDoAviso, idioma: Idioma): string {
+  if (typeof frase === "string") return traduzir(frase, idioma);
+  const valores: Record<string, string | number> = {};
+  for (const [nome, valor] of Object.entries(frase.valores)) {
+    valores[nome] = typeof valor === "object" ? traduzir(valor.traduzivel, idioma) : valor;
+  }
+  return preencher(traduzir(frase.chave, idioma), valores);
+}
+
+/** O título por tipo de mídia: uma frase inteira por tipo, para cada idioma poder concordar. */
+const TITULO_DA_MIDIA_NAO_LIDA: Record<string, string> = {
+  imagem: "O agente não conseguiu ler imagem que o cliente enviou",
+  "áudio": "O agente não conseguiu ler áudio que o cliente enviou",
+  documento: "O agente não conseguiu ler documento que o cliente enviou",
+  "vídeo": "O agente não conseguiu ler vídeo que o cliente enviou",
+  "mídia": "O agente não conseguiu ler mídia que o cliente enviou",
+};
+
+export function textoDoAvisoDeMidiaNaoLida(
+  aviso: {
+    tipo: string;
+    motivo: string | FraseDoAviso;
+    consequencia: string;
+    detalheTecnico?: string;
+    /** Quando a saída não é modelo nem chave (ex.: o teto de gasto), o padrão mandaria o operador ao lugar errado. */
+    paraResolver?: string;
+  },
+  /**
+   * A Central mostra o texto como foi gravado (nunca passa por `t()`), então o
+   * aviso nasce no idioma da organização. O detalhe técnico é a frase crua do
+   * provedor e segue como veio.
+   */
+  idioma: Idioma = IDIOMA_PADRAO,
+): { title: string; body: string } {
+  const titulo = Object.hasOwn(TITULO_DA_MIDIA_NAO_LIDA, aviso.tipo)
+    ? traduzir(TITULO_DA_MIDIA_NAO_LIDA[aviso.tipo]!, idioma)
+    : preencher(traduzir("O agente não conseguiu ler {tipo} que o cliente enviou", idioma), { tipo: aviso.tipo });
+  const paraResolver =
+    aviso.paraResolver === undefined
+      ? traduzir(
+          "Para resolver, ajuste o modelo desse ponto em Agente de IA → Provedores, ou cadastre a chave necessária em Credenciais.",
+          idioma,
+        )
+      : traduzir(aviso.paraResolver, idioma);
   return {
-    title: `O agente não conseguiu ler ${aviso.tipo} que o cliente enviou`,
+    title: titulo,
     body:
-      `Motivo: ${aviso.motivo}. ${aviso.consequencia} ` +
-      `Para resolver, ajuste o modelo desse ponto em Agente de IA → Provedores, ou cadastre a chave necessária em Credenciais.` +
-      (aviso.detalheTecnico ? ` ${DETALHE_TECNICO} ${aviso.detalheTecnico}` : ""),
+      preencher(traduzir("Motivo: {motivo}.", idioma), { motivo: fraseNoIdioma(aviso.motivo, idioma) }) +
+      ` ${traduzir(aviso.consequencia, idioma)} ` +
+      paraResolver +
+      (aviso.detalheTecnico ? ` ${traduzir(DETALHE_TECNICO, idioma)} ${aviso.detalheTecnico}` : ""),
   };
 }
 
 async function avisarMidiaNaoLida(
   organizationId: string,
   tipo: string,
-  motivo: string,
+  motivo: string | FraseDoAviso,
   /**
    * O que aconteceu com o atendimento. O padrão vale para as recusas, que
    * entregam o marcador ao agente; a falha permanente não entrega nada.
@@ -763,6 +1427,7 @@ async function avisarMidiaNaoLida(
   consequencia = "Enquanto isso, o agente responde avisando que não conseguiu abrir o arquivo.",
   /** A frase crua do provedor ou do armazenamento, quando houver — vai no fim, rotulada. */
   detalheTecnico?: string,
+  paraResolver?: string,
 ): Promise<void> {
   try {
     const admin = createAdminClient();
@@ -776,6 +1441,9 @@ async function avisarMidiaNaoLida(
       .maybeSingle();
     if (jaAberto) return;
 
+    // Nunca lança: sem o idioma, o aviso sai em português, como antes.
+    const idioma = await idiomaDoAviso(admin, organizationId);
+
     // `warn`, não `warning`: o CHECK de `agent_inbox_items.severity` aceita
     // info|warn|critical. Com o valor errado o INSERT era recusado com 23514 —
     // e o aviso NUNCA abria. A Central ficava vazia exatamente no caso que esta
@@ -784,7 +1452,7 @@ async function avisarMidiaNaoLida(
       organization_id: organizationId,
       kind: "midia_nao_lida",
       severity: "warn",
-      ...textoDoAvisoDeMidiaNaoLida({ tipo, motivo, consequencia, detalheTecnico }),
+      ...textoDoAvisoDeMidiaNaoLida({ tipo, motivo, consequencia, detalheTecnico, paraResolver }, idioma),
     });
     // E o retorno é CONFERIDO. O supabase-js devolve `{ error }` em vez de
     // lançar, então o `catch` abaixo era inalcançável para erro de banco: a

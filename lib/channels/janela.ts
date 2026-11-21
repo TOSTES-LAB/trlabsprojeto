@@ -27,7 +27,7 @@
  * sozinha — parecendo autoritativa justamente quando já está errada.
  */
 import { capabilitiesOf } from "./capabilities";
-import { WINDOW_MS, windowRemainingMs } from "@/lib/agent-engine/guardrails/messaging-window";
+import { WINDOW_MS, isWindowOpen, windowRemainingMs } from "@/lib/agent-engine/guardrails/messaging-window";
 import type { ChannelProvider } from "./types";
 
 export type EstadoDaJanela =
@@ -47,6 +47,34 @@ export type EstadoDaJanela =
   | { tipo: "fechada"; fechadaHaMs: number | null };
 
 /**
+ * A janela REGULATÓRIA de 24 h se aplica a este canal?
+ *
+ * A pergunta é de ESCOPO, não de horário, e é a que separa as duas famílias da
+ * doutrina (`docs/doctrine/restricao-de-canal.md`):
+ *
+ *  - hetero-restrição (`meta_cloud` e os parceiros que espelham a Cloud API) —
+ *    fora das 24 h desde a última mensagem do cliente, a plataforma RECUSA
+ *    texto livre (131047) e só modelo aprovado passa;
+ *  - auto-restrição (`waha`, a conexão por QR) — fala quando quiser; o que a
+ *    limita é o risco de banimento, que é outra régua (o anti-ban do pacing).
+ *
+ * A resposta vem da CAPACIDADE declarada em `capabilities.ts`, nunca do nome do
+ * provedor: `waha` é o nome de hoje, e uma conexão por QR de outro provedor não
+ * pode herdar a janela por não estar numa lista de exceções. Provider ausente
+ * ou fora da matriz responde `false` — a MESMA direção de
+ * `canalAceitaTextoLivreAgora`: barrar por uma regra que não está MEDIDA
+ * puniria um canal que talvez envie.
+ */
+export function aJanelaRegulatoriaSeAplica(provider: string | null | undefined): boolean {
+  if (!provider) return false;
+  try {
+    return capabilitiesOf(provider as ChannelProvider).freeformOutsideWindow === false;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * O estado da janela desta conversa, agora.
  *
  * `provider` nulo devolve `sem_restricao` — conversa sem sessão resolvida não
@@ -60,10 +88,14 @@ export function estadoDaJanela(
 ): EstadoDaJanela {
   if (!provider) return { tipo: "sem_restricao" };
 
-  const caps = capabilitiesOf(provider as ChannelProvider);
+  // `capabilitiesOf` primeiro de propósito: provider fora da matriz LANÇA aqui,
+  // e é o contrato que quem chama já trata (`canalAceitaTextoLivreAgora` engole,
+  // os outros propagam). A pergunta de escopo abaixo é a MESMA função que o
+  // caminho de envio usa — ver `aJanelaRegulatoriaSeAplica`.
+  capabilitiesOf(provider as ChannelProvider);
   // `freeformOutsideWindow: true` = o canal aceita texto livre a qualquer hora.
   // Mostrar um relógio nele seria inventar uma urgência que não existe.
-  if (caps.freeformOutsideWindow) return { tipo: "sem_restricao" };
+  if (!aJanelaRegulatoriaSeAplica(provider)) return { tipo: "sem_restricao" };
 
   if (!lastInboundAt) return { tipo: "fechada", fechadaHaMs: null };
 
@@ -75,6 +107,35 @@ export function estadoDaJanela(
   // diferem em exatamente 24h, e o que o operador pergunta é "passei muito?".
   const fechadaHaMs = Math.max(0, agora.getTime() - (ultimo.getTime() + WINDOW_MS));
   return { tipo: "fechada", fechadaHaMs };
+}
+
+/**
+ * Este canal consegue mandar texto livre AGORA — ou o que sair vai ser recusado
+ * na entrega (issue #2595)?
+ *
+ * `estadoDaJanela` é a régua; este predicado é só o veredito "não está fechada"
+ * para quem vai ENVIAR, não para quem mostra relógio. O primeiro consumidor é o
+ * cron de lembrete de agenda, que antes deste fix escolhia o primeiro canal
+ * WORKING e carimbava "enviado" o que a Meta recusa com 131047 — o mesmo engano
+ * medido e documentado em `capabilities.ts`.
+ *
+ * Provider que a matriz NÃO conhece (linha de voz, provider mais novo que esta
+ * imagem) responde `true`: `estadoDaJanela` lança ali, e barrar o envio por uma
+ * regra que não existe puniria um canal que talvez envie — quem barre é só o
+ * `freeformOutsideWindow: false` MEDIDO. Mesma direção de
+ * `lib/agent-engine/agent/followup-turn.ts`, que lê o canal não encontrado como
+ * "não fechado" em vez de travar.
+ */
+export function canalAceitaTextoLivreAgora(
+  provider: string | null | undefined,
+  lastInboundAt: string | null,
+  agora: Date,
+): boolean {
+  // A decisão de ESCOPO primeiro: canal sem janela regulatória aceita texto
+  // livre agora, e nem chega a olhar o relógio. É a MESMA função que
+  // `estadoDaJanela` usa — um lugar só decide se a regra vale para este canal.
+  if (!aJanelaRegulatoriaSeAplica(provider)) return true;
+  return isWindowOpen(agora, lastInboundAt === null ? null : new Date(lastInboundAt));
 }
 
 /**
