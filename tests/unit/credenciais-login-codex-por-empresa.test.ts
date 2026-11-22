@@ -28,7 +28,11 @@ vi.hoisted(() => {
   process.env.AI_CRED_AES_KEY = "iBc1Z2gYaAH4rEHs1dHQ2dvNQ6t4OfrdE1/Y6OSvtZY=";
 });
 
-import { guardarCredencial, rotacionarCredencial } from "@/lib/ai/credenciais/guardar";
+import {
+  guardarCredencial,
+  guardarCredencialDoLogin,
+  rotacionarCredencial,
+} from "@/lib/ai/credenciais/guardar";
 import {
   guardarLoginCodex,
   lerLoginCodex,
@@ -68,6 +72,8 @@ function admin() {
 const tokens: TokensDoCodex = {
   access_token: "at-1234567890",
   refresh_token: "rt-9876543210",
+  client_id: "siwc-client-test",
+  scopes: ["chatgpt.tokens.use.direct"],
   expires_at: null,
 };
 
@@ -79,15 +85,15 @@ beforeEach(() => {
 describe("gravar a conta da empresa (itens 3 e 4)", () => {
   it("a gravação nasce com validated_at e o last4 é o do access_token", async () => {
     const fake = admin();
-    const r = await guardarCredencial({
+    const r = await guardarCredencialDoLogin({
       admin: fake as never,
       orgId: org,
       userId: user,
-      provider: PROVEDOR_POR_ASSINATURA,
       label: "Assinatura do Codex (ChatGPT)",
       apiKey: JSON.stringify(tokens),
     });
     expect(r.ok).toBe(true);
+    expect(fake.linha!.provider).toBe(PROVEDOR_POR_ASSINATURA);
     const linha = fake.linha!;
     expect(typeof linha.validated_at).toBe("string");
     expect(linha.validated_at).not.toBeNull();
@@ -97,6 +103,39 @@ describe("gravar a conta da empresa (itens 3 e 4)", () => {
     expect(validateProviderKey).not.toHaveBeenCalled();
     // E o segredo nunca vai em claro.
     expect(String(linha.api_key_encrypted)).not.toContain("rt-9876543210");
+  });
+
+  // O cadastro GENÉRICO (rota REST, onboarding) recebe texto colado. Se ele
+  // aceitasse a assinatura, o texto nasceria "validado" — a marca acima — sem
+  // login nenhum. Vale com o módulo LIGADO (o `beforeEach` o liga): a credencial
+  // só nasce pelo login, nunca por colagem.
+  it("o cadastro genérico recusa a assinatura e não grava nada", async () => {
+    const fake = admin();
+    const r = await guardarCredencial({
+      admin: fake as never,
+      orgId: org,
+      userId: user,
+      provider: PROVEDOR_POR_ASSINATURA,
+      label: "colada",
+      apiKey: "sk-texto-colado-qualquer",
+    });
+    expect(r).toEqual({ ok: false, motivo: "assinatura_so_pelo_login" });
+    expect(fake.linha).toBeNull();
+  });
+
+  it("o cadastro genérico segue gravando os outros provedores, sem marca de validada", async () => {
+    const fake = admin();
+    const r = await guardarCredencial({
+      admin: fake as never,
+      orgId: org,
+      userId: user,
+      provider: "openai",
+      label: "chave da openai",
+      apiKey: "sk-chave-da-openai-1234",
+    });
+    expect(r.ok).toBe(true);
+    expect(fake.linha!.provider).toBe("openai");
+    expect(fake.linha!.validated_at ?? null).toBeNull();
   });
 
   it("rotacionar o par de tokens CONFIRMA o login em vez de zerar o validated_at", async () => {
@@ -120,6 +159,29 @@ describe("gravar a conta da empresa (itens 3 e 4)", () => {
     expect(r.ok).toBe(true);
     expect(typeof fake.linha!.validated_at).toBe("string");
     expect(validateProviderKey).not.toHaveBeenCalled();
+  });
+
+  it("reconectar (pode ser outra conta) zera a lista de modelos", async () => {
+    const fake = admin();
+    fake.linha = {
+      id: credId,
+      organization_id: org,
+      provider: PROVEDOR_POR_ASSINATURA,
+      label: "Assinatura do Codex (ChatGPT)",
+      is_active: true,
+      models_available: ["gpt-da-conta-antiga"],
+      updated_at: new Date(Date.now() - 60_000).toISOString(),
+    };
+    const r = await rotacionarCredencial({
+      admin: fake as never,
+      orgId: org,
+      userId: user,
+      credentialId: credId,
+      provider: PROVEDOR_POR_ASSINATURA,
+      apiKey: JSON.stringify({ ...tokens, access_token: "at-outra-conta" }),
+    });
+    expect(r.ok).toBe(true);
+    expect(fake.linha!.models_available).toBeNull();
   });
 
   it("com o módulo da instalação desligado, nada é gravado", async () => {
@@ -268,6 +330,21 @@ describe("a trava de renovação está NO BANCO (item 8)", () => {
       expect(r.ok).toBe(true);
       expect(vi.mocked(audit).mock.calls.map(([e]) => e.actorUserId)).toEqual([userId]);
     }
+  });
+
+  it("a renovação automática mantém a lista de modelos da conta (senão todo Publicar dá model_not_found)", async () => {
+    const fake = admin();
+    fake.linha = { ...linhaCifrada(), models_available: ["gpt-6-luna", "gpt-6"] };
+    const r = await renovarComTravaDeBanco({
+      admin: fake as never,
+      orgId: org,
+      credentialId: credId,
+      userId: null,
+      renovar: async (atuais) => ({ ...atuais, access_token: "at-renovado" }),
+    });
+    expect(r.ok).toBe(true);
+    expect(fake.linha!.models_available).toEqual(["gpt-6-luna", "gpt-6"]);
+    expect(typeof fake.linha!.validated_at).toBe("string");
   });
 });
 

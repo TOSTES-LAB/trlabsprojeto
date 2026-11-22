@@ -74,7 +74,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
 
-import { test, expect, type Page, type Locator } from "./helpers/test";
+import { esperarARevelacaoNasCargas, test, expect, type Page, type Locator } from "./helpers/test";
 
 import { generateTotp, msUntilNextTotpWindow } from "./utils/totp";
 
@@ -358,9 +358,14 @@ function anotar(nome: string, dado: unknown): void {
   fs.writeFileSync(evidencia(nome), JSON.stringify(dado, null, 2) + "\n", "utf8");
 }
 
-/** O cabeçalho da barra lateral: o primeiro filho do `<aside>` (`h-14`, `border-b`). */
+/**
+ * O cabeçalho da barra lateral (`h-14`, `border-b`): o primeiro `div` do `<aside>`
+ * que tem essas duas classes. Não `aside > div` — a tela Aparência (#4635) pôs um
+ * painel (`data-casca="menu-painel"`) entre o `<aside>` e o conteúdo, e o "primeiro
+ * filho" passou a ser o menu inteiro (720px), sem o cabeçalho ter mudado um pixel.
+ */
 function cabecalhoDaBarra(page: Page): Locator {
-  return page.locator("aside > div").first();
+  return page.locator("aside div.h-14.border-b").first();
 }
 
 async function medirCaixa(alvo: Locator): Promise<Caixa> {
@@ -454,6 +459,7 @@ test.describe("a moldura do logo no tema escuro", () => {
     // que o navegador de quem escolheu escuro e saiu da conta já faz sozinho.
     for (const tema of ["dark", "light"] as const) {
       const contexto = await browser.newContext();
+      contexto.on("page", esperarARevelacaoNasCargas);
       try {
         const pagina = await contexto.newPage();
         await pagina.addInitScript((t) => window.localStorage.setItem("deskcomm-theme", t), tema);
@@ -628,6 +634,7 @@ test.describe("a moldura do logo no tema escuro", () => {
       expect(fundoETransparente((await medirMoldura(logo)).fundo)).toBe(true);
       await page.screenshot({ path: evidencia(`7-barra-${tema}.png`) });
       const contexto = await browser.newContext();
+      contexto.on("page", esperarARevelacaoNasCargas);
       try {
         const fachada = await contexto.newPage();
         await fachada.addInitScript((t) => localStorage.setItem("deskcomm-theme", t), tema);
@@ -653,9 +660,20 @@ test.describe("a moldura do logo no tema escuro", () => {
       "src",
       urlClara!,
     );
-    expect(
-      fundoEClaro((await medirMoldura(page.locator("[data-previa-do-logo='escuro'] img"))).fundo),
-    ).toBe(true);
+    // Poll, não leitura única: a moldura chega ~80ms DEPOIS do src (re-render do
+    // refresh do remover()), e a leitura única caía nessa janela — o MESMO commit
+    // de prévia passou e falhou no CI (#1218). Moldura que nunca chega ainda reprova.
+    await expect
+      .poll(
+        async () => {
+          const m = await medirMoldura(page.locator("[data-previa-do-logo='escuro'] img"));
+          return fundoEClaro(m.fundo)
+            ? "claro"
+            : `${m.fundo} em <${m.tagDoPai} class="${m.classeDoPai}">`;
+        },
+        { message: "moldura branca atrás do logo claro na prévia escura", timeout: 5_000 },
+      )
+      .toBe("claro");
     await page.reload();
     await expect(page.locator("[data-previa-do-logo='claro'] img")).toHaveAttribute(
       "src",
@@ -671,6 +689,7 @@ test.describe("a moldura do logo no tema escuro", () => {
    */
   test.afterAll(async ({ browser }) => {
     const contexto = await browser.newContext();
+    contexto.on("page", esperarARevelacaoNasCargas);
     try {
       const pagina = await contexto.newPage();
       await loginComTotp(pagina, creds.users.dono!.email, secret());

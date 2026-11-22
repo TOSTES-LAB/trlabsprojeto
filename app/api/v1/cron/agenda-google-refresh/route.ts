@@ -40,6 +40,7 @@ import { classificarErroDoGoogle, estadoDaConexaoApos } from "@/lib/agenda/googl
 import { fundirTokens, precisaRenovar, type TokenDoGoogle } from "@/lib/agenda/google/oauth";
 import { renovarToken } from "@/lib/agenda/google/token";
 import { autorizaCron } from "@/lib/auth/cron-auth";
+import { comIdDaRequisicao } from "@/lib/api/wrappers";
 
 export const dynamic = "force-dynamic";
 
@@ -132,7 +133,12 @@ export async function renovarAgendasDoGoogle(
 
     const leitura = await renovarToken(app, refresh, { agora: opcoes.agora });
     if (!leitura.ok) {
-      const classificacao = classificarErroDoGoogle({ error: leitura.detalhe }, "token");
+      // O status vai junto (#2393): sem ele, uma recusa 400 do Google virava
+      // "sem resposta" na tela e `transitorio` na classificação.
+      const classificacao = classificarErroDoGoogle(
+        { error: leitura.detalhe, status: leitura.status },
+        "token",
+      );
       const novoEstado = estadoDaConexaoApos(classificacao.desfecho);
       if (novoEstado && novoEstado !== "healthy") {
         await marcarConexao(admin, linha, novoEstado, classificacao.mensagem);
@@ -205,10 +211,10 @@ async function marcarConexao(
 
 async function executar(req: NextRequest): Promise<Response> {
   if (!autorizaCron(req)) {
-    return NextResponse.json({ error: { code: "unauthenticated", message: "cron secret inválido" } }, { status: 401 });
+    return comIdDaRequisicao(NextResponse.json({ error: { code: "unauthenticated", message: "cron secret inválido" } }, { status: 401 }), req);
   }
   const resumo = await renovarAgendasDoGoogle(createAdminClient(), { agora: new Date() });
-  return NextResponse.json({ data: resumo });
+  return comIdDaRequisicao(NextResponse.json({ data: resumo }), req);
 }
 
 export async function GET(req: NextRequest): Promise<Response> {
