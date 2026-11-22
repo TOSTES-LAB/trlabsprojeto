@@ -39,14 +39,32 @@ projeto** e preenche as quatro sozinho (`hostgator-setup-kit/supabase-provision.
 | `APP_ACCENT_HEX` (ex. `#7a5cd6`) | a cor do produto (verde) na tela e nos e-mails |
 | `SUPPORT_EMAIL` | a tela de "conta suspensa" fica sem endereço de contato |
 | `RESEND_API_KEY` + `RESEND_FROM_EMAIL` | envio de e-mail **desligado**: o convite mostra o link de aceite na própria tela; o export de LGPD fica pendente. O remetente precisa ser de um domínio **verificado** na Resend, senão toda tentativa falha com mensagem opaca |
-| Telemetria (`s/N`, padrão **não enviar**) | só erros, com CPF/telefone/e-mail redigidos, sem replay. `--yes` → não envia. Copiando o `.env` do exemplo a pergunta não aparece e sai **ligada** (issue #668) — escreva `SENTRY_DSN=off` |
+| Telemetria (`s/N`, padrão **não enviar**) | só erros, com CPF/telefone/e-mail redigidos, sem replay. `--yes` → não envia (`SENTRY_DSN=off`). Para aceitar o Sentry do projeto: `SENTRY_DSN=comunidade` — o campo vazio significa **desligado** (issue #4936) |
 
 ## O que o instalador gera sozinho (não peça)
 
 `INTERNAL_SECRET`, `INTERNAL_CRON_SECRET`, chaves de cifra (CPF, credenciais de IA, WAHA próprio,
 Nuvemshop), `IMPERSONATE_COOKIE_SECRET`, `LGPD_SIGNING_KEY`, segredo e chave do WAHA (com o hash
-SHA-512 que o contêiner exige), token do Redis. Vazios mas preservados: Google Calendar, VAPID (push),
-`APP_LOGO_URL`, gateway de IA.
+SHA-512 que o contêiner exige), token do Redis e o par VAPID dos avisos com o app fechado (uma vez só;
+nunca troque — trocar desliga os avisos de todo aparelho inscrito). Vazios mas preservados: Google
+Calendar, `APP_LOGO_URL`, gateway de IA.
+
+## Google Calendar e o "Meet com acesso aberto" (issue #2063)
+
+No self-host quem conecta a agenda é o próprio operador, com o app OAuth **dele**. A agenda
+funciona sem mais nada; o que precisa de passo extra é a opção **"Google Meet com acesso
+aberto"** (Configurações › Tipos de agendamento), e ela pede duas coisas no projeto Google Cloud
+da organização:
+
+1. **Meet API habilitada** — `spaces.create` é da API do Meet, não do Calendar.
+2. **Escopo `meetings.space.created` na tela de consentimento** — só ele faz o Google conceder a
+   permissão de criar espaços. Com a opção já ligada, um **reconectar** da agenda (Agenda ›
+   Conectar Google) já pede o escopo sozinho: a tela de consentimento só concede o que estiver
+   escrito nela.
+
+Sem as duas, o Google recusa a criação do espaço aberto e a reunião nasce com o Meet "confiável"
+do Calendar — o link que pede para participar. Nunca sem link: é a escolha declarada do produto
+(#2089). A mesma frase aparece ao lado do interruptor, de quem está configurando.
 
 ## As quatro fases que ele imprime
 
