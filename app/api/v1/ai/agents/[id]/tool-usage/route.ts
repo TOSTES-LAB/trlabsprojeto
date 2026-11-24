@@ -16,22 +16,31 @@
  * manager — "nunca usada" indistinguível de "você não pode ver", que é o pior
  * tipo de mentira que uma tela pode contar. O que sai daqui é agregado: nome da
  * capacidade e contagens, nunca o `metadata` cru do audit (que carrega os
- * argumentos da chamada). `organization_id` vem do cookie via `requireRole` e
- * filtra explicitamente, como manda o CLAUDE.md para todo uso de service role.
+ * argumentos da chamada). `organization_id` vem de `resolveAuthDual` (cookie
+ * pela sessão, linha do token pelo Bearer) e filtra explicitamente, como manda
+ * o CLAUDE.md para todo uso de service role.
+ *
+ * Sessão OU token de integração (Spec 33, R1): o token precisa de `config:read`
+ * e de papel admin (`tokenRole`). As duas funções do banco que esta rota chama
+ * recebem a organização de `authz.organizationId`, nunca do path.
  */
 import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
 
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { ok, fail } from "@/lib/api/wrappers";
-import { requireRole } from "@/lib/auth/require-role";
+import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
 import {
   montarUsoDeCapacidades,
   resumirUso,
+  termosSemResultado,
+  type LinhaDeTermo,
   type LinhaDeUso,
 } from "@/lib/ai/agents/uso-de-capacidades";
 import { TOOL_CATALOG } from "@/lib/mcp/tools/catalog";
+import { IDIOMA_PADRAO } from "@/lib/i18n/idiomas";
 import { traduzir } from "@/lib/i18n/dicionario";
 
 export const dynamic = "force-dynamic";
@@ -49,10 +58,18 @@ export async function GET(req: NextRequest, ctx: Ctx): Promise<Response> {
   const { id } = await ctx.params;
   if (!UUID_RX.test(id)) return fail("invalid_request", "id inválido.", 400, { requestId });
 
-  const authz = await requireRole("manager", { requestId, resource: "ai_agents" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "ai_agents",
+    role: "manager",
+    scope: "config:read",
+    tokenRole: "admin",
+  });
   if (!authz.ok) return authz.response;
-  const t = (texto: string) => traduzir(texto, authz.user.idioma);
-  const { org: activeOrg } = authz;
+  const teto = await tetoDeEscritaDoToken(authz, "ai_agents", requestId);
+  if (teto) return teto;
+  const t = (texto: string) => traduzir(texto, authz.idioma ?? IDIOMA_PADRAO);
+  const { organizationId } = authz;
 
   const parsed = querySchema.safeParse({
     days: req.nextUrl.searchParams.get("days") ?? undefined,
@@ -73,7 +90,7 @@ export async function GET(req: NextRequest, ctx: Ctx): Promise<Response> {
   const { data: agente, error: erroAgente } = await admin
     .from("ai_agents")
     .select("id, published_version_id")
-    .eq("organization_id", activeOrg.orgId)
+    .eq("organization_id", organizationId)
     .eq("id", id)
     .maybeSingle();
   if (erroAgente) return fail("internal_error", "Erro ao carregar o agente.", 500, { requestId });
@@ -85,13 +102,13 @@ export async function GET(req: NextRequest, ctx: Ctx): Promise<Response> {
     ? await admin
         .from("ai_agent_versions")
         .select("id, tool_ids, status, created_at")
-        .eq("organization_id", activeOrg.orgId)
+        .eq("organization_id", organizationId)
         .eq("id", agente.published_version_id)
         .maybeSingle()
     : await admin
         .from("ai_agent_versions")
         .select("id, tool_ids, status, created_at")
-        .eq("organization_id", activeOrg.orgId)
+        .eq("organization_id", organizationId)
         .eq("agent_id", id)
         .order("created_at", { ascending: false })
         .limit(1)
@@ -102,13 +119,44 @@ export async function GET(req: NextRequest, ctx: Ctx): Promise<Response> {
   );
 
   const { data: linhas, error: erroUso } = await admin.rpc("fn_agent_tool_usage", {
-    p_organization_id: activeOrg.orgId,
+    p_organization_id: organizationId,
     p_agent_id: id,
     p_since: desde,
   });
   if (erroUso) {
     return fail("internal_error", "Erro ao ler o uso das capacidades.", 500, { requestId });
   }
+
+  // A leitura POR TERMO (#484, caminho 2): "crm_search_products falhou 12×" não
+  // diz QUAL termo não foi encontrado. A irmã de `fn_agent_tool_usage` agrupa por
+  // (`tool_name`, `metadata.termo`), que a tool passa a declarar (`termoBuscado`);
+  // aqui vira a lista do que NÃO acharam, para o dono saber se falta cadastro ou
+  // se a busca erra sempre no mesmo termo. Erro nesta leitura NÃO derruba a tela:
+  // o uso por capacidade continua vindo, e a lista volta vazia.
+  const { data: linhasPorTermo, error: erroTermo } = await admin.rpc(
+    "fn_agent_tool_usage_por_termo",
+    {
+      p_organization_id: organizationId,
+      p_agent_id: id,
+      p_since: desde,
+    },
+  );
+  if (erroTermo) {
+    logger.warn("leitura por termo do uso das capacidades falhou", {
+      organization_id: organizationId,
+      agent_id: id,
+      erro: erroTermo.message,
+    });
+  }
+  const termos_sem_resultado = termosSemResultado(
+    ((linhasPorTermo ?? []) as LinhaDeTermo[]).map((l) => ({
+      tool_name: l.tool_name,
+      termo: l.termo,
+      total: Number(l.total),
+      falhas: Number(l.falhas),
+      ultima_vez: l.ultima_vez,
+    })),
+  );
 
   const capacidades = montarUsoDeCapacidades({
     ligadas,
@@ -140,6 +188,9 @@ export async function GET(req: NextRequest, ctx: Ctx): Promise<Response> {
         : null,
       resumo: resumirUso(capacidades),
       capacidades,
+      // (#484, caminho 2) O que NÃO acharam, por termo, do mais problemático ao
+      // menos. Vazio = ninguém buscou nada que não exista na janela.
+      termos_sem_resultado,
     },
     { requestId },
   );

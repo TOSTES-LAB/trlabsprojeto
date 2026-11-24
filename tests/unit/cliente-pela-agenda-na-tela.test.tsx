@@ -25,6 +25,7 @@ const USER = { id: "u-1", is_platform_admin: false, support: null };
 
 vi.mock("@/hooks/auth/AuthProvider", () => ({
   useActiveOrg: () => ({ ...ORG, cliente_pela_agenda: ligada }),
+  usePermission: () => true,
   useAuth: () => ({ user: USER, activeOrg: { ...ORG, cliente_pela_agenda: ligada } }),
 }));
 vi.mock("@/hooks/i18n/useT", () => ({ useT: () => (s: string) => s }));
@@ -55,6 +56,10 @@ vi.mock("@/hooks/pipelines/usePipelines", () => ({
   useCriarFunil: () => ({ isPending: false, mutate: vi.fn() }),
   useEditarFunil: () => ({ isPending: false, mutate: vi.fn() }),
   useArquivarFunil: () => ({ isPending: false, mutate: vi.fn() }),
+  // #4802 (item 3) — `_client` monta `TransferirNegocios`, que lê estes três.
+  useNegociosDoFunil: () => ({ negocios: 0, carregando: false, erro: null }),
+  useEtapasDoFunil: () => ({ etapas: [], carregando: false }),
+  useMoverNegociosDoFunil: () => ({ mutate: vi.fn(), isPending: false }),
 }));
 vi.mock("@/app/app/kanban/_components/ImportarLeads", () => ({ ImportarLeads: () => null }));
 
@@ -66,9 +71,10 @@ const CONTATO = {
   email: null,
   email_normalized: null,
   phone_number: null,
-  cpf_hash: null,
+  cpf_available: false,
   birthdate: null,
   is_blocked: false,
+  is_personal: false,
   blocked_reason: null,
   is_anonymized: false,
   anonymized_at: null,
@@ -83,6 +89,7 @@ const CONTATO = {
   updated_at: "2026-01-01T10:00:00.000Z",
   last_activity_at: null,
   first_service_at: "2025-03-12T14:00:00.000Z",
+  ai_opt_out: false,
 } satisfies Contact;
 
 function comQuery(ui: ReactNode) {

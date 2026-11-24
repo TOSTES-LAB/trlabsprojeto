@@ -1,8 +1,10 @@
 "use client";
-import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
+import { hashKey, useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
 import { useRealtimeChannel } from "@/hooks/realtime/useRealtimeChannel";
 import { useRefetchDeSeguranca } from "@/hooks/realtime/useRefetchDeSeguranca";
+import { agendarRecargaDasConversas } from "@/hooks/inbox/recargaDasConversas";
+import { aplicarAtualizacaoNaLista } from "@/lib/inbox/atualizacao-da-lista";
 import { apiClient } from "@/lib/api/client";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import {
@@ -10,16 +12,28 @@ import {
   marcadoresEscolhidos,
 } from "@/lib/inbox/marcador-da-conversa";
 import type { Conversation } from "@/lib/types/messaging";
-import type { ComandoDoBanco } from "@/lib/inbox/comando-da-conversa";
+import { ehAFila, type ComandoDoBanco } from "@/lib/inbox/comando-da-conversa";
 
 export interface ContactSummary {
   id: string;
   display_name: string | null;
   name: string | null;
+  /** Nome salvo na agenda do celular. SÓ A EQUIPE vê (`rotuloParaAEquipe`); nunca vai em mensagem.
+   *  Opcional: conversas em cache de antes do campo existir. */
+  address_book_name?: string | null;
   phone_number: string | null;
   tags: string[];
   is_blocked: boolean;
   is_anonymized: boolean;
+  /** Spec 21: lido da coluna, nunca de etiqueta (o selo "Pessoal" da fatia 3 lê daqui). */
+  is_personal: boolean;
+  /**
+   * Issue 3005: o papel do contato — `cliente` (default do banco) ou
+   * `fornecedor`. Lido da COLUNA, nunca de etiqueta: o selo do painel continua
+   * a verdade mesmo quando alguém remove a tag `fornecedor`.
+   * Opcional: conversas em cache de antes do campo existir.
+   */
+  contact_type?: string | null;
   /** Caminho da foto no bucket privado. A tela nunca usa este valor como src —
    *  só para saber SE existe foto; a imagem vem de /api/v1/contacts/{id}/avatar,
    *  que assina a URL. Opcional: conversas em cache de antes do campo existir. */
@@ -90,6 +104,8 @@ export interface ConversationsFilters {
    * vida, este é quem responde a próxima mensagem do cliente.
    */
   comando?: readonly ComandoDoBanco[];
+  /** A ordem da Fila — `recentes` põe o contato que acabou de chegar em cima. */
+  ordem_fila?: "espera" | "recentes";
   search?: string;
   /**
    * Só as que têm mensagem não lida para o dono. Vai ao BANCO — migration nenhuma,
@@ -97,6 +113,12 @@ export interface ConversationsFilters {
    */
   unread?: boolean;
   channel_session_id?: string;
+  /**
+   * A FILA (#3876): só as conversas classificadas neste setor. O `set` da
+   * serialização é a metade que o typecheck não pega — campo no tipo sem a linha
+   * do `qs.set` faz o seletor mudar de valor e a lista não mudar.
+   */
+  sector_id?: string;
   /**
    * A etiqueta, ou VÁRIAS (#1274).
    *
@@ -110,6 +132,12 @@ export interface ConversationsFilters {
   tagMode?: ModoDeEtiqueta;
   /** A aba "Grupos" do inbox (Task 10). Ausente = sem filtro, mostra tudo. */
   is_group?: boolean;
+  /**
+   * A aba "Pessoal" (#4434). `true` INVERTE a exclusão da spec 21: a lista
+   * devolve só o pessoal de quem chama. Ausente = o padrão de sempre — pessoal
+   * fora da lista de trabalho.
+   */
+  pessoais?: boolean;
 }
 
 interface ListResponse {
@@ -117,17 +145,48 @@ interface ListResponse {
   meta?: { cursor?: string | null; has_more?: boolean };
 }
 
+/**
+ * A TROCA DE CHAVE QUE É A MESMA LISTA (#2366): os dois lados são a Fila e só o
+ * `comando` mudou — é o `automatico-ativo` respondendo (`comandosDaFila`), não
+ * uma escolha de quem usa a tela. Qualquer outra troca (aba, busca, etiqueta,
+ * canal) é OUTRA lista, e mostrar a anterior enquanto a nova carrega põe na
+ * tela linhas que não são da aba — clicáveis, e numeradas como Fila.
+ */
+export function soMudouOAutomaticoDaFila(
+  anterior: ConversationsFilters,
+  atual: ConversationsFilters,
+): boolean {
+  const { comando: _comandoAnterior, ...restoAnterior } = anterior;
+  const { comando: _comandoAtual, ...restoAtual } = atual;
+  return ehAFila(anterior) && ehAFila(atual) && hashKey([restoAnterior]) === hashKey([restoAtual]);
+}
+
 export function useConversationsRealtime(
   filters: ConversationsFilters,
   orgId: string | null,
+  /**
+   * A CHAVE AINDA NÃO É A DEFINITIVA (#2365) — `false` segura a consulta.
+   *
+   * A Fila monta o `comando` a partir de um fato org-wide ASSÍNCRONO
+   * (`/ai/automatico-ativo`). Consultar antes de o fato chegar era o que
+   * produzia DUAS buscas em série pela MESMA lista: a primeira saía com
+   * `aguardando`, a resposta do fato trocava a chave para
+   * `aguardando,automatico` e a primeira resposta era DESCARTADA — medido no
+   * trace do #2360 (run 37340942770): 1091ms + 896ms, com a lista fora da tela
+   * no meio. Segurar a consulta até a chave ficar pronta custa a espera do fato
+   * (a MESMA pergunta que a tela já faz, deduplicada pelo react-query) e devolve
+   * UMA requisição com o filtro definitivo.
+   */
+  habilitada = true,
 ) {
   const qc = useQueryClient();
   const queryKey = useMemo(() => ["conversations", filters] as const, [filters]);
 
   const query = useInfiniteQuery({
     queryKey,
+    enabled: habilitada,
     initialPageParam: undefined as string | undefined,
-    queryFn: async ({ pageParam }) => {
+    queryFn: async ({ pageParam, signal }) => {
       const qs = new URLSearchParams();
       // Lista vira `open,pending`; valor único continua saindo como antes.
       if (filters.status) {
@@ -141,11 +200,14 @@ export function useConversationsRealtime(
       if (filters.comando && filters.comando.length > 0) {
         qs.set("comando", filters.comando.join(","));
       }
+      if (filters.ordem_fila) qs.set("ordem_fila", filters.ordem_fila);
       if (filters.exclude_finished) qs.set("exclude_finished", "true");
       if (filters.assigned_to) qs.set("assigned_to", filters.assigned_to);
       if (filters.search) qs.set("search", filters.search);
       if (filters.unread) qs.set("unread", "true");
       if (filters.channel_session_id) qs.set("channel_session_id", filters.channel_session_id);
+      // A FILA (#3876) — ver o comentário do campo em `ConversationsFilters`.
+      if (filters.sector_id) qs.set("sector_id", filters.sector_id);
       // `append`, e não `set` (#1274): o filtro aceita várias etiquetas e cada
       // uma viaja como um `tag` repetido — que é o que a rota lê com `getAll`.
       for (const marcador of marcadoresEscolhidos(
@@ -156,12 +218,32 @@ export function useConversationsRealtime(
       // `&modo=e` colado num link de hoje mudaria a URL sem mudar o sentido.
       if (filters.tagMode === "ou") qs.set("modo", "ou");
       if (filters.is_group !== undefined) qs.set("is_group", filters.is_group ? "true" : "false");
+      // A aba "Pessoal" (#4434). Só viaja quando LIGADA: ausente é o padrão de
+      // sempre (pessoal fora da lista), e um `&pessoais=false` colado num link
+      // de hoje mudaria a URL sem mudar o sentido.
+      if (filters.pessoais) qs.set("pessoais", "true");
       if (pageParam) qs.set("cursor", pageParam);
       qs.set("limit", "50");
       try {
-        return await apiClient.get<ListResponse>(`/api/v1/conversations?${qs.toString()}`);
+        // O `signal` do react-query VAI JUNTO (#4508).
+        //
+        // Sem ele, desistir desta lista não desistia da REQUISIÇÃO: o `fetch`
+        // seguia em voo, e quem trocou de aba (ou de filtro, ou de tela) pagava
+        // a espera inteira — até 10 s por tentativa — para depois DESCARTAR a
+        // resposta. Medido nos testes deste arquivo: sem o repasse, o `fetch`
+        // da lista nunca era abortado e a promessa da consulta ficava pendente
+        // até o timeout do cliente HTTP.
+        //
+        // O `apiClient` já sabia cancelar (`RequestOpts.signal`, e o `catch`
+        // dele propaga abort do chamador sem repetir) — o que faltava era a
+        // lista entregar o dela.
+        return await apiClient.get<ListResponse>(`/api/v1/conversations?${qs.toString()}`, {
+          signal,
+        });
       } catch (err) {
-        showApiError(err);
+        // Aborto de quem chamou não é falha da API: não há motivo a mostrar, e
+        // o `showApiError` transformaria um cancelamento em toast de erro.
+        if (!signal.aborted) showApiError(err);
         throw err;
       }
     },
@@ -171,11 +253,44 @@ export function useConversationsRealtime(
     // chega de fora enquanto ninguém olha, e voltar para a aba é quando a
     // defasagem aparece. Segunda rede — a primeira é o Realtime.
     refetchOnWindowFocus: true,
+    // #2366 — A LISTA NÃO VOLTA AO SKELETON NUM REFETCH.
+    //
+    // A chave desta query muda depois de a primeira resposta chegar: quando
+    // `/ai/automatico-ativo` responde, `comandosDaFila` troca `aguardando` por
+    // `aguardando,automatico` e o react-query abre uma query NOVA, que nasce
+    // sem dado. Sem isto a primeira resposta é DESCARTADA, a tela cai no
+    // skeleton e um segundo GET sai ~2 s depois — medido no trace do #2360
+    // (run 37340942770): 1 a 3 s de tela vazia a cada carga do inbox.
+    //
+    // A lista anterior fica na tela até a chave nova responder (ou falhar) SÓ
+    // nessa troca (`soMudouOAutomaticoDaFila`). O `keepPreviousData` puro valia
+    // para toda troca de chave: trocar de aba ou de busca mostrava a lista
+    // anterior, sem aviso, enquanto a nova carregava. Nas outras trocas o
+    // `isLoading` volta e o skeleton aparece — ali ele tem o que dizer.
+    placeholderData: (anterior, queryAnterior) =>
+      queryAnterior && soMudouOAutomaticoDaFila(queryAnterior.queryKey[1], filters)
+        ? anterior
+        : undefined,
   });
 
-  const onChange = useCallback(() => {
-    qc.invalidateQueries({ queryKey: ["conversations"] });
-  }, [qc]);
+  /**
+   * O EVENTO DE UMA CONVERSA NÃO DECLARA A LISTA INTEIRA VELHA (#2366).
+   *
+   * `aplicarAtualizacaoNaLista` resolve o caso comum — `UPDATE` de uma conversa
+   * que está na tela — mesclando a linha no lugar, sem rede e sem estado de
+   * carregamento. Ele devolve `false` só quando a resposta não está no evento:
+   * conversa nova, conversa fora da lista (pode ter entrado no filtro), evento
+   * que muda a POSIÇÃO da linha (reordenar é da rota), lista ainda sem dado, ou
+   * filtro que depende do join do contato (busca/etiqueta). Aí a recarga
+   * agrupada continua, como antes.
+   */
+  const onChange = useCallback(
+    (payload: unknown) => {
+      if (aplicarAtualizacaoNaLista(qc, queryKey, filters, payload)) return;
+      agendarRecargaDasConversas(qc);
+    },
+    [qc, queryKey, filters],
+  );
 
   // G4-01 (visibility_mode): a subscription postgres_changes HERDA a RLS de
   // SELECT de `conversations` — o Supabase Realtime avalia as policies do usuário
