@@ -1,5 +1,6 @@
 "use server";
 
+import { ipDoCliente } from "@/lib/http/ip-do-cliente";
 import { supportWriteError } from "@/lib/impersonate/support";
 import { headers } from "next/headers";
 import { revalidatePath } from "next/cache";
@@ -32,8 +33,9 @@ export type ApagarDadosOperacionaisResult =
     };
 
 /**
- * Zona de perigo de Configurações › Organização: apaga de vez mensagens,
- * conversas, leads, contatos, agendamentos e pedidos da organização ATIVA.
+ * "Limpar dados de teste" (Zona de perigo) de Configurações › Organização: apaga de vez
+ * mensagens, conversas, leads, contatos, agendamentos, pedidos, empresas, pessoas e
+ * importações da organização ATIVA.
  *
  * Capacidade extraída da contribuição de @maugarciasa (PR #556).
  *
@@ -96,7 +98,7 @@ export async function apagarDadosOperacionaisDaOrganizacao(input: {
     resourceType: "organization",
     resourceId: activeOrg.orgId,
     requestId: hdrs.get("x-request-id"),
-    ip: hdrs.get("x-forwarded-for")?.split(",")[0]?.trim() ?? null,
+    ip: ipDoCliente(hdrs),
     userAgent: hdrs.get("user-agent") ?? null,
     bypassedRls: true,
     actingAsPlatformAdmin: authUser.is_platform_admin,
@@ -114,6 +116,9 @@ export async function apagarDadosOperacionaisDaOrganizacao(input: {
   revalidatePath("/app/settings/tenant");
   revalidatePath("/app/inbox");
   revalidatePath("/app/contacts");
+  revalidatePath("/app/companies");
+  revalidatePath("/app/people");
+  revalidatePath("/app/imports");
   revalidatePath("/app/pipelines/[id]", "page");
 
   if (!resultado.ok) {

@@ -67,6 +67,10 @@ Para criar só o projeto, sem instalar, o script também roda sozinho:
 bash supabase-provision.sh "Nome do Projeto" sa-east-1 >> .env
 ```
 
+O segundo argumento (ou `SUPABASE_REGION`) é a região do projeto: use a **mais próxima da VPS** —
+`sa-east-1` no Brasil, `us-east-1` ou `eu-central-1` nos EUA/Europa. Ela **não muda depois** de
+criado o projeto.
+
 O script cria o projeto, **espera o banco ficar `ACTIVE_HEALTHY`** (projeto novo não
 nasce pronto), busca as chaves e **descobre o host do pooler testando conexão real** em
 vez de adivinhar. Imprime as 4 linhas prontas para colar no `.env`.
@@ -108,20 +112,22 @@ Owner/Admin. Não dá para hospedar vários clientes numa conta só.
   `linux/amd64` e `linux/arm64`; o instalador seleciona a variante oficial ARM64 NOWEB do WAHA.
   O modo com Supabase self-hosted na mesma VPS também funciona em ARM64: a versão upstream
   fixada pelo kit (`self-hosted/v0.8.1`) e as imagens dos seus 11 serviços têm manifestos
-  `linux/arm64`. Ao atualizar `SUPABASE_REF`, confira de novo os manifestos de todas as imagens.
+  `linux/arm64` na ref atualmente validada. O pré-voo descobre e testa a lista inteira
+  novamente a cada instalação; não presume que continuará com 11 serviços. Para Oracle
+  Ampere A1, siga o [runbook ARM64](../docs/runbooks/oracle-arm64.md).
 - **4 GB RAM recomendados.** A imagem é pré-buildada, então o servidor não compila nada e a
   stack SOBE com 2 GB — mas operar é outra coisa: são 7 contêineres, e o WAHA consome
   ~150 MB por sessão de WhatsApp além de ~300 MB de overhead do Node. Com 2 GB você roda
   no limite e vai precisar de swap. Ver `docs/runbooks/waha-hostgator.md`.
-- Portas **80** e **443** abertas (`ufw allow 80,443,22/tcp`).
+- Portas **80** e **443** abertas, e a **22022** do SSH (`ufw allow 22,22022,80,443/tcp`).
 - Docker + Docker Compose v2 — o `install.sh` instala o Docker sozinho se faltar (ver acima).
 
 ### VPS que já vem com proxy próprio (Hostinger, Coolify, Dokploy…)
 
 Algumas hospedagens entregam a VPS com um **Traefik** já ocupando as portas 80/443 — é ele
 que dá HTTPS automático ao que o painel instala. O Caddy do kit quer as mesmas portas e não
-sobe. O instalador **detecta isso sozinho** e grava `REVERSE_PROXY=traefik` no `.env`; a
-partir daí os scripts do kit incluem o override que desliga o Caddy e publica o app pelo
+sobe. O `install.sh` (banco no Supabase Cloud) **detecta isso sozinho** e grava
+`REVERSE_PROXY=traefik` no `.env`; a partir daí os scripts do kit incluem o override que desliga o Caddy e publica o app pelo
 Traefik da hospedagem. Rodando compose na mão nessas instalações, use os dois arquivos:
 
 ```bash
@@ -140,17 +146,141 @@ proxy errado deixa o site no ar sem responder, o instalador mostra o que encontr
 confirmação. Em `bash install.sh --yes` não há a quem perguntar: ele para e pede que você
 declare `REVERSE_PROXY=traefik` no `.env` — aí a escolha é sua e ele segue sem perguntar.
 
+**No single-server (`install-single-server.sh`, banco na mesma VPS) a detecção não roda.**
+Ele grava `REVERSE_PROXY=caddy` no `.env` a menos que a variável venha no ambiente, e então
+chama o `install.sh --yes` com a escolha já feita. Sem declarar nada, o Caddy do kit sobe e
+briga pelas portas 80/443 com o Traefik da hospedagem. Declare no próprio comando, antes de
+rodar — escrever só no `.env` não basta, porque o single-server o regrava:
+
+- `REVERSE_PROXY=traefik`: quem publica o site é o Traefik da hospedagem;
+- `TRAEFIK_NETWORK=<rede do proxy>`: com Traefik em rede Docker própria (Coolify, Dokploy),
+  é a rede onde ele alcança as APIs do banco. Confira o nome com `docker network ls`. Com
+  Traefik em `--network host` (Hostinger), deixe de fora.
+
+O exemplo completo, com a porta do banco (`API_GW_HTTP_PORT`) e os nomes das portas do proxy,
+está em [docs/saas/coolify.md](../docs/saas/coolify.md#passo-5--instalar-o-crm-e-o-banco).
+O single-server recusa `REVERSE_PROXY=cloudflared`: as APIs do Supabase dependem do Caddy, e
+o Cloudflare Tunnel só serve com o banco no Supabase Cloud.
+
 ## Scripts do kit
 
 | Script | Função |
 |---|---|
 | `install.sh` | Instala tudo (idempotente) |
 | `update.sh` | Atualiza pra versão nova |
-| `backup.sh` | Backup do banco + sessões WhatsApp |
+| `backup.sh` | Backup do banco + sessões WhatsApp (`--podar` aplica só a retenção) |
 | `restore.sh` | Restaura um backup |
 | `reset-password.sh` | Redefine senha de um usuário |
 | `reset-mfa.sh` | Remove o MFA de um usuário travado |
 | `healthcheck.sh` | Diagnóstico dos serviços |
+| `preflight-upgrade.sh` | Sonda uma release numérica de um kit novo antes de usar o updater antigo |
+
+No ARM64, o instalador e o updater recusam antecipadamente uma release cujas quatro
+imagens do CRM ou a WAHA efetiva não tenham variante nativa. No single-server,
+também sondam as imagens fixadas do Supabase. O pré-voo não prova chamada de voz,
+entrega WhatsApp ou restauração de dados: essas jornadas exigem teste real.
+
+## Espaço em disco, retenção e imagens antigas
+
+O `update.sh` **confere o espaço livre antes de qualquer escrita** e recusa a atualização
+quando a conta não fecha — nada é parado, nada é baixado, a versão atual segue no ar, e o
+`agent.sh` lê o código de saída como "esta atualização nunca começou". O mínimo é o maior
+entre:
+
+- `DESKCOMM_ESPACO_MINIMO_MB` (piso, padrão **1024** — só decide quando não há como medir as imagens);
+- o tamanho das imagens em uso **mais** o do último backup, com 20% de folga.
+
+A mensagem da recusa traz os dois números e o que libera espaço sem apagar dado. Três
+ajustes no `.env` mudam o comportamento:
+
+| Variável | Padrão | Para quê |
+|---|---|---|
+| `DESKCOMM_ESPACO_MINIMO_MB` | `1024` | piso, em MB, quando o tamanho das imagens não pode ser medido |
+| `BACKUP_KEEP` | `14` | quantos backups **por tipo** (db, waha, storage) a retenção guarda |
+| `DESKCOMM_PODA_IMAGENS` | `1` | `0` desliga a poda ao fim da atualização |
+
+Depois de uma atualização **saudável**, o `update.sh` roda uma poda conservadora:
+`docker image prune -f` com `--filter dangling=true --filter until=168h` (só camadas sem
+tag com mais de 7 dias) e, uma a uma, as versões antigas das imagens **deste** produto —
+nunca a versão atual, nunca a da volta (`.deskcomm-env-antes-do-update`), nunca uma imagem
+que um contêiner usa, nunca canal móvel (`stable`) e nunca imagem de terceiros. Falha da
+poda é aviso: a atualização já está concluída.
+
+O que continua sendo do **operador**, e o kit não faz por conta própria:
+
+- `docker image prune -a` (leva embora a imagem da versão anterior, que é a volta) e
+  `docker system prune --volumes` (apaga o volume com a sessão do WhatsApp e o banco);
+- escolher retenção por **tamanho** e mandar cópia para fora da VPS (S3 ou outra máquina);
+- aumentar o disco. O passo a passo está em
+  [docs/runbooks/remediar-worker-congelado.md](../docs/runbooks/remediar-worker-congelado.md).
+
+> ⚠️ **Restaurar um backup: o `restore.sh` só restaura num banco VAZIO.** O dump do
+> `backup.sh` sai com `--no-owner --no-privileges` e **sem `--clean`**: ele não tem `DROP` nem
+> `TRUNCATE`, e os `CREATE TABLE` não têm `IF NOT EXISTS`. Antes de pedir a confirmação, o
+> `restore.sh` conta as tabelas de `public` e, se o banco já tem as tabelas do sistema, **para
+> com mensagem própria** — nada é alterado e o `psql` nem é chamado. Ou seja: hoje ele **não**
+> volta o backup por cima da instalação que está em uso (isso está em aberto na issue #2120).
+>
+> Antes de restaurar, o kit verifica a integridade do `.sql.gz` e dos snapshots `.tgz`
+> presentes que usará (WhatsApp e, no single-server, Storage). Se algum estiver corrompido
+> ou cortado, para antes de alterar banco ou volumes. Essa conferência não garante que a
+> escrita vá funcionar: se a extração falhar depois, o comando sai com erro e informa que
+> o banco já foi restaurado. Confira o destino antes de reiniciar; repetir o script não
+> restaura por cima do banco populado. Snapshots ausentes continuam opcionais.
+>
+> O caminho que funciona hoje é restaurar num **projeto Supabase novo, em que o instalador
+> ainda não rodou** (o instalador cria as tabelas, e aí o restore recusa), e depois apontar a
+> instalação para esse projeto — trocando no `.env` a conexão e as chaves do Supabase pelas do
+> projeto novo. Medimos a parte do restore num Supabase recém-criado (`rc=0`, 110 tabelas); a
+> troca do `.env` não foi medida. Se não tiver segurança para fazer essa troca, ou se o seu
+> Supabase roda no próprio servidor (single-server, onde não há projeto novo para criar),
+> **peça ajuda antes**.
+>
+> O `psql` roda **sem** `-v ON_ERROR_STOP=1 --single-transaction`. Essas flags faziam o
+> restore falhar também em **banco vazio**: o dump traz os schemas internos (`auth`,
+> `storage`, `realtime`, `vault`) e extensões como `pg_net`, que já existem num Supabase
+> novo — medido em Supabase novo, Postgres 17 puro e database nova, as três deram `rc=3` e
+> 0 tabelas; sem elas, nos dois primeiros, o mesmo dump entrou com `rc=0` e 110 tabelas. Sem a
+> transação única não há rollback: em falha fatal do `psql`, confira o estado do banco antes
+> de repetir. (Gerar o dump com `--clean --if-exists` mudaria o formato dele — decisão do
+> mantenedor, issue #2120.)
+
+## Publicar outro serviço no mesmo VPS (issue #2724)
+
+Uma wiki, uma landing page, um n8n no mesmo servidor em que o CRM já roda: **não edite o `Caddyfile`**. Os dois arquivos (o da variante normal e o `Caddyfile.single-server`) terminam com um ponto de extensão, e os dois composes montam a mesma pasta local:
+
+```yaml
+- ./caddy-sites:/etc/caddy/sites:ro
+```
+
+O caminho do `import` e o alvo do bind mount são o mesmo — e a régua `tests/unit/ponto-de-extensao-do-caddy.test.ts` reprova qualquer um dos dois que mude sozinho, porque se divergirem o Caddy continua validando e só avisa no log (aí o arquivo existe, o subdomínio não responde e ninguém explica).
+
+Como fazer:
+
+1. Crie `caddy-sites/<nome>.caddy` na raiz do clone (um arquivo novo — **não** edite o `caddy-sites/README.caddy`, que é versionado e alterado trava a atualização):
+
+   ```
+   base.exemplo.com.br {
+   	encode gzip
+   	reverse_proxy wiki:80
+   }
+   ```
+
+2. Suba o serviço extra na rede `caddy-sites` do stack, para o nome `wiki` resolver dentro do contêiner do Caddy: `docker run --network <nome-do-projeto>_caddy-sites --memory 512m ...` (`docker network ls | grep caddy-sites` mostra o nome da rede). Essa rede existe só entre o Caddy e os serviços extras; **não** use a `_internal`, que é a dos serviços internos do CRM. O `--memory` não é decoração: sem teto o serviço novo derruba o CRM junto.
+
+3. Confira e recarregue o proxy, **sem reiniciá-lo**:
+
+   ```bash
+   docker compose -f docker-compose.prod.yml exec caddy caddy validate --config /etc/caddy/Caddyfile
+   docker compose -f docker-compose.prod.yml exec caddy caddy reload --config /etc/caddy/Caddyfile
+   # single-server: acrescente -f docker-compose.single-server.yml
+   ```
+
+   Não use `restart caddy`: com um arquivo errado o Caddy reiniciado não sobe, e o CRM sai do ar junto. O `reload` recusa o arquivo errado, diz a linha e mantém no ar o que já estava.
+
+A pasta `caddy-sites/` está no `.gitignore` (só o `README.caddy` é versionado, para a pasta existir no clone novo e o glob do `import` nunca ficar vazio). Seus arquivos não aparecem em `git status`, não entram em `git diff` e **não atrapalham o `update.sh`** — ele troca de versão com `git checkout <tag>` e não toca nesta pasta. HTTPS automático, emissão de certificado e gzip vêm de graça, com o mesmo `ACME_EMAIL` do CRM.
+
+Na atualização, o `update.sh` confere a configuração do proxy (esta pasta inclusive) **antes** de recriá-lo. Se a conferência recusar um arquivo seu, o proxy antigo continua no ar, o CRM segue respondendo e a saída da atualização mostra o motivo, citando `caddy-sites/`.
 
 ## Automações e webhooks
 

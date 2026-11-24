@@ -93,7 +93,10 @@ const KNOBS: PacingKnobs = {
   respostaStartHour: 7,
   respostaEndHour: 22,
   allowSunday: true,
+  prospeccaoDias: [0, 1, 2, 3, 4, 5, 6],
   timezone: "America/Sao_Paulo",
+  tetoSoAbordagem: false,
+  followupDailyCap: 200,
   warmupDailyCaps: [
     { minAgeDays: 0, cap: 20 },
     { minAgeDays: 7, cap: 60 },

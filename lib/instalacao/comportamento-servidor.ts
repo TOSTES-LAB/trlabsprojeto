@@ -16,6 +16,7 @@ import { normalizarChaveDeOrcamento } from "@/lib/agent-engine/edge/llm/orcament
 import { env } from "@/lib/env";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { semearLinhaDaInstalacao } from "@/lib/auth/politica-de-cadastro";
 
 import {
   carregarComportamento,
@@ -62,6 +63,11 @@ export async function carregarComportamentoDaInstalacao(): Promise<Comportamento
       .from("platform_settings")
       .select(COLUNAS)
       .eq("id", 1)
+      // Fora da deduplicação de `fetch` do Next dentro de um render: sem o `signal`,
+      // uma 2ª leitura do MESMO render, feita depois de uma escrita ter invalidado o
+      // memo, recebe a resposta de ANTES dela e a memoiza. O porquê inteiro está em
+      // `lerLinha` de `lib/branding/instalacao.ts` (#1218). Nunca é abortado.
+      .abortSignal(new AbortController().signal)
       .maybeSingle();
 
     // Erro = o banco NÃO falou; a degradação (último valor conhecido) é decisão
@@ -85,6 +91,9 @@ export async function gravarComportamentoDaInstalacao(
   atorUserId: string,
 ): Promise<boolean> {
   try {
+    // Sem a semente, esta gravação criaria a linha com `signup_mode='aberto'`
+    // e reabriria o cadastro de quem declarou `SIGNUP_MODE=so_convite`.
+    if (!(await semearLinhaDaInstalacao())) return false;
     const { error } = await createAdminClient()
       .from("platform_settings")
       .upsert({ id: 1, ...valores, updated_by: atorUserId }, { onConflict: "id" });

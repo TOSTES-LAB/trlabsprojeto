@@ -95,10 +95,25 @@ const TTL_MS = 30_000;
 declare global {
   // eslint-disable-next-line no-var
   var __memoDoAppDaMeta: { readonly valor: AppDaMetaEmVigor; readonly expiraEm: number } | null | undefined;
+  /**
+   * Contador de escritas. Mora no `globalThis` pelo mesmo motivo que o memo — a
+   * rota que grava e quem entrega o webhook são duas instâncias do módulo, e um
+   * `let` de arquivo falharia calado.
+   *
+   * Ele existe porque zerar o memo não basta: uma leitura que já estava em voo
+   * quando a escrita aconteceu volta com o par PRÉ-ESCRITA e o reinstala por um
+   * TTL inteiro, desfazendo a invalidação. É a guarda que
+   * `lib/branding/instalacao.ts` estreou, e este memo é cópia declarada dela.
+   */
+  // eslint-disable-next-line no-var
+  var __geracaoDoAppDaMeta: number | undefined;
 }
 
 /** Chamada por quem ESCREVE a credencial — a server action do /admin. */
 export function invalidarAppDaMeta(): void {
+  // A geração sobe ANTES de zerar: quem estiver lendo agora fica marcado como
+  // anterior a esta escrita e não poderá reinstalar o que leu.
+  globalThis.__geracaoDoAppDaMeta = (globalThis.__geracaoDoAppDaMeta ?? 0) + 1;
   globalThis.__memoDoAppDaMeta = null;
 }
 
@@ -114,6 +129,11 @@ async function linhaDoBanco(): Promise<LinhaDoApp | null> {
       .from("platform_meta_app")
       .select("app_secret_encrypted, verify_token_encrypted")
       .eq("id", 1)
+      // Fora da deduplicação de `fetch` do Next dentro de um render: sem o `signal`,
+      // uma 2ª leitura do MESMO render, feita depois de uma escrita ter invalidado o
+      // memo, recebe a resposta de ANTES dela e a memoiza. O porquê inteiro está em
+      // `lerLinha` de `lib/branding/instalacao.ts` (#1218). Nunca é abortado.
+      .abortSignal(new AbortController().signal)
       .maybeSingle();
     // Clone que ainda não aplicou a 0257 devolve 42P01 aqui. Isso NÃO é erro
     // desta instalação — é o piso de rollback funcionando, e o `.env` assume.
@@ -166,8 +186,19 @@ export async function appDaMeta(): Promise<AppDaMetaEmVigor> {
   const memo = globalThis.__memoDoAppDaMeta;
   if (memo && memo.expiraEm > Date.now()) return memo.valor;
 
+  // A geração é lida ANTES da ida ao banco, e conferida depois. Sem isso o memo
+  // sofre lost-update: uma leitura que entrou em voo antes de
+  // `invalidarAppDaMeta()` volta com o par PRÉ-ESCRITA e o grava com TTL novo,
+  // desfazendo a invalidação — a entrega seguinte assinando com o segredo velho
+  // e morrendo em 401, por até TTL_MS inteiros, atrás de um toast verde. Mesma
+  // guarda, e mesmo comentário alongado, de `marcaDaInstalacao` (#2795).
+  const geracao = globalThis.__geracaoDoAppDaMeta ?? 0;
   const valor = (await parDoBanco(await linhaDoBanco())) ?? appDaMetaDoAmbiente();
-  globalThis.__memoDoAppDaMeta = { valor, expiraEm: Date.now() + TTL_MS };
+  // Só memoiza quem não perdeu uma escrita no meio do caminho — a leitura em
+  // voo devolve o valor velho a quem a chamou, mas não o reinstala no memo.
+  if ((globalThis.__geracaoDoAppDaMeta ?? 0) === geracao) {
+    globalThis.__memoDoAppDaMeta = { valor, expiraEm: Date.now() + TTL_MS };
+  }
   return valor;
 }
 
@@ -189,4 +220,43 @@ export async function fontesDoAppDaMeta(): Promise<Record<string, string | undef
     META_APP_SECRET: appSecret ?? undefined,
     META_WEBHOOK_VERIFY_TOKEN: verifyToken ?? undefined,
   };
+}
+
+/**
+ * O que o navegador precisa para abrir a janela do Embedded Signup (#4074).
+ *
+ * App ID e Configuration ID NÃO são segredo — vão ao `FB.init` e ao `FB.login`
+ * no navegador. Mas a janela só serve se o App Secret também existir: é ele que
+ * troca o código devolvido pela Meta pelo token da empresa. Sem o trio, `null`, e
+ * a tela de Conexões simplesmente não mostra o botão.
+ *
+ * Sem memo: é lido ao abrir Conexões, não a cada entrega do webhook. Nunca lança.
+ */
+export interface EmbeddedSignupDaInstalacao {
+  readonly appId: string;
+  readonly configId: string;
+}
+
+export async function embeddedSignupDaInstalacao(): Promise<EmbeddedSignupDaInstalacao | null> {
+  try {
+    const { data, error } = await createAdminClient()
+      .from("platform_meta_app")
+      .select("app_id, config_id")
+      .eq("id", 1)
+      .abortSignal(new AbortController().signal)
+      .maybeSingle();
+    if (error || !data) return null;
+    const linha = data as { app_id?: string | null; config_id?: string | null };
+    const appId = texto(linha.app_id);
+    const configId = texto(linha.config_id);
+    if (!appId || !configId) return null;
+    const { appSecret } = await appDaMeta();
+    if (!appSecret) return null;
+    return { appId, configId };
+  } catch (err) {
+    logger.warn("[meta.app] leitura do Embedded Signup falhou", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
