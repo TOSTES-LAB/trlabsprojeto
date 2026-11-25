@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "@/lib/api/client";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import type { Pipeline, Stage } from "@/lib/kanban/types";
+import type { WebhookFormField } from "@/lib/webhooks/formulario";
 
 export interface WebhookSourceRow {
   id: string;
@@ -10,13 +11,25 @@ export interface WebhookSourceRow {
   name: string;
   path_token: string;
   is_active: boolean;
+  authorize_ai_on_capture: boolean;
+  /** Opção do #2316: atualizar o card quando o envio repete o external_id. */
+  update_existing_lead_on_capture: boolean;
+  /** Opção do #3101: reusar o card aberto do contato no funil da fonte. */
+  reuse_open_lead_on_capture: boolean;
   kind: string;
   last_received_at: string | null;
   default_pipeline_id: string;
   default_stage_id: string;
   redirect_to: string | null;
   field_map: Record<string, unknown>;
+  form_fields: WebhookFormField[];
   has_secret: boolean;
+  /** Formulário da Meta (#3768): a página que a fonte representa. */
+  meta_page_id: string | null;
+  /** Buscar as respostas na Meta — desligada por padrão. */
+  meta_lead_retrieval: boolean;
+  /** O token da página existe? O valor nunca volta. */
+  has_meta_page_token: boolean;
   created_at: string;
   updated_at: string;
   /** Quem mexeu por último (migration 0101). `null` nas fontes anteriores a ela. */
@@ -87,8 +100,18 @@ export function useUpdateWebhookSource() {
       ...patch
     }: {
       id: string;
+      name?: string;
       is_active?: boolean;
+      authorize_ai_on_capture?: boolean;
+      update_existing_lead_on_capture?: boolean;
+      /** A opção do #3101 — reusar o card aberto do contato no funil da fonte. */
+      reuse_open_lead_on_capture?: boolean;
       secret?: string | null;
+      form_fields?: WebhookFormField[];
+      /** Formulário da Meta (#3768). O token vai de ida e nunca volta, como `secret`. */
+      meta_page_id?: string | null;
+      meta_page_token?: string | null;
+      meta_lead_retrieval?: boolean;
     }) => apiClient.patch<{ data: WebhookSourceRow }>(`/api/v1/webhook-sources/${id}`, patch),
     onError: showApiError,
     onSuccess: () => {

@@ -110,8 +110,14 @@ export interface InboundMessageEvent {
   from: string;
   profileName: string | null;
   sentAt: Date;
-  /** `text` | `audio` | `image` | `video` | `document` | `sticker` | `contact` | … */
+  /** Sempre um valor de `messages_type_check` — ver `TIPO_NO_CRM`. */
   type: string;
+  /**
+   * O `type` cru da Meta, SÓ quando ele está fora do vocabulário do banco e
+   * `type` caiu em `text` (#4580). A ingestão o grava em `metadata.raw_type`.
+   * Ausente = o tipo era conhecido.
+   */
+  rawType?: string;
   text: string | null;
   /** Preenchido quando `type === "contact"` (cartão compartilhado). */
   sharedContact?: SharedContact | null;
@@ -122,6 +128,14 @@ export interface InboundMessageEvent {
     mime: string | null;
     /** Nota de voz de verdade (não anexo de áudio). */
     voice: boolean;
+    /**
+     * Nome ORIGINAL do arquivo — a Cloud API só manda `filename` em
+     * `document` (imagem/vídeo/áudio vêm sem). Vira
+     * `metadata.media_filename` na ingestão, que é o que o cartão do Inbox
+     * lê (#2613). Opcional: o parser SEMPRE preenche (null quando não há),
+     * mas quem monta um evento à mão não é obrigado a inventar a chave.
+     */
+    filename?: string | null;
   } | null;
   /**
    * `messages[].referral` cru — vem na mensagem que o app do cliente manda ao
@@ -162,8 +176,10 @@ export interface OutboundEchoEvent {
   /** `wa_id` do CLIENTE (o destinatário). Mesma ressalva do nono dígito. */
   to: string;
   sentAt: Date;
-  /** `text` | `image` | `video` | `document` | `contact` | … */
+  /** Sempre um valor de `messages_type_check` — ver `TIPO_NO_CRM`. */
   type: string;
+  /** O `type` cru, só quando caiu em `text` por estar fora do vocabulário — idem a recebida. */
+  rawType?: string;
   text: string | null;
   /** Preenchido quando `type === "contact"` (cartão compartilhado pelo app). */
   sharedContact?: SharedContact | null;
@@ -172,6 +188,8 @@ export interface OutboundEchoEvent {
     url: string | null;
     mime: string | null;
     voice: boolean;
+    /** Nome original do arquivo, só em `document` — idem a recebida (#2613). */
+    filename?: string | null;
   } | null;
 }
 
@@ -201,12 +219,45 @@ export interface AppContactSyncEvent {
   action: string;
 }
 
+/**
+ * O usuário REAGIU a uma mensagem, e depois talvez desfaça (#2797).
+ *
+ * A Cloud API entrega a reação DENTRO de `messages[]`, com `type: "reaction"` e
+ * o par `reaction.{message_id,emoji}` (webhooks/reference/messages/reaction) —
+ * o mesmo lugar de onde vem uma mensagem de texto, o que fazia o normalizador
+ * tratá-la como mensagem: linha em `messages` sem emoji e sem alvo, que ainda
+ * carimbava a conversa como nova.
+ *
+ * `emoji` é `null` quando o usuário REMOVEU a reação: a referência diz que a
+ * Meta omite a propriedade e reentrega o mesmo `id`. É o caso em que a
+ * ingestão apaga a reação anterior do mesmo autor sobre o mesmo alvo.
+ *
+ * `externalId` é o id da PRÓPRIA reação (não o do alvo) — é a chave de
+ * idempotência, e a Meta reentrega o mesmo evento até receber 2xx.
+ */
+export interface ReactionEvent {
+  kind: "reaction";
+  wabaId: string;
+  /** Qual número NOSSO recebeu o gesto — amarra à sessão, como no recebimento. */
+  phoneNumberId: string;
+  /** `wamid` da reação — a chave de idempotência. */
+  externalId: string;
+  /** `wa_id` de quem reagiu. A Cloud API só entrega reação do contato. */
+  from: string;
+  /** Emoji; `null` = o usuário removeu a reação que tinha dado. */
+  emoji: string | null;
+  /** `reaction.message_id` — a mensagem que foi reagida. */
+  targetExternalId: string;
+  sentAt: Date;
+}
+
 export type MetaWebhookEvent =
   | TemplateStatusEvent
   | MessageStatusEvent
   | InboundMessageEvent
   | OutboundEchoEvent
-  | AppContactSyncEvent;
+  | AppContactSyncEvent
+  | ReactionEvent;
 
 /**
  * O formato do fio mora em `./envelope.ts`, onde é um schema Zod — e o tipo
@@ -231,6 +282,64 @@ export function normalizeRejectedReason(v: unknown): string | null {
 
 function str(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+/** Objeto simples (nem array, nem null) — a guarda para dado que vem do fio. */
+function objetoSimples(v: unknown): Record<string, unknown> | null {
+  return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : null;
+}
+
+/** Rótulo do botão tocado: `button.text` (modelo) ou `interactive.button_reply|list_reply.title`. */
+function textoDoClique(raw: Record<string, unknown>, tipo: string): string | null {
+  if (tipo === "button") {
+    const b = raw.button as Record<string, unknown> | undefined;
+    return str(b?.text) ?? str(b?.payload);
+  }
+  const i = raw.interactive as Record<string, unknown> | undefined;
+  const r = (i?.button_reply ?? i?.list_reply) as Record<string, unknown> | undefined;
+  return str(r?.title) ?? str(r?.id);
+}
+
+/**
+ * O `type` da Meta no vocabulário de `messages.type` (#4580).
+ *
+ * O CHECK `messages_type_check` aceita só os valores da direita, e qualquer
+ * outro faz o INSERT falhar. Como a rota responde 2xx do mesmo jeito (a Meta
+ * não re-entrega), tipo fora da lista era mensagem que SUMIA: `unsupported`,
+ * `order`, o `"unknown"` de payload sem `type`, e qualquer tipo que a Meta
+ * criar amanhã. Só sobrava uma linha no log do contêiner.
+ *
+ * UM mapa para a recebida e para o eco da coexistência: eram duas regras, e o
+ * eco já tinha divergido (não convertia botão nem resposta interativa).
+ *
+ * Desconhecido vira `text` e o tipo cru sai em `rawType`, que a ingestão grava
+ * em `metadata.raw_type` — o precedente do canal por QR (`mapWahaMessageType`).
+ * Sem marcador no corpo, de propósito: o corpo é o que o cliente escreveu, e um
+ * marcador chegaria ao agente como fala do cliente.
+ */
+const TIPO_NO_CRM: ReadonlyMap<string, string> = new Map([
+  ["text", "text"],
+  ["image", "image"],
+  ["video", "video"],
+  ["audio", "audio"],
+  ["document", "document"],
+  ["sticker", "sticker"],
+  ["location", "location"],
+  ["contact", "contact"],
+  ["reaction", "reaction"],
+  ["system", "system"],
+  ["template", "template"],
+  // A Meta manda o cartão como `contacts` (plural); o banco espera `contact`.
+  ["contacts", "contact"],
+  // Toque num botão de modelo (`button`) ou numa resposta interativa: entram
+  // como texto, com o rótulo tocado (`textoDoClique`).
+  ["button", "text"],
+  ["interactive", "text"],
+]);
+
+function noVocabularioDoCrm(tipo: string): { tipoCrm: string; rawType?: string } {
+  const tipoCrm = TIPO_NO_CRM.get(tipo);
+  return tipoCrm !== undefined ? { tipoCrm } : { tipoCrm: "text", rawType: tipo };
 }
 
 /**
@@ -275,9 +384,46 @@ export function parseMetaWebhook(envelope: MetaWebhookEnvelope): MetaWebhookEven
 
           const perfil = contatos.find((c) => str(c.wa_id) === from);
           const tipo = str(raw.type) ?? "unknown";
-          const corpoMidia = tipo !== "contacts" ? (raw[tipo] as Record<string, unknown> | undefined) : undefined;
+
+          // ── REAÇÃO (#2797): não é mensagem, e não pode virar linha cega ──
+          //
+          // Ela chega no MESMO `messages[]` de um texto, o que fazia o bloco de
+          // baixo tratá-la como mensagem qualquer: linha `type='reaction'` sem
+          // emoji e sem alvo, e o carimbo da conversa movendo última mensagem,
+          // janela de 24h e prévia por um gesto que não é fala. O evento próprio
+          // é o que separa os dois caminhos lá na frente (a ingestão de reação
+          // não chama `fn_mark_conversation_message`).
+          //
+          // Sem `reaction.message_id` não há o que ligar: descartar AQUI, antes
+          // de qualquer escrita, é o que impede a linha órfã.
+          if (tipo === "reaction") {
+            const miolo = objetoSimples(raw.reaction);
+            const alvo = str(miolo?.message_id);
+            if (!alvo) continue;
+            out.push({
+              kind: "reaction",
+              wabaId,
+              phoneNumberId: str(meta.phone_number_id) ?? "",
+              externalId: id,
+              from,
+              // A Meta OMITE o `emoji` quando o usuário remove a reação — é
+              // como o WhatsApp desfaz o gesto, e o modelo tem de caber nos dois.
+              emoji: str(miolo?.emoji),
+              targetExternalId: alvo,
+              sentAt: new Date(Number(str(raw.timestamp) ?? "0") * 1000),
+            });
+            continue;
+          }
+
+          // Toque num botão de modelo chega como `button`, e numa resposta interativa como
+          // `interactive`: nenhum dos dois cabe no CHECK de `messages.type`, e gravá-los crus
+          // fazia o insert falhar — a resposta do contato sumia do CRM. Entram como texto,
+          // com o rótulo que a pessoa tocou.
+          const cliqueDeBotao = tipo === "button" || tipo === "interactive";
+          const corpoMidia =
+            tipo !== "contacts" && !cliqueDeBotao ? (raw[tipo] as Record<string, unknown> | undefined) : undefined;
           const sharedContact = tipo === "contacts" ? parseMetaInboundContact(raw) : null;
-          const tipoCrm = tipo === "contacts" ? "contact" : tipo;
+          const { tipoCrm, rawType } = noVocabularioDoCrm(tipo);
 
           out.push({
             kind: "inbound_message",
@@ -289,8 +435,10 @@ export function parseMetaWebhook(envelope: MetaWebhookEnvelope): MetaWebhookEven
             // A Meta manda epoch em SEGUNDOS, string. Passar direto ao Date daria 1970.
             sentAt: new Date(Number(str(raw.timestamp) ?? "0") * 1000),
             type: tipoCrm,
-            text:
-              tipoCrm === "text"
+            ...(rawType !== undefined ? { rawType } : {}),
+            text: cliqueDeBotao
+              ? textoDoClique(raw, tipo)
+              : tipoCrm === "text"
                 ? str((raw.text as Record<string, unknown>)?.body)
                 : sharedContact?.name ?? null,
             ...(sharedContact ? { sharedContact } : {}),
@@ -301,6 +449,9 @@ export function parseMetaWebhook(envelope: MetaWebhookEnvelope): MetaWebhookEven
                     url: str(corpoMidia.url),
                     mime: str(corpoMidia.mime_type),
                     voice: corpoMidia.voice === true,
+                    // Nome original (Cloud API: `document.filename`). `str`
+                    // devolve null em string vazia — a chave não nasce vazia.
+                    filename: str(corpoMidia.filename),
                   }
                 : null,
             referral: raw.referral ?? null,
@@ -338,11 +489,11 @@ export function parseMetaWebhook(envelope: MetaWebhookEnvelope): MetaWebhookEven
           if (!id || !to) continue; // payload capenga não vira linha meia-boca
           if (tipo === "revoke" || tipo === "edit") continue; // ver `OutboundEchoEvent`
 
-          // Cartão chega como `contacts`, que o CHECK de `messages.type` recusa —
-          // mesmo mapeamento da recebida, senão o insert falha e a IA não pausa.
+          // O tipo passa pelo MESMO mapa da recebida (`TIPO_NO_CRM`): fora do CHECK
+          // de `messages.type`, o insert falhava e a IA não pausava.
           const corpoMidia = tipo !== "contacts" ? (raw[tipo] as Record<string, unknown> | undefined) : undefined;
           const sharedContact = tipo === "contacts" ? parseMetaInboundContact(raw) : null;
-          const tipoCrm = tipo === "contacts" ? "contact" : tipo;
+          const { tipoCrm, rawType } = noVocabularioDoCrm(tipo);
           out.push({
             kind: "outbound_echo",
             wabaId,
@@ -351,6 +502,7 @@ export function parseMetaWebhook(envelope: MetaWebhookEnvelope): MetaWebhookEven
             to,
             sentAt: new Date(Number(str(raw.timestamp) ?? "0") * 1000),
             type: tipoCrm,
+            ...(rawType !== undefined ? { rawType } : {}),
             // Texto do balão: o corpo, o nome do cartão, ou a legenda da mídia.
             text:
               tipoCrm === "text"
@@ -364,6 +516,8 @@ export function parseMetaWebhook(envelope: MetaWebhookEnvelope): MetaWebhookEven
                     url: str(corpoMidia.url),
                     mime: str(corpoMidia.mime_type),
                     voice: corpoMidia.voice === true,
+                    // Idem a recebida: o eco do app também traz `document.filename`.
+                    filename: str(corpoMidia.filename),
                   }
                 : null,
           });

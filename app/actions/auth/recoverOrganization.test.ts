@@ -57,11 +57,13 @@ vi.mock("@/lib/audit", async (orig) => ({
 
 const USUARIO = { id: "11111111-1111-4111-8111-111111111111", email: "dono@exemplo.com.br" };
 
+const atualizarConta = vi.fn(async (_: unknown) => ({ error: null }));
 function comUsuario(user_metadata: Record<string, unknown> = {}) {
   vi.mocked(createClient).mockResolvedValue({
-    auth: { getUser: vi.fn(async () => ({ data: { user: { ...USUARIO, user_metadata } } })) },
+    auth: { getUser: vi.fn(async () => ({ data: { user: { ...USUARIO, user_metadata } } })), updateUser: atualizarConta },
   } as never);
 }
+const PLANO = "33333333-3333-4333-8333-333333333333";
 
 describe("recoverOrganization", () => {
   beforeEach(() => {
@@ -158,6 +160,30 @@ describe("recoverOrganization", () => {
     ).toBeLessThanOrEqual(3);
   });
 
+  it("⭐ #2846 o plano escolhido nesta tela vence o que a conta trazia, e chega ao provisionamento", async () => {
+    comUsuario({ org_name: "Velho", cobranca_plan_id: "44444444-4444-4444-8444-444444444444" });
+    const { recoverOrganization } = await import("./recoverOrganization");
+
+    await expect(recoverOrganization("Clínica Boa Vista", PLANO)).rejects.toThrow("NEXT_REDIRECT:/onboarding/welcome");
+    expect(vi.mocked(ensureTenantForUser).mock.calls[0]![0].user_metadata).toMatchObject({
+      org_name: "Clínica Boa Vista", cobranca_plan_id: PLANO,
+    });
+  });
+
+  it("⭐ #2846 o gatilho recusa por falta de plano: a tela diz para escolher um, em vez de 'tente de novo'", async () => {
+    vi.mocked(ensureTenantForUser).mockRejectedValue(new Error("signup provisioning: org insert failed: plano_obrigatorio"));
+    const { recoverOrganization } = await import("./recoverOrganization");
+
+    await expect(recoverOrganization("Clínica Boa Vista")).resolves.toEqual({ ok: false, error: "plano_obrigatorio" });
+  });
+
+  it("plano que não é uuid para antes de qualquer escrita", async () => {
+    const { recoverOrganization } = await import("./recoverOrganization");
+
+    await expect(recoverOrganization("Clínica Boa Vista", "1 or 1=1")).resolves.toEqual({ ok: false, error: "validation_error" });
+    expect(ensureTenantForUser).not.toHaveBeenCalled();
+  });
+
   it("provisionamento que levanta vira erro tratado, não tela branca", async () => {
     vi.mocked(ensureTenantForUser).mockRejectedValue(new Error("banco fora do ar"));
     const { recoverOrganization } = await import("./recoverOrganization");
@@ -179,7 +205,22 @@ describe("o laço está cortado nos três pontos que o formavam", () => {
   const PONTOS: Array<[string, string]> = [
     ["app/onboarding/layout.tsx", 'if (!activeOrg) redirect("/get-started")'],
     ["app/onboarding/page.tsx", 'if (!activeOrg) redirect("/get-started")'],
-    ["app/auth/confirm/route.ts", 'return redirectTo("/get-started")'],
+    // ── O DESTINO NÃO MUDOU; O VEÍCULO MUDOU (#4335) ──────────────────────
+    // Esta entrada exigia o literal `return redirectTo("/get-started")`. Depois
+    // da #4335 o confirm não responde mais 3xx para tela que exige sessão: a
+    // volta que chega de FORA (o GET com `code`, que vem do `/auth/v1/verify`
+    // do GoTrue, iniciado num cliente de e-mail) sai pela PONTE, e quem decide
+    // isso é `sair()` — `paraTelaAutenticada` quando `pelaPonte`, `redirectTo`
+    // no POST de `/login/continuar`, que parte de um documento nosso.
+    //
+    // O que esta cerca protege continua sendo o CORTE DO LAÇO: o confirm manda
+    // para a SAÍDA (`/get-started`), nunca de volta para `/login`. Trocar o
+    // veículo não move o destino — e é por isso que a expectativa passa a ser o
+    // literal do veículo novo, e não um `toContain("/get-started")` frouxo, que
+    // aceitaria um comentário citando a rota enquanto o código fosse para outro
+    // lugar. Um `redirectTo("/get-started")` de volta aqui reprova esta entrada
+    // E `tests/unit/volta-de-fora-nao-sai-por-302.test.ts`.
+    ["app/auth/confirm/route.ts", 'return await sair("/get-started")'],
   ];
 
   it.each(PONTOS)("%s manda para a saída, não de volta para o login", async (arquivo, esperado) => {
@@ -288,6 +329,15 @@ describe("recoverOrganization — instalação com aprovação", () => {
     );
     expect(createRegistrationRequest).toHaveBeenCalledWith(USUARIO.id, "Clínica Boa Vista");
     expect(ensureTenantForUser, "a empresa nasceu sem aprovação").not.toHaveBeenCalled();
+  });
+
+  it("⭐ #2846 o plano escolhido fica na CONTA, que é de onde a aprovação o lê", async () => {
+    vi.mocked(modoDeCadastro).mockResolvedValue("com_aprovacao");
+    const { recoverOrganization } = await import("./recoverOrganization");
+
+    await expect(recoverOrganization("Clínica Boa Vista", PLANO)).rejects.toThrow("NEXT_REDIRECT:/get-started");
+    expect(atualizarConta).toHaveBeenCalledWith({ data: { cobranca_plan_id: PLANO } });
+    expect(createRegistrationRequest).toHaveBeenCalled();
   });
 
   it("⭐ recusa é final: pedir de novo não enfileira outro pedido", async () => {
