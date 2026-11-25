@@ -25,6 +25,8 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { estornarSchema } from "@/lib/financeiro/comanda";
 import { requireSupportWrite } from "@/lib/impersonate/support";
+import { moduloLigado } from "@/lib/instalacao/modulos";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
@@ -54,6 +56,11 @@ function traduzirErro(mensagem: string): { code: string; status: number; texto: 
 
 export async function POST(req: NextRequest, ctx: Ctx): Promise<Response> {
   const requestId = randomUUID();
+  // #1907 item 4 — comanda é MÓDULO DE TABELA: sem `modulos_instalados` a
+  // linha ativa as cinco tabelas não existem e a rota não existe. 404,
+  // mesmo molde da cobrança desligada (falha fechada, dois lados).
+  const admin = createAdminClient();
+  if (!(await moduloLigado(admin, "financeiro"))) return fail("not_found", "Not found", 404, { requestId });
   const supportDenied = await requireSupportWrite();
   if (supportDenied) return supportDenied;
 
@@ -105,6 +112,8 @@ export async function POST(req: NextRequest, ctx: Ctx): Promise<Response> {
     // motivo — que é o que a obrigatoriedade do campo existe para garantir.
     await audit({
       action: "comanda.estornada",
+      actorUserId: authz.user.id,
+      organizationId: authz.org.orgId,
       resourceType: "sale",
       resourceId: id,
       requestId,

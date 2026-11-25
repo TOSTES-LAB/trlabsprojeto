@@ -31,6 +31,33 @@ export const EXTENSION_PERMISSIONS = [
   // O consentimento para um tema de extensão pintar o produto — mostrado na
   // MESMA tela que lista as demais permissões antes de alguém aceitar a extensão.
   "theme.apply",
+  // A concessão de um módulo de DADOS: ele guarda fichas próprias, declaradas no manifesto e
+  // compiladas pelo host. Entra na lista porque aparece na MESMA tela de consentimento das outras —
+  // um pacote de dados não pede porta de navegação, e dar-lhe uma que ele não usa só para caber na
+  // validação seria mentir para quem lê a tela (ADR-0005, D4).
+  "dados.proprios",
+  // As áreas do CRM que um módulo CONECTADO pode ler ou alterar (spec 33, F1). A lista de
+  // áreas e o significado de cada permissão moram em `areas.ts`; o SIGNIFICADO no host é da F3,
+  // e nesta fatia nada consome estas permissões. Escritas em extenso porque `z.enum` precisa do
+  // tipo literal. Mesma ordem em `experiments/extensoes/catalog/catalog.py` (PERMISSOES).
+  "area.contatos.leitura",
+  "area.contatos.escrita",
+  "area.negocios.leitura",
+  "area.negocios.escrita",
+  "area.conversas.leitura",
+  "area.conversas.escrita",
+  "area.agenda.leitura",
+  "area.agenda.escrita",
+  "area.funis.leitura",
+  "area.funis.escrita",
+  "area.agentes_ia.leitura",
+  "area.agentes_ia.escrita",
+  "area.catalogo.leitura",
+  "area.catalogo.escrita",
+  "area.configuracao.leitura",
+  "area.configuracao.escrita",
+  "area.analise.leitura",
+  "area.analise.escrita",
 ] as const;
 export type ExtensionPermission = (typeof EXTENSION_PERMISSIONS)[number];
 

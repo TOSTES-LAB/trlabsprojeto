@@ -8,8 +8,11 @@
  *
  * Timeout 5s, sem retry. Erros 401 são distintos de erros de rede.
  */
+import { AIMLAPI_ENDPOINT } from "@/lib/agent-engine/edge/llm/providers";
 import { baseDaApiDoJev } from "@/lib/ai/decisao/cliente";
+import { caminhoDaProva, ORIGEM_PADRAO, type OrigemDoJev } from "@/lib/ai/decisao/origem";
 import { PROVEDOR_POR_ASSINATURA, type ProvedorComChave } from "@/lib/ai/pontos/provedores";
+import { PROVEDORES_DE_SERVICO } from "@/lib/ai/pontos/provedores-de-servico";
 import { motivoDaRecusaDeDestino } from "@/lib/automation/destinos-internos-autorizados";
 import { env } from "@/lib/env";
 
@@ -24,6 +27,13 @@ export interface ValidationFail {
 }
 
 export type ValidationResult = ValidationOk | ValidationFail;
+
+/**
+ * Os provedores de SERVIÇO (voz, hoje) cuja chave este arquivo sabe validar.
+ * Derivado de `lib/ai/pontos/provedores-de-servico.ts` — ver o cabeçalho
+ * daquele arquivo para o porquê de serem uma lista separada da de chat.
+ */
+export type ServiceProvider = (typeof PROVEDORES_DE_SERVICO)[number]["id"];
 
 const TIMEOUT_MS = 5000;
 /** Só do provedor personalizado — ver `validateCustomKey`. */
@@ -279,16 +289,79 @@ export async function validateRequestyKey(apiKey: string): Promise<ValidationRes
   }
 }
 
+/** O `type` das linhas do catálogo da AI/ML API que falam Chat Completions. */
+export const AIMLAPI_TIPO_DE_CHAT = "openai/chat-completions";
+
+/**
+ * A AI/ML API prova a chave pelo `GET /v1/key`, que EXIGE a credencial (medido:
+ * 401 com chave falsa, 200 com a real) e não gasta token. O `GET /v1/models`
+ * NÃO serve de prova: é o catálogo público e responde 200 até com chave falsa
+ * (medido), por isso ele vem depois, SEM o header, só para listar os modelos.
+ *
+ * O catálogo traz todo tipo de modelo (imagem, vídeo, voz...) e o mesmo id em
+ * mais de um formato de API; ficam só as linhas `type = openai/chat-completions`,
+ * que é o que a fábrica `.chat()` fala. `redirect: "error"` nas duas: a chave
+ * nunca segue um redirect para fora de `api.aimlapi.com`.
+ */
+export async function validateAimlapiKey(apiKey: string): Promise<ValidationResult> {
+  try {
+    const res = await timedFetch(`${AIMLAPI_ENDPOINT}/key`, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${apiKey}` },
+      redirect: "error",
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "auth_failed_401" };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `provider_status_${res.status}` };
+    }
+    const lista = await timedFetch(`${AIMLAPI_ENDPOINT}/models`, {
+      method: "GET",
+      redirect: "error",
+    });
+    if (!lista.ok) {
+      return { ok: false, error: `provider_status_${lista.status}` };
+    }
+    const json = (await lista.json()) as { data?: { id?: string; type?: string }[] };
+    const models = [
+      ...new Set(
+        (json.data ?? [])
+          .filter((m) => m.type === AIMLAPI_TIPO_DE_CHAT)
+          .map((m) => m.id ?? "")
+          .filter(Boolean),
+      ),
+    ];
+    return { ok: true, models };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.name : "network_error" };
+  }
+}
+
 /**
  * O Jev (TypeSafe AI) prova a chave pelo `GET /v1/models`, que EXIGE a
  * credencial (medido: 401 com chave falsa, 403 sem chave, 200 com a real) e não
  * gasta token. O formato do catálogo é `{ models: [{ name }] }`, diferente do
  * `{ data: [{ id }] }` dos outros. A base é a mesma que o cliente usa, para o
  * dublê do e2e validar pelo mesmo caminho.
+ *
+ * ═══ A ORIGEM MUDA A PROVA, E É POR ISSO QUE ELA ENTRA AQUI ═══
+ *
+ * Via OpenRouter (`./decisao/origem`) o MESMO Jev responde, mas o catálogo
+ * `/v1/models` de lá é PÚBLICO — responde 200 para qualquer string, e provar a
+ * chave por ele gravaria qualquer coisa como validada (o defeito que este
+ * arquivo já corrigiu para o provedor OpenRouter, medido em 2026-09-02). Quem
+ * prova a chave na OpenRouter é `GET /v1/key` (`caminhoDaProva`), sobre a MESMA
+ * base que a chamada usará — um dublê ou proxy prova o par exato que vai sair.
+ * (A credencial OpenRouter da CONVERSA é provada por `validateOpenRouterKey`,
+ * que é outro caminho de escrita, e não muda.)
  */
-export async function validateTypeSafeKey(apiKey: string): Promise<ValidationResult> {
+export async function validateTypeSafeKey(
+  apiKey: string,
+  origem: OrigemDoJev = ORIGEM_PADRAO,
+): Promise<ValidationResult> {
   try {
-    const res = await timedFetch(`${baseDaApiDoJev()}/v1/models`, {
+    const res = await timedFetch(`${baseDaApiDoJev(origem)}${caminhoDaProva(origem)}`, {
       method: "GET",
       headers: { Authorization: `Bearer ${apiKey}` },
     });
@@ -298,6 +371,10 @@ export async function validateTypeSafeKey(apiKey: string): Promise<ValidationRes
     if (!res.ok) {
       return { ok: false, error: `provider_status_${res.status}` };
     }
+    // A prova da OpenRouter não devolve catálogo, e o catálogo dela não é a
+    // lista do Jev: a tela do Jev não a usa (o rótulo e o prefixo da chave são
+    // estáticos). Provar a chave é o que importa; inventar uma lista não.
+    if (origem === "openrouter") return { ok: true, models: [] };
     const json = (await res.json()) as { models?: { name?: string }[] };
     const models = (json.models ?? []).map((m) => m.name ?? "").filter(Boolean);
     return { ok: true, models };
@@ -372,8 +449,37 @@ export async function validateCustomKey(
  * 0127 — quando era repetida à mão aqui, a 0127 abriu o banco para a OpenRouter
  * e as cópias continuaram recusando.
  */
+/**
+ * ElevenLabs — `/v1/voices` exige a chave (não é endpoint público, ao
+ * contrário do catálogo da OpenRouter) e devolve as vozes da conta, que é
+ * exatamente o que a tela de síntese precisa listar para o operador escolher.
+ * `models` aqui carrega `voice_id`, porque é o valor que
+ * `organizations.settings->'voz'.voice_id` precisa guardar — o nome por si só
+ * não identifica a voz na chamada de síntese.
+ */
+export async function validateElevenLabsKey(apiKey: string): Promise<ValidationResult> {
+  try {
+    const res = await timedFetch("https://api.elevenlabs.io/v1/voices", {
+      method: "GET",
+      headers: { "xi-api-key": apiKey },
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: "auth_failed_401" };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `provider_status_${res.status}` };
+    }
+    const json = (await res.json()) as { voices?: { voice_id?: string }[] };
+    const models = (json.voices ?? []).map((v) => v.voice_id ?? "").filter(Boolean);
+    return { ok: true, models };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.name : "network_error" };
+  }
+}
+
 export function validateProviderKey(
-  provider: ProvedorComChave,
+  // A credencial dos dois mundos (chat e serviço) mora na mesma tabela.
+  provider: ProvedorComChave | ServiceProvider,
   apiKey: string,
   baseUrl?: string,
 ): Promise<ValidationResult> {
@@ -388,8 +494,12 @@ export function validateProviderKey(
       return validateOpenRouterKey(apiKey);
     case "deepseek":
       return validateDeepSeekKey(apiKey);
+    case "elevenlabs":
+      return validateElevenLabsKey(apiKey);
     case "requesty":
       return validateRequestyKey(apiKey);
+    case "aimlapi":
+      return validateAimlapiKey(apiKey);
     case "custom":
       return validateCustomKey(apiKey, baseUrl);
     case "typesafe":
@@ -403,7 +513,7 @@ export function validateProviderKey(
       return Promise.resolve({
         ok: false,
         error:
-          'assinatura_pelo_login: esta credencial não é uma chave — conecte-a no painel "Conectar com o Codex" da tela de Credenciais desta empresa.',
+          'assinatura_pelo_login: esta credencial não é uma chave — conecte a conta do ChatGPT no painel de Credenciais desta empresa.',
       });
     default: {
       // Sem `never` aqui: o tipo é derivado das listas, e elas
