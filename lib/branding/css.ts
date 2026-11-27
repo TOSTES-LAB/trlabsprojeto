@@ -110,7 +110,18 @@ function declaracoesDoTema(cor: CorResolvida, tema: "claro" | "escuro"): Declara
   const derivada = cor.derivada;
   if (!derivada) return saida;
 
-  const t = tema === "claro" ? derivada.claro : derivada.escuro;
+  // ── A segunda semente (#2482) ─────────────────────────────────────────────
+  //
+  // Só o ESCURO troca de fonte: com `corEscura` preenchida, o bloco
+  // `[data-theme="dark"]` deriva da segunda semente pela MESMA `derivarMarca`
+  // — mesmos pisos de contraste, mesmo deslocamento de rampa —, e o claro
+  // segue na primeira. Sem a chave, `fonte` é a própria `derivada`, que é o
+  // caminho de antes: a ausência é o caso normal, não um ramo especial.
+  //
+  // `--color-brand` continua sendo a semente PRINCIPAL nos DOIS blocos: ele é
+  // declarado acima, antes deste ponto, e é o que e-mail e logo leem.
+  const fonte = tema === "escuro" && cor.corEscura ? cor.corEscura.derivada : derivada;
+  const t = tema === "claro" ? fonte.claro : fonte.escuro;
 
   // Os 11 stops saem JÁ DESLOCADOS, e por isso podem diferir entre os dois
   // blocos. Os rótulos vêm de `GRAUS` (rampa.ts) e não de uma lista repetida
@@ -152,7 +163,7 @@ function declaracoesDoTema(cor: CorResolvida, tema: "claro" | "escuro"): Declara
   // sempre significou. Com d=0 — a Sage e toda marca que já cabe — a saída é
   // idêntica à de antes, byte a byte.
   for (const [i, grau] of GRAUS.entries()) {
-    saida.push([`--color-accent-${grau}`, stop(derivada.rampa, i + t.deslocamento)]);
+    saida.push([`--color-accent-${grau}`, stop(fonte.rampa, i + t.deslocamento)]);
   }
 
   saida.push(
@@ -220,7 +231,47 @@ export const ESCOPO_DA_ORGANIZACAO = [
   ['[data-theme="dark"] body:has([data-marca-org])', "escuro"],
 ] as const;
 
-export type EscopoDaMarca = typeof ESCOPO_DA_INSTALACAO | typeof ESCOPO_DA_ORGANIZACAO;
+/**
+ * O escopo de um TEMPLATE da tela Aparência (`lib/aparencia/css.ts`), que deriva
+ * a cor de ação pelo MESMO gerador, só que escopada pelo id do template.
+ *
+ * Não é um seletor livre: só nasce em `escopoDeAparencia`, que monta os quatro
+ * seletores possíveis a partir de um atributo fixo e de um id no formato do
+ * catálogo — o seletor entra em `montarBloco` sem outra validação, e a marca do
+ * tipo é o que impede uma string solta de chegar lá.
+ */
+declare const ESCOPO_VALIDADO: unique symbol;
+export type EscopoDeAparencia = readonly [
+  readonly [string, "claro"],
+  readonly [string, "escuro"],
+] & { readonly [ESCOPO_VALIDADO]: true };
+
+const ID_DE_APARENCIA = /^[a-z][a-z0-9-]{1,31}$/;
+
+/**
+ * `sistema` pinta o `/app` da organização (o marcador carrega o id e o modo
+ * vem do `<html>`); `amostra` pinta a miniatura da galeria (o modo vem do
+ * próprio elemento, para claro e escuro aparecerem lado a lado).
+ */
+export function escopoDeAparencia(alvo: "sistema" | "amostra", id: string): EscopoDeAparencia {
+  if (!ID_DE_APARENCIA.test(id)) throw new Error(`id de aparência fora do formato: ${JSON.stringify(id)}`);
+  const pares =
+    alvo === "sistema"
+      ? ([
+          [`body:has([data-aparencia="${id}"])`, "claro"],
+          [`[data-theme="dark"] body:has([data-aparencia="${id}"])`, "escuro"],
+        ] as const)
+      : ([
+          [`[data-aparencia-amostra="${id}"][data-aparencia-modo="claro"]`, "claro"],
+          [`[data-aparencia-amostra="${id}"][data-aparencia-modo="escuro"]`, "escuro"],
+        ] as const);
+  return pares as unknown as EscopoDeAparencia;
+}
+
+export type EscopoDaMarca =
+  | typeof ESCOPO_DA_INSTALACAO
+  | typeof ESCOPO_DA_ORGANIZACAO
+  | EscopoDeAparencia;
 
 function montarBloco(seletor: string, decls: readonly Declaracao[]): string {
   const linhas = decls.map(([nome, valor]) => `  ${nome}: ${valor};`);

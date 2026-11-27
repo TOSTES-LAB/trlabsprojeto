@@ -35,7 +35,7 @@ import {
 
 /** As colunas que descrevem um retorno. Uma lista só — leitura e escrita. */
 const COLUNAS =
-  "id, contact_id, next_run_at, enabled, payload, cancelled_at, cancel_reason";
+  "id, contact_id, next_run_at, enabled, payload, cancelled_at, cancel_reason, last_error";
 
 interface LinhaDeCron {
   id: string;
@@ -45,6 +45,7 @@ interface LinhaDeCron {
   payload: Record<string, unknown> | null;
   cancelled_at: string | null;
   cancel_reason: string | null;
+  last_error: string | null;
 }
 
 function texto(v: unknown): string | null {
@@ -58,7 +59,11 @@ function paraRetorno(row: LinhaDeCron): RetornoAgendado {
     contactId: row.contact_id,
     quando: row.next_run_at,
     prometidoPara: texto(payload.promised_at),
-    situacao: situacaoDoRetorno({ enabled: row.enabled, cancelled_at: row.cancelled_at }),
+    situacao: situacaoDoRetorno({
+      enabled: row.enabled,
+      cancelled_at: row.cancelled_at,
+      last_error: row.last_error,
+    }),
     motivo: texto(payload.reason) ?? "Retorno agendado",
     promessa: texto(payload.promise),
     canceladoEm: row.cancelled_at,
@@ -356,6 +361,17 @@ export type FalhaDeAlvo = Extract<ResolucaoDoAlvo, { ok: false }>;
  * abrir o dossiê pega. O padrão da casa é o de `stageChangeReason` — o rótulo
  * nomeia o QUE aconteceu, o reason conta o PORQUÊ, e eles não se repetem.
  */
+/**
+ * Quem desmarcou o retorno pela fila, em uma frase — a mesma que o agente e a
+ * timeline leem. Pelo token o "quem" não é uma pessoa (#5160): a linha diria
+ * "Integração · <token>" ao lado de "por uma pessoa da equipe".
+ */
+export function motivoDoCancelamentoPelaFila(actor: Actor): string {
+  if (actor.type === "user") return "desmarcado por uma pessoa da equipe";
+  if (actor.type === "ai_agent") return "desmarcado pelo agente de IA";
+  return "desmarcado por uma integração";
+}
+
 function motivoLegivel(texto: string): string {
   const limpo = texto.trim();
   if (limpo === "") return "Sem motivo informado";

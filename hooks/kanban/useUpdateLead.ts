@@ -1,7 +1,9 @@
 "use client";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { apiClient } from "@/lib/api/client";
+import { ApiError } from "@/lib/api/types";
 import { liberarEcoLocal, marcarEcoLocal } from "@/lib/kanban/local-echo";
+import { fundeRespostaNoCard } from "@/lib/kanban/owner";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import type { Lead } from "@/lib/types/leads";
 import type { BoardData } from "@/lib/kanban/types";
@@ -31,31 +33,62 @@ function gravaLeadNoQuadro(
   if (!lead) return;
   qc.setQueryData<BoardData>(queryKey, (atual) =>
     atual
-      ? { ...atual, leads: atual.leads.map((l) => (l.id === leadId ? { ...l, ...lead } : l)) }
+      ? {
+          ...atual,
+          leads: atual.leads.map((l) => (l.id === leadId ? fundeRespostaNoCard(l, lead) : l)),
+        }
       : atual,
   );
 }
 
 interface WinArgs {
   leadId: string;
+  /**
+   * O motivo do ganho (issue #5181) — o que a caixa do card coletou antes de
+   * fechar. Ausente/`""` mantém o corpo `{}` de antes: o servidor decide
+   * (lista do funil, `won_reason_required`), e é ele quem recusa.
+   */
+  wonReason?: string;
 }
 interface LoseArgs {
   leadId: string;
   lostReason: string;
 }
 
-export function useWinLead(pipelineId: string) {
+interface OpcoesDoGanho {
+  /**
+   * A recusa `won_reason_invalid` do servidor (motivo fora de
+   * `settings.won_reasons`) vira mensagem NA PRÓPRIA CAIXA, não toast: a pessoa
+   * acabou de escolher na lista, e o único conserto possível é escolher outra —
+   * um toast genérico ("deu errado") some justamente quando ela precisa reler
+   * a lista. Sem esta opção, cai no `showApiError` de sempre.
+   */
+  onMotivoRecusado?: (erro: ApiError) => void;
+}
+
+export function useWinLead(pipelineId: string, opcoes: OpcoesDoGanho = {}) {
   const qc = useQueryClient();
   const queryKey = ["board", pipelineId] as const;
   return useMutation({
-    mutationFn: async ({ leadId }: WinArgs) => {
+    mutationFn: async ({ leadId, wonReason }: WinArgs) => {
       marcarEcoLocal(leadId);
-      return apiClient.post<{ data: Lead }>(`/api/v1/leads/${leadId}/win`, {});
+      // Corpo EXATAMENTE o de antes quando não há motivo: `won_reason: ""` não é
+      // o mesmo que "não informei" para quem lê o corpo no servidor.
+      return apiClient.post<{ data: Lead }>(
+        `/api/v1/leads/${leadId}/win`,
+        wonReason ? { won_reason: wonReason } : {},
+      );
     },
     onSuccess: (res, { leadId }) => {
       gravaLeadNoQuadro(qc, queryKey, leadId, res?.data);
     },
-    onError: showApiError,
+    onError: (err) => {
+      if (err instanceof ApiError && err.code === "won_reason_invalid" && opcoes.onMotivoRecusado) {
+        opcoes.onMotivoRecusado(err);
+        return;
+      }
+      showApiError(err);
+    },
     onSettled: (_data, _err, { leadId }) => {
       liberarEcoLocal(leadId);
       qc.invalidateQueries({ queryKey });
@@ -87,6 +120,13 @@ export function useLoseLead(pipelineId: string) {
 interface MoveToPipelineArgs {
   leadId: string;
   targetPipelineId: string;
+  /**
+   * A etapa de ENTRADA no funil destino (issue #3643). Ausente ou `null` é o
+   * comportamento de sempre: o servidor escolhe a primeira etapa aberta
+   * (`escolheEtapaDeDestino`). Não vai como `null` no corpo porque o schema
+   * aceita `stage_id` só como uuid — e porque "não escolhi" não é um pedido.
+   */
+  targetStageId?: string | null;
 }
 
 /**
@@ -104,11 +144,16 @@ export function useMoveLeadToPipeline(pipelineId: string) {
   const qc = useQueryClient();
   const queryKey = ["board", pipelineId] as const;
   return useMutation({
-    mutationFn: async ({ leadId, targetPipelineId }: MoveToPipelineArgs) => {
+    mutationFn: async ({ leadId, targetPipelineId, targetStageId }: MoveToPipelineArgs) => {
       marcarEcoLocal(leadId);
       return apiClient.post<{ data: { lead: Lead; origem: Lead } }>(
         `/api/v1/leads/${leadId}/clone`,
-        { pipeline_id: targetPipelineId },
+        {
+          pipeline_id: targetPipelineId,
+          // Sem escolha, o corpo é EXATAMENTE o de antes: quem decide a etapa
+          // continua sendo o servidor.
+          ...(targetStageId ? { stage_id: targetStageId } : {}),
+        },
       );
     },
     onSuccess: (res, { leadId }) => {

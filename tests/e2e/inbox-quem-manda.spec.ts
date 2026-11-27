@@ -25,6 +25,7 @@ import * as path from "node:path";
 import { expect, test, type Page } from "./helpers/test";
 import { createClient } from "@supabase/supabase-js";
 
+import { funilDeEntrada } from "../../lib/leads/nascimento-do-lead";
 import { carregarEnvLocal } from "../../scripts/lib/env-de-teste";
 
 const CREDS_PATH = path.join(process.cwd(), ".e2e-creds.json");
@@ -197,22 +198,38 @@ test.describe("Inbox — quem manda nesta conversa", () => {
     // pendurar a linha da timeline, e é a MESMA limitação que a ida e a volta
     // IA↔humano já têm. Semear o lead aqui é o que faz o passo (5) medir o
     // caminho que existe, em vez de reprovar por uma ausência que já era conhecida.
-    const { data: funil } = await admin
-      .from("crm_pipelines")
-      .select("id, crm_stages(id)")
-      .eq("organization_id", creds.org_id)
-      .eq("is_archived", false)
-      .limit(1)
-      .maybeSingle();
-    const funilId = (funil as { id: string } | null)?.id;
-    const etapaId = (funil as { crm_stages?: Array<{ id: string }> } | null)?.crm_stages?.[0]?.id;
-    if (!funilId || !etapaId) throw new Error("a org de teste não tem funil com etapa");
+    //
+    // ⚠️ ONDE ELE NASCE É A REGRA DO PRODUTO, não a primeira linha que o embed
+    // devolveu. A semeadura anterior pegava `crm_stages[0]` de
+    // `crm_pipelines.select("id, crm_stages(id)")` — sem ORDER BY e sem filtro
+    // de papel. A lista do embed não tem ordem, e a org de teste é
+    // COMPARTILHADA entre as specs da mesma parte: qual etapa vem primeiro não
+    // é propriedade de nada que este arquivo controle.
+    //
+    // Na corrida que reprovou o `e2e-parte (3)`, veio a etapa de PERDA: o
+    // `trg_crm_lead_close_on_stage` gravou `status='lost'` no INSERT e o
+    // `fn_validate_lost_reason_required` levantou `22023 lost_reason_required`.
+    // O `beforeAll` morria em `crm_leads: lost_reason_required`, antes de o
+    // corpo do teste rodar (0ms, e o teste seguinte "did not run") — e nada
+    // disso tinha a ver com o comando da conversa, que é o que a spec mede.
+    //
+    // `funilDeEntrada` é a MESMA regra pela qual a conversa vira negócio
+    // (`lib/leads/nascimento-do-lead.ts`, `primeiraEtapa`): funil padrão da
+    // organização e etapa de MENOR `position` entre as não arquivadas, não
+    // ganhas e não perdidas. Semear por ela é o que faz o card nascer onde o
+    // produto o faria — e um funil mal ordenado não pode mais fazer o negócio
+    // do teste nascer fechado.
+    const entrada = await funilDeEntrada(admin, creds.org_id);
+    if ("erro" in entrada) {
+      throw new Error(`a org de teste não tem funil de entrada com etapa aberta: ${entrada.erro}`);
+    }
+    const { pipelineId, stageId } = entrada;
 
     const { error: erroLead } = await admin.from("crm_leads").insert({
       organization_id: creds.org_id,
       contact_id: contatoId,
-      pipeline_id: funilId,
-      stage_id: etapaId,
+      pipeline_id: pipelineId,
+      stage_id: stageId,
       title: `Negócio de ${NOME_DO_CONTATO}`,
     });
     if (erroLead) throw new Error(`crm_leads: ${erroLead.message}`);
@@ -241,6 +258,46 @@ test.describe("Inbox — quem manda nesta conversa", () => {
     // -----------------------------------------------------------------
     // (2) A pessoa assume — pelo botão, como ela faria.
     // -----------------------------------------------------------------
+    // Um turno executa e outro aguarda ANTES do clique. Sem esta precondição,
+    // a tela provaria só silêncio futuro, deixando o turno antigo escapar.
+    const { data: fronteira, error: erroFronteira } = await admin.rpc("fn_service_boundary", {
+      p_org: creds.org_id,
+      p_conversation: conversaId,
+    });
+    if (erroFronteira || !fronteira)
+      throw new Error(`capturar atendimento: ${erroFronteira?.message ?? "ausente"}`);
+    const { data: turnos, error: erroTurnos } = await admin
+      .from("job_queue")
+      .insert(
+        ["inbound_turn", "case_reply_turn"].map((kind) => ({
+          organization_id: creds.org_id,
+          contact_id: contatoId,
+          kind,
+          status: kind === "inbound_turn" ? "running" : "pending",
+          locked_by: kind === "inbound_turn" ? "e2e-turno-antes-da-tomada" : null,
+          locked_at: kind === "inbound_turn" ? new Date().toISOString() : null,
+          payload: {
+            conversation_id: conversaId,
+            contact_id: contatoId,
+            service_boundary: fronteira,
+          },
+        })),
+      )
+      .select("id, status");
+    if (erroTurnos) throw new Error(`turnos já iniciados: ${erroTurnos.message}`);
+    expect(turnos).toHaveLength(2);
+    expect(turnos!.map((t) => t.status).sort()).toEqual(["pending", "running"]);
+    const idsDosTurnos = turnos!.map((t) => t.id);
+    async function comandoDosTurnos() {
+      const { data, error } = await admin
+        .from("job_queue")
+        .select("id,status,locked_by,locked_at,last_error")
+        .eq("organization_id", creds.org_id)
+        .in("id", idsDosTurnos)
+        .order("id");
+      if (error) throw new Error(`conferir comando: ${error.message}`);
+      return data;
+    }
     await page.getByRole("button", { name: /^Assumir$/i }).click();
 
     // -----------------------------------------------------------------
@@ -267,6 +324,17 @@ test.describe("Inbox — quem manda nesta conversa", () => {
     // parou. `bot_silenced_until` é o gate que os três guards do motor leem.
     // -----------------------------------------------------------------
     await expect.poll(async () => silencioNoBanco(), { timeout: 30_000 }).toMatch(/infinity/);
+    await expect
+      .poll(async () => comandoDosTurnos(), { timeout: 30_000 })
+      .toEqual(
+        idsDosTurnos.sort().map((id) => ({
+          id,
+          status: "failed",
+          locked_by: null,
+          locked_at: null,
+          last_error: "conversation_command_taken",
+        })),
+      );
 
     // -----------------------------------------------------------------
     // (5) A troca de comando aparece na linha do tempo do painel.
@@ -295,6 +363,22 @@ test.describe("Inbox — quem manda nesta conversa", () => {
     await expect(comando).toContainText(/autom/i, { timeout: 30_000 });
     await expect(page.getByTestId("badge-atendimento-humano")).toHaveCount(0);
     await captura(page, "3-devolvido-ao-automatico");
+    // Voltar ao automático autoriza um próximo turno; não revive o comando antigo.
+    expect(await comandoDosTurnos()).toEqual(
+      idsDosTurnos.map((id) => ({
+        id,
+        status: "failed",
+        locked_by: null,
+        locked_at: null,
+        last_error: "conversation_command_taken",
+      })),
+    );
+    const { error: erroLimpeza } = await admin
+      .from("job_queue")
+      .delete()
+      .eq("organization_id", creds.org_id)
+      .in("id", idsDosTurnos);
+    if (erroLimpeza) throw new Error(`limpar turnos fictícios: ${erroLimpeza.message}`);
   });
 
   test("a conversa que o automático escalou APARECE na Fila", async ({ page }) => {

@@ -6,6 +6,7 @@ import { getLeadContext } from "../edge/crm/get-lead-context";
 import { fusoDaOrganizacao } from "./fuso-da-org";
 import { latestCheckpoint, runAgentPreview, type InboundTurnDeps } from "./inbound-turn";
 import { newPreviewResult } from "./preview";
+import { temOfertaAoAtendente } from "./sugestao-de-resposta";
 import type { ServiceBoundary } from "@/lib/atendimento/fronteira";
 import { parseServiceBoundary, assertCurrentServiceBoundary } from "@/lib/atendimento/fronteira";
 import {
@@ -35,6 +36,7 @@ export async function generateReplyDraft(
     channelId: string;
     boundary?: ServiceBoundary;
     agent?: PublishedAgentConfig;
+    followupJobId?: string;
   },
 ) {
   const agent =
@@ -75,12 +77,19 @@ export async function generateReplyDraft(
           conversationId: input.conversationId,
           fuso: await fusoDaOrganizacao(pool, input.organizationId),
         },
-        { historyLimit: agent.historyMessageWindow, maxTokens: agent.historyTokenWindow },
+        {
+          historyLimit: agent.historyMessageWindow,
+          maxTokens: agent.historyTokenWindow,
+          // A prévia assistida ("Sugerir resposta") vê o que o turno real veria (9108).
+          verImagens: agent.imageVisionEnabled ?? true,
+        },
       );
       if (!context.ok || context.context.contact.is_blocked || context.lgpd.isAnonymized)
         throw new Error("reply_context_unavailable");
-      const { rows: notes } = await pool.query<{ headline: string; body: string }>(
-        "select headline,body from lead_notes where organization_id=$1 and contact_id=$2",
+      // Com id e na ordem de `getLeadNotesIndex`: acima do teto inline a prévia
+      // usa o índice do turno real, e o get_lead_note busca a nota pelo id.
+      const { rows: notes } = await pool.query<{ id: string; headline: string; body: string }>(
+        "select id::text as id,headline,body from lead_notes where organization_id=$1 and contact_id=$2 order by created_at, id",
         [input.organizationId, input.contactId],
       );
       const { rows: feedback } = await pool.query<{ feedback: unknown }>(
@@ -102,18 +111,36 @@ export async function generateReplyDraft(
         result,
       });
       const body = result.candidates.map((c) => c.body).join("\n\n");
+      // #3093, caso 2 — o rascunho ia para `failed` sempre que o corpo ficava
+      // vazio, mesmo com PROPOSTA registrada (a prévia do agente que só propõe
+      // uma ação e não escreve). O painel dizia "Não foi possível concluir a
+      // sugestão" para um desfecho que deu certo. A oferta é o corpo OU as
+      // propostas; sem nenhum dos dois, `failed` continua certo.
+      // Com veto/truncamento/teto, a proposta não basta: o motivo só aparece em `failed`.
+      const temOferta = temOfertaAoAtendente(body, result.proposals, result.impediments[0]?.code);
       const { rows: finished } = await pool.query(
-        `update ai_reply_drafts set status=case when not fn_reply_context_current($1,id) then 'stale' when $4='' then 'failed' else 'pending' end,
- original_body=$4,edited_body=$4,proposals=$5,trace=$6,error_code=$7,updated_at=now()
- where organization_id=$1 and id=$2 and generation_token=$3 and status='generating' returning *`,
+        `with finalizado as (
+           update ai_reply_drafts
+           set status=case when not fn_reply_context_current($1,id) then 'stale' when $4::boolean then 'pending' else 'failed' end,
+               original_body=$5,edited_body=$5,proposals=$6,trace=$7,error_code=$8,updated_at=now()
+           where organization_id=$1 and id=$2 and generation_token=$3 and status='generating'
+           returning *
+         )
+         select finalizado.*, case
+           when $9::uuid is not null and status = 'pending' and btrim(original_body) <> '' then
+             public.fn_followup_registrar_envio($1,$9,'followup_draft_generated',id::text,jsonb_build_object('draft_id', id))
+         end as historico_do_followup
+         from finalizado`,
         [
           input.organizationId,
           draft.id,
           token,
+          temOferta,
           body,
           JSON.stringify(result.proposals),
           JSON.stringify(result.candidates.flatMap((c) => c.trace)),
           result.impediments[0]?.code ?? null,
+          input.followupJobId ?? null,
         ],
       );
       return replyDraftSchema.parse(finished[0] ?? draft);

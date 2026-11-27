@@ -25,6 +25,7 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
 import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { ok, fail } from "@/lib/api/wrappers";
 import { ApiError } from "@/lib/api/types";
 import { audit } from "@/lib/audit";
@@ -33,6 +34,7 @@ import { createCallSchema, listCallsQuerySchema } from "@/lib/schemas/calls";
 import { validateRequest } from "@/lib/schemas/_validate";
 import { createClient } from "@/lib/supabase/server";
 import { originateCall } from "@/lib/voip/ariClient";
+import { idsDeContatosPessoais } from "@/app/api/v1/conversations/_handler";
 
 export const dynamic = "force-dynamic";
 
@@ -75,12 +77,28 @@ export function mapStatusParaApi(status: string, endReason: string | null): stri
  * GET /api/v1/calls — lista chamadas SIP da org ativa, mais recente primeiro.
  * `provider=eq.sip` sempre: chamada de WhatsApp (WaCalls) tem tela própria
  * (app/api/v1/voice/calls/*), não entra aqui.
+ *
+ * Sessão OU token (Spec 33, R2): `manager` na sessão; no token, `mcp:read` e
+ * papel `manager` na linha dele. A organização sai da sessão ou da LINHA DO
+ * TOKEN. No ramo do token o cliente é a service role e a RLS não protege mais:
+ * o `.eq("organization_id", …)` das duas consultas (as chamadas e os contatos
+ * pessoais) é a única barreira. O POST desta rota segue só de sessão (originar
+ * ligação é efeito sobre o cliente): `requireRole` recusa o token sem cookie.
  */
 export async function GET(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
-  const authz = await requireRole("manager", { requestId, resource: "voice_calls" });
+  const authz = await resolveAuthDual(req, {
+    requestId,
+    resource: "voice_calls",
+    role: "manager",
+    scope: "mcp:read",
+  });
   if (!authz.ok) return authz.response;
-  const { org: activeOrg } = authz;
+  // Está em PUBLIC_PATHS: o Bearer chega aqui sem estrangulamento a montante, e
+  // o teto por token e por organização é o único que conta as chamadas.
+  const teto = await tetoDeEscritaDoToken(authz, "voice_calls", requestId);
+  if (teto) return teto;
+  const organizationId = authz.organizationId;
 
   const params = Object.fromEntries(new URL(req.url).searchParams.entries());
   const parsed = listCallsQuerySchema.safeParse(params);
@@ -89,14 +107,23 @@ export async function GET(req: NextRequest): Promise<Response> {
   }
   const q = parsed.data;
 
-  const supabase = await createClient();
+  const supabase = authz.supabase;
   let query = supabase
     .from("voice_calls")
     .select(LIST_COLS)
-    .eq("organization_id", activeOrg.orgId)
+    .eq("organization_id", organizationId)
     .eq("provider", "sip")
     .order("started_at", { ascending: false })
     .limit(q.limit);
+
+  // Chamada de pessoal fica ESCONDIDA (spec 21, etapa 14): some do histórico e
+  // só volta ao desmarcar. A de bloqueado continua aparecendo como recusada
+  // (`contact_blocked` → `canceled` em `mapStatusParaApi`) — por isso o filtro
+  // é só de pessoal, pela mesma primitiva de ids da lista do inbox.
+  const pessoais = await idsDeContatosPessoais(supabase, organizationId);
+  if (pessoais.length > 0) {
+    query = query.not("contact_id", "in", `(${pessoais.join(",")})`);
+  }
 
   if (q.direction) query = query.eq("direction", q.direction);
 
@@ -158,6 +185,36 @@ export async function POST(req: NextRequest): Promise<Response> {
   }
 
   const supabase = await createClient();
+
+  // Ligar para pessoal é envio para fora da operação (spec 21, etapa 12): a
+  // discagem recusa como o `send` recusa — sem exceção, em todo papel que
+  // alcança esta rota. Via lead, resolve o contato do negócio antes de
+  // perguntar; sem contato ligado, não há o que vetar.
+  {
+    let contatoId: string | null = input.contactId ?? null;
+    if (!contatoId && input.leadId) {
+      const { data: negocio } = await supabase
+        .from("crm_leads")
+        .select("contact_id")
+        .eq("organization_id", activeOrg.orgId)
+        .eq("id", input.leadId)
+        .maybeSingle();
+      contatoId = ((negocio as { contact_id?: string | null } | null)?.contact_id ?? null) as
+        | string
+        | null;
+    }
+    if (contatoId) {
+      const { data: alvo } = await supabase
+        .from("contacts")
+        .select("is_personal")
+        .eq("organization_id", activeOrg.orgId)
+        .eq("id", contatoId)
+        .maybeSingle();
+      if ((alvo as { is_personal?: boolean } | null)?.is_personal === true) {
+        return fail("forbidden", "Contato marcado como pessoal.", 403, { requestId });
+      }
+    }
+  }
 
   // Trunk da organização (Configurações > Trunk SIP) — fallback pro env pra
   // quem ainda não cadastrou nada na tela.

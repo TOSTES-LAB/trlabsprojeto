@@ -7,13 +7,18 @@ import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 import { z } from "zod";
 
+import { resolveAuthDual, tetoDeEscritaDoToken } from "@/lib/api/auth-dual";
 import { ApiError } from "@/lib/api/types";
 import { ok, fail } from "@/lib/api/wrappers";
 import { orgAtivaDaApi, requireRole } from "@/lib/auth/require-role";
 import { loadAuthUser } from "@/lib/auth/server";
 import { traduzir } from "@/lib/i18n/dicionario";
+import { extractBearer } from "@/lib/mcp/auth";
+import { redigirContatoParaModulo } from "@/lib/modulo/redigir-contato";
 import { patchConversationSchema, validateRequest } from "@/lib/schemas";
 import { createClient } from "@/lib/supabase/server";
+import { identidadeIndisponivel } from "@/lib/supabase/falha-de-identidade";
+import { conferirOrgNaLeitura } from "@/lib/inbox/autorizacao-da-leitura";
 import { comNomeDoAtendente } from "@/lib/users/com-nome-do-atendente";
 
 import { getConversationHandler, patchConversationHandler } from "../_handler";
@@ -53,27 +58,74 @@ function idInvalido(id: string): boolean {
   return !z.uuid().safeParse(id).success;
 }
 
-export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
+export async function GET(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   const requestId = randomUUID();
   const { id } = await ctx.params;
+
+  // Token de integração (Spec 33, R2): `getConversationHandler` filtra
+  // `organization_id` e é o mesmo das tools MCP. A guarda do id vem DEPOIS do
+  // portão, como no ramo da sessão.
+  if (extractBearer(req.headers.get("authorization"))) {
+    const authz = await resolveAuthDual(req, {
+      requestId,
+      resource: "conversations",
+      role: "viewer",
+      scope: "mcp:read",
+      tokenRole: "agent",
+    });
+    if (!authz.ok) return authz.response;
+    const teto = await tetoDeEscritaDoToken(authz, "conversations", requestId);
+    if (teto) return teto;
+    if (idInvalido(id)) {
+      return fail("not_found", "Conversa não encontrada.", 404, { requestId });
+    }
+    try {
+      const conv = await getConversationHandler(
+        authz.supabase,
+        {
+          organization_id: authz.organizationId,
+          actor: authz.actor,
+          requestId,
+          idioma: authz.idioma,
+        },
+        id,
+      );
+      const [comNome] = await comNomeDoAtendente(authz.organizationId, [conv]);
+      return ok(redigirContatoParaModulo(authz, comNome ?? conv), { requestId });
+    } catch (err) {
+      if (err instanceof ApiError) {
+        return fail(err.code, err.message, err.status, { requestId });
+      }
+      throw err;
+    }
+  }
+
   const supabase = await createClient();
 
   const {
     data: { user },
     error: authErr,
   } = await supabase.auth.getUser();
+  if (identidadeIndisponivel(authErr)) {
+    return fail("auth_unavailable", "Authentication is temporarily unavailable.", 503, { requestId });
+  }
   if (authErr || !user) {
     return fail("unauthenticated", "Auth required.", 401, { requestId });
   }
 
   const authUser = await loadAuthUser();
-  const t = (texto: string) => traduzir(texto, authUser?.idioma ?? "pt-BR");
+  if (!authUser) {
+    return fail("auth_unavailable", "Authentication is temporarily unavailable.", 503, { requestId });
+  }
+  const t = (texto: string) => traduzir(texto, authUser.idioma ?? "pt-BR");
   const ativa = await orgAtivaDaApi(authUser, requestId);
   if (!ativa.ok) return ativa.response;
   const activeOrg = ativa.org;
   if (!activeOrg) {
     return fail("no_active_org", t("No active organization."), 403, { requestId });
   }
+  const orgDivergente = conferirOrgNaLeitura(req, activeOrg.orgId, requestId);
+  if (orgDivergente) return orgDivergente;
   if (idInvalido(id)) {
     return fail("not_found", "Conversa não encontrada.", 404, { requestId });
   }
@@ -91,7 +143,7 @@ export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
     );
     // Mesma razão da listagem: o nome entra na borda HTTP, não no handler que o
     // MCP compartilha. Aqui é UM lookup, não N.
-    const [comNome] = await comNomeDoAtendente([conv]);
+    const [comNome] = await comNomeDoAtendente(activeOrg.orgId, [conv]);
     return ok(comNome ?? conv, { requestId });
   } catch (err) {
     if (err instanceof ApiError) {

@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { logger } from "@/lib/logger";
+
 import { decidirElegibilidadeDaConversaViaSupabase } from "./consulta-supabase";
 
 const ORG = "11111111-1111-4111-8111-111111111111";
@@ -40,7 +42,14 @@ describe("decidirElegibilidadeDaConversaViaSupabase", () => {
       agora: AGORA,
       ttlMs: TTL,
     });
-    expect(d).toEqual({ permite: true, motivo: "gate_aberto", bloqueioPorAllowlist: false });
+    // #3534: a decisão do transporte carrega também `contatoDaEquipe` (a régua
+    // que o medidor de clima precisa). Aqui o contato não tem etiqueta de equipe.
+    expect(d).toEqual({
+      permite: true,
+      motivo: "gate_aberto",
+      bloqueioPorAllowlist: false,
+      contatoDaEquipe: false,
+    });
   });
 
   it("canal 'allowlist' + contato NÃO autorizado: NÃO permite (bloqueioPorAllowlist)", async () => {
@@ -153,7 +162,12 @@ describe("decidirElegibilidadeDaConversaViaSupabase", () => {
       adminStub({ data: linha({ organizations: { status: "suspended" } }), error: null }),
       { organizationId: ORG, conversationId: CONV, agora: AGORA, ttlMs: TTL },
     );
-    expect(d).toEqual({ permite: false, motivo: "org_nao_operante", bloqueioPorAllowlist: false });
+    expect(d).toEqual({
+      permite: false,
+      motivo: "org_nao_operante",
+      bloqueioPorAllowlist: false,
+      contatoDaEquipe: false,
+    });
   });
 
   it("embed da org ausente: NÃO permite (falha fechada)", async () => {
@@ -164,6 +178,38 @@ describe("decidirElegibilidadeDaConversaViaSupabase", () => {
     expect(d?.motivo).toBe("org_nao_operante");
   });
 
+  it("dono humano + modo 'IA com o dono' ligado: o transporte também permite (#3967)", async () => {
+    const d = await decidirElegibilidadeDaConversaViaSupabase(
+      adminStub({ data: linha({ assignee_kind: "user", metadata: { ai_com_dono: true } }), error: null }),
+      { organizationId: ORG, conversationId: CONV, agora: AGORA, ttlMs: TTL },
+    );
+    expect(d).toMatchObject({ permite: true, motivo: "gate_aberto" });
+  });
+
+  it("pré-go-live social: a identidade do contato chega ao gate — só a conta da lista passa", async () => {
+    const testador = "instagram:6af9e0ef28984e27de07bef4:1011223655361506";
+    const decidir = (identidade: string | null) =>
+      decidirElegibilidadeDaConversaViaSupabase(
+        adminStub({
+          data: linha({
+            channel_sessions: {
+              metadata: {
+                ai_gate: "allowlist", ai_gate_mode: "pre_go_live",
+                ai_test_phone_numbers: [], ai_test_social_identities: [testador],
+              },
+            },
+            contacts: { force_human: false, ai_authorized_at: null, phone_number: null, social_identity: identidade },
+          }),
+          error: null,
+        }),
+        { organizationId: ORG, conversationId: CONV, agora: AGORA, ttlMs: TTL },
+      );
+    expect(await decidir(testador)).toMatchObject({ permite: true, motivo: "numero_de_teste" });
+    expect(await decidir("instagram:0123456789abcdef01234567:1011223655361506"))
+      .toMatchObject({ permite: false, motivo: "fora_da_lista_de_teste" });
+    expect(await decidir(null)).toMatchObject({ permite: false, motivo: "fora_da_lista_de_teste" });
+  });
+
   it("conversa inexistente → null", async () => {
     const d = await decidirElegibilidadeDaConversaViaSupabase(adminStub({ data: null, error: null }), {
       organizationId: ORG,
@@ -172,6 +218,48 @@ describe("decidirElegibilidadeDaConversaViaSupabase", () => {
       ttlMs: TTL,
     });
     expect(d).toBeNull();
+  });
+
+  it("canal com teto + contagem que falha: o gate passa e o aviso cai no logger do projeto", async () => {
+    // A conversa vem do embed; a contagem (`from("messages")`) devolve erro.
+    const conversa = {
+      select: () => conversa,
+      eq: () => conversa,
+      maybeSingle: () =>
+        Promise.resolve({
+          data: linha({
+            contacts: { force_human: false, ai_authorized_at: null, phone_number: null, email: null },
+            channel_sessions: { metadata: {}, provider: "webchat" },
+          }),
+          error: null,
+        }),
+    };
+    const contagem = {
+      select: () => contagem,
+      eq: () => contagem,
+      neq: () => Promise.resolve({ count: null, error: { message: "banco fora" } }),
+    };
+    const admin = {
+      from: vi.fn((t: string) => (t === "messages" ? contagem : conversa)),
+    } as never;
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    try {
+      const d = await decidirElegibilidadeDaConversaViaSupabase(admin, {
+        organizationId: ORG,
+        conversationId: CONV,
+        agora: AGORA,
+        ttlMs: TTL,
+      });
+      expect(d).toMatchObject({ permite: true });
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0]?.[1]).toMatchObject({
+        organization_id: ORG,
+        conversation_id: CONV,
+        erro: "banco fora",
+      });
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("erro de banco → LANÇA (fail-closed: o chamador trata como 'não responder')", async () => {

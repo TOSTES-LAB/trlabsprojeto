@@ -8,6 +8,7 @@ import type { ChannelRoutingSettings } from "@/lib/routing/channel-policies";
 import { toast } from "sonner";
 
 import type { ChannelDeletionImpact } from "@/app/api/v1/channel-sessions/[id]/route";
+import type { ResultadoDoLoteDePausa } from "@/app/api/v1/channel-sessions/disabled/route";
 import { copyToClipboard } from "@/lib/clipboard";
 import { randomId } from "@/lib/random-id";
 import { apiClient } from "@/lib/api/client";
@@ -28,7 +29,10 @@ import { AntiBanSheet } from "./AntiBanSheet";
 import { GruposSheet } from "./GruposSheet";
 import { PairingOptions } from "./PairingOptions";
 import { ChannelAcervo } from "./ChannelAcervo";
+import { ChannelHistorico } from "./ChannelHistorico";
 import { ChannelAiAccess } from "./ChannelAiAccess";
+import { NegocioDaConversa } from "./NegocioDaConversa";
+import { FunilDeEntradaDoCartao } from "./FunilDeEntradaDoNumero";
 import { ParaIntegrar } from "./ParaIntegrar";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -48,6 +52,7 @@ import {
   Phone,
   Play,
   Plus,
+  QrCode,
   ShieldCheck,
   Trash,
   UsersThree,
@@ -57,6 +62,9 @@ import { canalDesativado } from "@/lib/channels/desativado";
 import { lerEstadoDoCanal } from "@/lib/channels/estado";
 import { fonteDeTemplates } from "@/lib/channels/templates-fonte";
 import { useT } from "@/hooks/i18n/useT";
+import { AgendaDePausa } from "@/components/connections/AgendaDePausa";
+import { RenomearConexao } from "./RenomearConexao";
+import { DefeitoDoNumero, numeroComDefeito } from "./DefeitoDoNumero";
 
 type Variant = "success" | "warning" | "error" | "neutral";
 
@@ -134,7 +142,91 @@ function enumerar(partes: (string | null)[], t: (texto: string) => string): stri
   return uteis.length > 0 ? `${uteis.join(", ")} ${t("e")} ${ultimo}` : ultimo;
 }
 
-export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean }) {
+/**
+ * A conta da ação em lote em frases que o operador lê de uma vez (issue #2387).
+ *
+ * Exportada para teste porque é a parte que MENTE quando erra: os critérios 1, 2
+ * e 5 da issue são asserções sobre ESTA função — "um toast diz quantos mudaram
+ * e quantos já estavam", "arquivado fica fora sem virar erro" e "a tela nunca
+ * afirma sucesso total com falha preenchida". Um teste que só clicasse no botão
+ * provaria que o clique chega ao endpoint, não que a frase é verdadeira.
+ *
+ * As três contagens saem juntas porque são a mesma operação vista por três
+ * ângulos; `falharam` DOMINA a frase: havendo um id que não saiu, não existe
+ * toast de sucesso — nem que todos os outros tenham mudado. É por isso que o
+ * retorno separa `sucesso` de `erro` em vez de devolver uma string só: quem
+ * chama não precisa lembrar dessa regra para não mentir.
+ *
+ * `arquivados` entra na frase (é canal que ficou de fora, não um erro — o
+ * critério 2) e `jaEstavam` também (é a idempotência tornada visível — o
+ * critério 3: repetir "Pausar todas" devolve esta linha, não um segundo audit).
+ */
+export function frasesDoLoteDePausa(
+  resultado: ResultadoDoLoteDePausa,
+  t: (texto: string) => string = (texto) => texto,
+): { sucesso: string | null; erro: string | null } {
+  const { disabled: pausar } = resultado;
+
+  const contagens: (string | null)[] = [
+    resultado.alterados > 0
+      ? contar(
+          resultado.alterados,
+          pausar ? "canal pausado agora" : "canal reativado agora",
+          pausar ? "canais pausados agora" : "canais reativados agora",
+          t,
+        )
+      : null,
+    resultado.jaEstavam > 0
+      ? contar(
+          resultado.jaEstavam,
+          pausar ? "canal já estava pausado" : "canal já estava reativado",
+          pausar ? "canais já estavam pausados" : "canais já estavam reativados",
+          t,
+        )
+      : null,
+    resultado.arquivados > 0
+      ? contar(resultado.arquivados, "canal arquivado fica de fora", "canais arquivados ficam de fora", t)
+      : null,
+  ];
+  const mudou = enumerar(contagens, t);
+
+  if (resultado.falharam.length > 0) {
+    // A falha vem com OS IDS: dizer "algo falhou" sem dizer o quê obriga o
+    // operador a conferir canal por canal — que é justamente o trabalho que a
+    // ação em lote existe para evitar.
+    const falhou =
+      `${pausar ? t("Não foi possível pausar") : t("Não foi possível retomar")} ` +
+      `${contar(resultado.falharam.length, "canal", "canais", t)}: ${resultado.falharam.join(", ")}.`;
+    return { sucesso: null, erro: mudou ? `${falhou} ${mudou}.` : falhou };
+  }
+
+  if (!mudou) return { sucesso: null, erro: null };
+  // "Nada mudou" é o desfecho HONESTO da repetição: o lote é idempotente, e
+  // dizer "3 canais pausados" quando nenhum mudou seria o mesmo sucesso falso
+  // que a rota evita ao separar `alterados` de `jaEstavam`.
+  const cabeca = resultado.alterados > 0 ? t("Feito:") : t("Nada mudou:");
+  return { sucesso: `${cabeca} ${mudou}.`, erro: null };
+}
+
+export function ConnectionsClient({
+  wahaConfigured,
+  qrInicial,
+  aoFecharQrInicial,
+}: {
+  wahaConfigured: boolean;
+  /**
+   * Sessão que chega pedindo QR pela URL (`/app/connections?qr=<id>`), vinda da
+   * faixa de conexão caída. Abre o diálogo de pareamento direto, sem passar
+   * pela lista: a faixa diz "Escanear o QR" e o clique tem que escanear —
+   * navegar para a tela em que o selo não é clicável era um beco sem saída.
+   * O título serve para qualquer estado: o diálogo em si lê o status do
+   * transporte a cada 3s e mostra QR, pareado ou "Gerar novo QR" conforme o
+   * que a sessão está vivendo.
+   */
+  qrInicial?: string;
+  /** Tira o `?qr=` da URL quando o diálogo fecha, para o próximo clique na faixa abrir de novo. */
+  aoFecharQrInicial?: () => void;
+}) {
   const tagDoIdioma = useTagDeIdioma();
   const t = useT();
   const qc = useQueryClient();
@@ -150,11 +242,32 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
   const routing = useQuery({ queryKey: ["channel-routing-settings"], queryFn: () => apiClient.get<{ data: ChannelRoutingSettings }>("/api/v1/settings/routing/channels") });
   const [creating, setCreating] = useState(false);
   const [checking, setChecking] = useState(false);
-  const [qr, setQr] = useState<{ sessionId: string; title: string } | null>(null);
+  const [qr, setQr] = useState<{ sessionId: string; title: string } | null>(
+    qrInicial ? { sessionId: qrInicial, title: t("Escaneie o QR") } : null,
+  );
+  // Com a Central já aberta, o clique na faixa é navegação suave: o componente
+  // continua montado e o inicializador acima não roda de novo. O `?qr=` novo
+  // tem de abrir o diálogo do mesmo jeito (ajuste de estado no render, sem efeito).
+  const [qrInicialVisto, setQrInicialVisto] = useState(qrInicial);
+  if (qrInicial !== qrInicialVisto) {
+    setQrInicialVisto(qrInicial);
+    if (qrInicial) setQr({ sessionId: qrInicial, title: t("Escaneie o QR") });
+  }
+  const fecharQr = useCallback(() => {
+    setQr(null);
+    if (qrInicial) aoFecharQrInicial?.();
+  }, [qrInicial, aoFecharQrInicial]);
   const [antiBanId, setAntiBanId] = useState<string | null>(null);
   const [gruposId, setGruposId] = useState<string | null>(null);
   const [toDelete, setToDelete] = useState<ChannelSession | null>(null);
   const pacingItems = usePacingKnobs().data?.items ?? [];
+
+  // A mesma lista que a tela desenha é a que a ação em lote comanda: filtrar
+  // social aqui (como a tela já faz) evita um botão que pede ids que ninguém vê.
+  const list = (sessions ?? []).filter((session) => session.provider !== CHANNEL_PROVIDER_SOCIAL);
+  /** Alvo de cada botão de lote — os dois só existem quando têm o que fazer. */
+  const paraPausar = list.filter((c) => !canalDesativado(c.metadata));
+  const paraRetomar = list.filter((c) => canalDesativado(c.metadata));
 
   // Mexer nos canais (criar, excluir, reconectar, health check) muda a LISTA de
   // conexões — e a ficha de Proteção de envio (`pacing-knobs`) é indexada por
@@ -242,6 +355,38 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
     [invalidate],
   );
 
+  // Gera um QR NOVO para um número que NUNCA foi pareado. O caminho suave
+  // (stop + start) é o padrão de propósito — preserva a credencial —, mas para
+  // quem nunca pareou não há credencial a preservar, e o start comum pode
+  // voltar direto para FAILED sem nunca passar por SCAN_QR_CODE. Aí o `force`
+  // (stop + LOGOUT + start) é o único que devolve um QR.
+  //
+  // ⚠️ O `force` DESCARTA a credencial de forma irreversível. A guarda de
+  // `phone_number` é o que impede isto de alcançar um número já pareado: um
+  // canal com telefone tem credencial, e descartá-la obrigaria o operador a
+  // reescanear um número que estava funcionando. Perguntar nos DOIS lugares —
+  // no render do botão e aqui — é de propósito: a UI pode mudar, a guarda não.
+  const handleGerarQrNovo = useCallback(
+    async (c: ChannelSession) => {
+      if (c.phone_number != null) {
+        toast.error(
+          t("Este número já foi pareado — gerar um novo QR descartaria a credencial guardada."),
+        );
+        return;
+      }
+      setBusyId(c.id);
+      try {
+        await forcePair(c.id);
+        setQr({ sessionId: c.id, title: t("Gerar novo QR") });
+      } catch (err) {
+        toast.error(errMsg(err, "Não foi possível gerar um novo QR.", t));
+      } finally {
+        setBusyId(null);
+      }
+    },
+    [forcePair, t],
+  );
+
   // Pausar = canal desativado pelo operador: a entrega é gravada mas não entra
   // na inbox, não dispara IA e não gera follow-up. Reativar volta tudo sem
   // reimportar nada. Diferente de excluir: o canal continua listado.
@@ -262,6 +407,41 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
     [invalidate, t],
   );
 
+  // Ação em lote (issue #2387): UMA requisição para a lista toda, UM invalidate
+  // para a tela toda e um toast que divulga a conta que a API devolveu —
+  // `alterados`, `jaEstavam` e, quando houver, os ids que não saíram. O caminho
+  // do servidor é o mesmo da rota unitária (RPC `fn_definir_canal_desativado`,
+  // um audit por canal), então o que muda aqui é só o número de cliques.
+  const [loteOcupado, setLoteOcupado] = useState(false);
+  const handleLote = useCallback(
+    async (pausar: boolean) => {
+      const alvo = (pausar ? paraPausar : paraRetomar).map((c) => c.id);
+      if (alvo.length === 0) return;
+      setLoteOcupado(true);
+      try {
+        const res = await apiClient.patch<{ data: ResultadoDoLoteDePausa }>(
+          "/api/v1/channel-sessions/disabled",
+          { disabled: pausar, ids: alvo },
+        );
+        // `frasesDoLoteDePausa` nunca devolve sucesso com falha preenchida; a
+        // ordem abaixo não é otimização, é a garantia de que não há caminho que
+        // avise "Feito" com um id em `falharam`.
+        const frases = frasesDoLoteDePausa(res.data, t);
+        if (frases.erro) toast.error(frases.erro);
+        else if (frases.sucesso) toast.success(frases.sucesso);
+      } catch (err) {
+        toast.error(errMsg(err, "Não foi possível mudar o estado dos canais.", t));
+      } finally {
+        setLoteOcupado(false);
+        // Um só invalidate para a ação inteira: recarregar por canal seria os N
+        // cliques que este botão existe para substituir (critério 8). Também
+        // no caminho de erro — falha parcial mudou alguns canais de verdade.
+        invalidate();
+      }
+    },
+    [paraPausar, paraRetomar, invalidate, t],
+  );
+
   const handleDeleted = useCallback(() => {
     setToDelete(null);
     invalidate();
@@ -269,11 +449,9 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
 
   const handleConnected = useCallback(() => {
     toast.success(t("WhatsApp conectado!"));
-    setQr(null);
+    fecharQr();
     invalidate();
-  }, [invalidate, t]);
-
-  const list = (sessions ?? []).filter((session) => session.provider !== CHANNEL_PROVIDER_SOCIAL);
+  }, [fecharQr, invalidate, t]);
 
   return (
     <div className="flex flex-col gap-4">
@@ -285,7 +463,7 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
               ? t("Nenhum número conectado ainda.")
               : `${list.length} ${list.length === 1 ? t("número conectado") : t("números conectados")}.`}
         </p>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
           {list.length > 0 && (
             <Button
               variant="outline"
@@ -301,6 +479,49 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
               {t("Atualizar saúde")}
             </Button>
           )}
+          {/* Ação em lote (#2387): o "todas" que resolve a janela de manutenção
+              do rodízio (#1330) — um número esquecido no meio de N cliques é o
+              defeito que este botão existe para evitar. Cada um só aparece
+              quando TEM alvo: "Retomar todas" com ninguém pausado seria um
+              botão que promete uma conta que não fecha. Sem exigir o serviço do
+              WhatsApp: pausar é gravar `metadata.disabled`, nada de transporte.
+              O total no rótulo é o mesmo que o toast confirma depois — o
+              operador vê a conta antes e depois do clique. */}
+          {paraPausar.length > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loteOcupado}
+              onClick={() => void handleLote(true)}
+            >
+              {loteOcupado ? (
+                <CircleNotch size={14} className="animate-spin" aria-hidden />
+              ) : (
+                <Pause size={14} aria-hidden />
+              )}
+              {t("Pausar todas")} ({paraPausar.length})
+            </Button>
+          )}
+          {paraRetomar.length > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={loteOcupado}
+              onClick={() => void handleLote(false)}
+            >
+              {loteOcupado ? (
+                <CircleNotch size={14} className="animate-spin" aria-hidden />
+              ) : (
+                <Play size={14} aria-hidden />
+              )}
+              {t("Retomar todas")} ({paraRetomar.length})
+            </Button>
+          )}
+          {/* A JANELA DE MANUTENÇÃO (#2388): o "todas" com HORÁRIO e RETOMADA
+              automática. Ela fica ao lado dos dois botões de lote de propósito:
+              os três são a mesma escrita (`metadata.disabled`), e a diferença é
+              quando — agora, ou quando o operador escolher. */}
+          <AgendaDePausa canais={list} />
           <Button size="sm" disabled={creating || !wahaConfigured} onClick={handleConnectNew}>
             {creating ? (
               <CircleNotch size={14} className="animate-spin" aria-hidden />
@@ -345,7 +566,7 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
         if (await copyToClipboard(connectionDetail)) toast.success(t("Copiado!"));
         else toast.error(t("Não foi possível copiar. Selecione e copie manualmente."));
       }}>{t("Copiar detalhes")}</Button></details>}
-      <Link href="/app/settings/atendimento" className="text-sm underline">{t("Configurar responsáveis por número")}</Link>
+      <Link href="/app/settings/atendimento" className="text-sm underline max-md:flex max-md:min-h-11 max-md:items-center">{t("Configurar responsáveis por número")}</Link>
       {!wahaConfigured && (
         <div className="rounded-md border border-warning bg-warning-bg p-4 text-sm text-warning-fg">
           <p className="font-medium">{t("O serviço do WhatsApp não está configurado.")}</p>
@@ -407,7 +628,11 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
       ) : (
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2 lg:grid-cols-3">
           {list.map((c) => {
-            const info = statusInfo(c.status, t);
+            // De pé com defeito (não recebe, envio restrito): o selo deixa de
+            // dizer "Conectado", e a linha logo abaixo diz o quê.
+            const info = numeroComDefeito(c.status, c.status_reason)
+              ? { label: t("Atenção"), variant: "warning" as const }
+              : statusInfo(c.status, t);
             const pausado = canalDesativado(c.metadata);
             const policy = routing.data?.data?.channels?.find((channel) => channel.id === c.id);
             // Sem o serviço no ar a rota de exclusão falha fechado (503) para
@@ -435,18 +660,53 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
                       </p>
                     )}
                   </div>
-                  <Badge variant={info.variant}>{info.label}</Badge>
+                  {/* "Escaneie o QR" é o estado que a sessão está vivendo, e um
+                      selo não faz nada quando é clicado — quem está pareando não
+                      tem para onde ir a partir dele. Neste estado o selo vira o
+                      botão que abre o diálogo do QR; nos outros, continua sendo
+                      só leitura. */}
+                  {c.status === "SCAN_QR_CODE" ? (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busyId === c.id}
+                      onClick={() => setQr({ sessionId: c.id, title: t("Escaneie o QR") })}
+                    >
+                      <QrCode size={14} aria-hidden />
+                      {t("Mostrar o QR")}
+                    </Button>
+                  ) : (
+                    <Badge variant={info.variant}>{info.label}</Badge>
+                  )}
                   {pausado && <Badge variant="neutral">{t("Pausado")}</Badge>}
                 </div>
+                <DefeitoDoNumero status={c.status} motivo={c.status_reason} />
                 <p className="text-[11px] text-muted-foreground">
                   {c.last_health_check_at
                     ? `${t("Verificado")} ${new Date(c.last_health_check_at).toLocaleString(tagDoIdioma)}`
                     : t("Ainda não verificado")}
                 </p>
                 <ChannelAiAccess channelId={c.id} />
+                {/* #4670: a chave é POR CONEXÃO — o cartão de cada número tem o
+                    interruptor, e não há nada disso em Configurações da
+                    organização, onde só caberia desligar para todo mundo. */}
+                <NegocioDaConversa channelId={c.id} />
+                {/* Os dois são do cartão da conexão e não se substituem: o
+                    interruptor acima decide SE a conversa nova vira negócio; o
+                    seletor abaixo decide EM QUAL funil/etapa ela nasce quando
+                    nasce. Desligar o de cima torna o de baixo inerte — ele
+                    continua guardando a escolha para quando religarem, mas para
+                    de prometer que o contato entra no funil (#5142). */}
+                <FunilDeEntradaDoCartao channelId={c.id} />
                 {dependeDoTransporte(c) && <ChannelAcervo channelId={c.id} />}
+                {dependeDoTransporte(c) && <ChannelHistorico channelId={c.id} />}
                 <p className="text-xs text-muted-foreground">{t(!policy ? "Consulte os responsáveis em Atendimento." : policy.mode === "legacy_unconfigured" ? "Usa todos os atendentes elegíveis da organização." : policy.mode === "restricted_empty" ? "Ninguém configurado — as conversas ficarão na fila." : "Somente as pessoas selecionadas recebem este número.")}</p>
                 <div className="mt-auto flex flex-wrap gap-2">
+                  <RenomearConexao
+                    channelId={c.id}
+                    currentName={c.display_name}
+                    onSaved={() => qc.invalidateQueries({ queryKey: ["channel-sessions"] })}
+                  />
                   {/* Some no canal oficial em vez de aparecer desabilitado: não é
                       indisponibilidade passageira (como o Excluir sem o serviço no
                       ar), é uma ação que não existe para esse canal — e o clique
@@ -464,6 +724,33 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
                         <ArrowsClockwise size={14} aria-hidden />
                       )}
                       {t("Reconectar")}
+                    </Button>
+                  )}
+                  {/* Nunca pareou (sem phone_number) e está em FAILED/STOPPED:
+                      o start suave costuma voltar direto para FAILED sem nunca
+                      passar por SCAN_QR_CODE — a credencial não existe para ser
+                      reaproveitada, e o buraco é o descrito na rota de
+                      reconectar. O `force` (stop + LOGOUT + start) é o único que
+                      devolve um QR, e SÓ aqui na ficha ele fica à mão sem
+                      precisar de uma tentativa suave fracassada antes.
+                      ⚠️ O `force` DESCARTA a credencial de forma irreversível; a
+                      guarda de `phone_number` é o que impede isto de alcançar um
+                      número já pareado. Perguntar nos DOIS lugares — no render
+                      e no clique — é de propósito: a UI pode mudar, a guarda não. */}
+                  {vivaNoTransporte && c.phone_number == null
+                    && (c.status === "FAILED" || c.status === "STOPPED") && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={busyId === c.id || !wahaConfigured}
+                      onClick={() => void handleGerarQrNovo(c)}
+                    >
+                      {busyId === c.id ? (
+                        <CircleNotch size={14} className="animate-spin" aria-hidden />
+                      ) : (
+                        <QrCode size={14} aria-hidden />
+                      )}
+                      {t("Gerar novo QR")}
                     </Button>
                   )}
                   <Button variant="outline" size="sm" onClick={() => setAntiBanId(c.id)}>
@@ -547,7 +834,7 @@ export function ConnectionsClient({ wahaConfigured }: { wahaConfigured: boolean 
           sessionId={qr.sessionId}
           title={qr.title}
           wahaConfigured={wahaConfigured}
-          onClose={() => setQr(null)}
+          onClose={fecharQr}
           onConnected={handleConnected}
           onForcePair={forcePair}
         />
@@ -766,7 +1053,15 @@ function QrDialog({
       }
     };
     void poll();
-    const iv = setInterval(poll, 3000);
+    const iv = setInterval(() => {
+      // ABA OCULTA NÃO PERGUNTA (refs #2821, a convenção da casa): o pareamento
+      // é uma tela de espera — com a aba escondida ninguém está escaneando QR
+      // nenhum, e cada tick de 3 s custa uma consulta ao transporte. A guarda é
+      // a mesma do refetch de segurança (hooks/realtime/useRefetchDeSeguranca.ts):
+      // quem volta para a aba vê o estado no tick seguinte, em no máximo 3 s.
+      if (document.visibilityState !== "visible") return;
+      void poll();
+    }, 3000);
     return () => {
       cancelled = true;
       clearInterval(iv);

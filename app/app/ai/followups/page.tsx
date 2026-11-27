@@ -11,7 +11,11 @@ import { QueueTab } from "./_components/QueueTab";
 
 export const dynamic = "force-dynamic";
 
-const FLOW_COLUMNS = "id, name, status, active_version_id, handoff_policy, updated_at";
+// As MESMAS colunas de `GET /api/v1/ai/followup-flows`: a lista nasce daqui e é
+// relida de lá, e o gatilho (#4593) precisa estar nas duas para a busca não mudar
+// de resposta no primeiro refetch.
+const FLOW_COLUMNS =
+  "id, name, status, active_version_id, handoff_policy, updated_at, trigger_kind:trigger_config->>kind";
 
 export default async function FollowupFlowsPage() {
   const user = await requireAuth();
@@ -49,7 +53,7 @@ export default async function FollowupFlowsPage() {
       <Tabs defaultValue="fluxos" className="flex flex-1 flex-col">
         <TabsList>
           <TabsTrigger value="fluxos">{t("Fluxos")}</TabsTrigger>
-          <TabsTrigger value="fila">Fila</TabsTrigger>
+          <TabsTrigger value="fila">{t("Fila")}</TabsTrigger>
         </TabsList>
         <TabsContent value="fluxos">
           <FlowsList initialData={flows} canWrite={canWrite} />
