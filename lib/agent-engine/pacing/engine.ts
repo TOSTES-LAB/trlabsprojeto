@@ -6,16 +6,34 @@
  * I/O nenhum. Clock e RNG são injetáveis (testes com clock fake e jitter
  * determinístico); em produção o chamador passa `new Date()` e omite o rng.
  *
- * Ordem de avaliação: janela horária (tz do tenant, domingo conforme `allowSunday`) → caps
- * diários (warm-up por idade do número; limite do CRM injetado) → throttle+jitter.
+ * Ordem de avaliação: janela horária (tz do tenant, domingo conforme `allowSunday`,
+ * dias próprios na prospecção) → caps diários (warm-up por idade do número;
+ * limite do CRM injetado) → throttle+jitter.
  */
-import type { PacingKnobs, WarmupStep } from './defaults';
+// `PACING_DEFAULTS` por VALOR: é o fallback do teto do follow-up quando o knob
+// chega montado à mão sem o campo (#4063) — sem isso o teto seria `undefined`
+// e a comparação deixaria passar tudo.
+import { PACING_DEFAULTS, type PacingKnobs, type WarmupStep } from './defaults';
+import { instantFromWall, wallClock, type Wall } from './relogio-de-parede';
 
 export interface PacingState {
   /** Último envio deste número (qualquer dia) — base do throttle. */
   lastSentAt: Date | null;
-  /** Envios deste número desde a meia-noite LOCAL do tenant. */
+  /**
+   * DISPAROS deste número desde a meia-noite LOCAL do tenant (1ª mensagem,
+   * follow-up, campanha). Resposta a quem escreveu não entra (`pacing_ledger.resposta`).
+   */
   sentToday: number;
+  /**
+   * ABORDAGENS deste número desde a meia-noite local — só as 1ª mensagens a
+   * pessoa nova (`pacing_ledger.abordagem` sem `resposta`). É a contagem que o
+   * teto usa quando o canal liga `tetoSoAbordagem`.
+   *
+   * Opcional porque `PacingState` montado à mão (testes, chamadores futuros)
+   * não tem de conhecer o ledger: ausente cai em `sentToday`, que é >= ela e
+   * portanto falha FECHADO (barra mais cedo, nunca mais tarde).
+   */
+  abordagensToday?: number;
   /** Ativação do número (channel_knobs.number_activated_at); null = idade 0 (conservador). */
   numberActivatedAt: Date | null;
 }
@@ -54,11 +72,60 @@ export interface PacingInput {
    * levam o número ao banimento; uma resposta para quem escreveu às 3h é o serviço.
    */
   resposta?: boolean;
+  /**
+   * Esta decisão é para a PROSPECÇÃO fria (primeira abordagem a quem nunca
+   * falou com a empresa)?
+   *
+   * `true` lê os dias próprios da prospecção (`knobs.prospeccaoDias`, 0642) em
+   * vez do `allowSunday` compartilhado — é o que desamarra "respondo domingo"
+   * de "prospecto domingo". As HORAS continuam as de disparo (`window*`):
+   * `resposta` é ignorado quando este campo é `true` (prospecção nunca é
+   * resposta). Omitir = comportamento anterior — todo chamador fora do worker
+   * de prospecção continua como está.
+   */
+  prospeccao?: boolean;
+  /**
+   * Este envio é a 1ª mensagem a uma PESSOA NOVA (abordagem)?
+   *
+   * Só importa quando o canal liga `knobs.tetoSoAbordagem`: aí o teto conta e
+   * barra a abordagem e deixa passar o follow-up de quem já foi abordado. Com o
+   * knob desligado (default) o campo é ignorado — a régua é a de sempre.
+   *
+   * Omitir = `true`, que é a direção CONSERVADORA: quem chama sem saber (worker
+   * de prospecção, campanha, teste) continua contando no teto. Quem SABE que a
+   * pessoa já foi abordada — o gate de envio, que lê `send_ledger` — declara
+   * `false` explicitamente.
+   */
+  abordagem?: boolean;
   /** [0,1) — injetável nos testes; default Math.random. */
   rng?: () => number;
 }
 
-export type PacingVetoCode = 'outside_window' | 'warmup_cap' | 'daily_cap';
+/**
+ * `followup_cap` (#4063) é o teto PRÓPRIO do follow-up, e só ele: nasce quando a
+ * opção `tetoSoAbordagem` está ligada e os follow-ups do dia chegaram a
+ * `followupDailyCap`. Código separado de `warmup_cap`/`daily_cap` de propósito —
+ * quem lê o trace precisa saber qual régua bateu, e a saída (amanhã) é a mesma.
+ */
+export type PacingVetoCode = 'outside_window' | 'warmup_cap' | 'daily_cap' | 'followup_cap';
+
+/**
+ * Os vetos de TETO DO DIA — o turno vetado por um deles é ADIADO até
+ * `nextAllowedAt`, nunca encerrado sem mensagem (inbound-turn, bloco
+ * `pacingCapVeto`). `Record` exaustivo de propósito: código novo em
+ * `PacingVetoCode` não compila sem alguém decidir se ele adia o turno.
+ * `outside_window` fica `false` porque a janela tem caminho próprio de adiamento.
+ */
+const ADIA_O_TURNO: Record<PacingVetoCode, boolean> = {
+  outside_window: false,
+  warmup_cap: true,
+  daily_cap: true,
+  followup_cap: true,
+};
+
+export function eTetoDoDia(code: string): boolean {
+  return Object.hasOwn(ADIA_O_TURNO, code) && ADIA_O_TURNO[code as PacingVetoCode];
+}
 
 export type PacingDecision =
   | { allow: true; waitMs: number }
@@ -71,20 +138,32 @@ export function decidePacing(input: PacingInput): PacingDecision {
   const rng = input.rng ?? Math.random;
   const banRisk = input.banRisk ?? true; // default preserva o comportamento atual
   const resposta = input.resposta ?? false; // default = disparo (janela restritiva)
+  const prospeccao = input.prospeccao ?? false; // default = sem dias próprios
   const wall = wallClock(now, knobs.timezone);
   // Resposta lê `resposta*`, disparo lê `window*`. Coluna vazia já chega aqui
-  // preenchida com a de disparo (`loadChannelKnobs`, 0495).
-  const janela = janelaDoPacing(knobs, resposta);
+  // preenchida com a de disparo (`loadChannelKnobs`, 0495). Prospecção é
+  // disparo nas horas e própria nos dias — `resposta` não se aplica a ela.
+  const janela = janelaDoPacing(knobs, prospeccao ? false : resposta);
+  const diasProspeccao = prospeccao ? knobs.prospeccaoDias : null;
 
-  if (!insideWindow(wall, knobs, janela)) {
-    const nextAllowedAt = addMs(nextWindowOpen(now, knobs, janela), jitterOf(rng, knobs));
+  if (!insideWindow(wall, knobs, janela, diasProspeccao)) {
+    const nextAllowedAt = addMs(
+      nextWindowOpen(now, knobs, janela, diasProspeccao),
+      jitterOf(rng, knobs),
+    );
+    const nome = prospeccao ? 'prospecção' : resposta ? 'resposta' : 'envio';
+    const dias = prospeccao
+      ? `, dias ${diasParaTexto(knobs.prospeccaoDias)}`
+      : knobs.allowSunday
+        ? ''
+        : ', sem domingo';
     return {
       allow: false,
       code: 'outside_window',
       nextAllowedAt,
       reason:
-        `fora da janela de ${resposta ? 'resposta' : 'envio'} (${janela.start}h-${janela.end}h` +
-        `${knobs.allowSunday ? '' : ', sem domingo'}, ${knobs.timezone}); ` +
+        `fora da janela de ${nome} (${janela.start}h-${janela.end}h` +
+        `${dias}, ${knobs.timezone}); ` +
         `agende para ${formatInTz(nextAllowedAt, knobs.timezone)} (abertura da janela + jitter)`,
     };
   }
@@ -94,6 +173,64 @@ export function decidePacing(input: PacingInput): PacingDecision {
   // SEMPRE — desarmar as duas juntas acordaria cliente às 3h (invariante 3).
   if (!banRisk) return { allow: true, waitMs: 0 };
 
+  // RESPOSTA não passa pelo teto do dia. O teto (warm-up e limite do CRM) mede
+  // quantas pessoas o número ABORDA — 1ª mensagem e follow-up —, e é isso que
+  // leva a banimento. Quem escreveu está esperando: segurar a resposta até
+  // amanhã porque a prospecção do dia acabou perde o lead e não protege o
+  // número. Por isso a resposta também não entra na conta (`recordSend` grava
+  // `resposta`, `loadPacingState` só conta disparo). O espaçamento continua.
+  //
+  // `prospeccao` prevalece: abordagem fria nunca é resposta (ver o contrato do
+  // campo), então um chamador que declare as duas coisas não abre o teto.
+  if (!prospeccao && resposta) return { allow: true, waitMs: throttleWaitMs(now, state, knobs, rng) };
+
+  // OPÇÃO POR CANAL — `tetoSoAbordagem` (issue #3851): o teto conta só a
+  // ABORDAGEM. Quem já foi abordado e recebe um follow-up não gasta nem espera
+  // o teto: o que leva a banimento é o número falar com gente NOVA em volume, e
+  // segurar quem já está na conversa não protege o número — só perde o lead.
+  //
+  // A abordagem continua contando e sendo barrada (o teto não virou fumaça), e
+  // o espaçamento abaixo continua valendo para TODO envio: a opção tira o teto,
+  // não o anti-ban. Desligada (default), nada muda: o `abordagem` nem é lido.
+  const soAbordagem = knobs.tetoSoAbordagem === true;
+  // `prospeccao` prevalece aqui também: abordagem fria É a 1ª mensagem a pessoa
+  // nova, então um chamador que declare as duas coisas não abre o teto por ela.
+  if (soAbordagem && !prospeccao && input.abordagem === false) {
+    // ─── O FOLLOW-UP NÃO FICA SEM TETO (#4063) ────────────────────────────────
+    //
+    // A opção acima tira o teto de ABORDAGEM do follow-up — e é isso que se
+    // queria. O que ela fazia junto era deixar o follow-up sem teto NENHUM: com
+    // a chave ligada, 200, 300, 400 follow-ups no mesmo dia saíam todos, porque
+    // a única régua que os media era a que a opção desliga. Medido antes: 380
+    // follow-ups num dia, zero vetos.
+    //
+    // O teto DAQUI é outro número, com outro nome e outro motivo: segurança de
+    // VOLUME do que já está em conversa. `knobs.followupDailyCap` vem do mesmo
+    // lugar que os demais limites do canal (`channel_knobs`), e `??` cobre quem
+    // monta `PacingKnobs` à mão (testes, chamadores antigos) — nesse caso vale o
+    // default conservador, nunca "sem teto".
+    //
+    // A conta sai do estado que já desceu na MESMA consulta: `sentToday` conta
+    // todo disparo do dia (resposta não entra, 9061) e `abordagensToday` o recorte
+    // que é abordagem; a diferença é o follow-up. Sem `abordagensToday` (estado
+    // montado à mão) o recorte vale 0, ou seja, conta tudo como follow-up: falha
+    // FECHADO, como no `contagemDoTeto` abaixo.
+    const tetoDoFollowup = knobs.followupDailyCap ?? PACING_DEFAULTS.followupDailyCap;
+    const followupsHoje = Math.max(0, state.sentToday - (state.abordagensToday ?? 0));
+    if (followupsHoje >= tetoDoFollowup) {
+      const nextAllowedAt = addMs(nextDayOpen(now, knobs, diasProspeccao), jitterOf(rng, knobs));
+      return {
+        allow: false,
+        code: 'followup_cap',
+        nextAllowedAt,
+        reason:
+          `teto diário de follow-up atingido (${tetoDoFollowup}/dia, teto próprio de segurança do ` +
+          `número); agende para ${formatInTz(nextAllowedAt, knobs.timezone)} (próxima abertura + jitter)`,
+      };
+    }
+    return { allow: true, waitMs: throttleWaitMs(now, state, knobs, rng) };
+  }
+
   // Clamp em >= 0: number_activated_at no futuro (typo do admin / clock skew
   // daemon↔DB) cai no degrau MAIS conservador — warm-up falha FECHADO, nunca
   // vira "número formado" por idade negativa.
@@ -102,27 +239,39 @@ export function decidePacing(input: PacingInput): PacingDecision {
     : 0;
   const wCap = warmupCapFor(ageDays, knobs.warmupDailyCaps);
   const effectiveCap = Math.min(wCap ?? Infinity, crmDailyLimit ?? Infinity);
-  if (state.sentToday >= effectiveCap) {
-    const nextAllowedAt = addMs(nextDayOpen(now, knobs), jitterOf(rng, knobs));
+  // Com a opção ligada, a régua é a contagem de ABORDAGENS: os follow-ups que a
+  // opção deixou sair continuam no ledger (para o espaçamento e para quem
+  // desligar a opção depois), mas não empurram a próxima pessoa nova para amanhã.
+  const contagemDoTeto = soAbordagem ? (state.abordagensToday ?? state.sentToday) : state.sentToday;
+  if (contagemDoTeto >= effectiveCap) {
+    const nextAllowedAt = addMs(nextDayOpen(now, knobs, diasProspeccao), jitterOf(rng, knobs));
     const isWarmup = wCap !== null && wCap < (crmDailyLimit ?? Infinity);
+    const nota = soAbordagem ? ', contando só abordagem' : '';
     return {
       allow: false,
       code: isWarmup ? 'warmup_cap' : 'daily_cap',
       nextAllowedAt,
       reason: isWarmup
-        ? `cap de warm-up atingido (${wCap}/dia para número com ${ageDays} dia(s) de idade); ` +
+        ? `cap de warm-up atingido (${wCap}/dia para número com ${ageDays} dia(s) de idade${nota}); ` +
           `agende para ${formatInTz(nextAllowedAt, knobs.timezone)} (próxima abertura + jitter)`
-        : `cap diário do número atingido (${effectiveCap}/dia, limite do CRM); ` +
+        : `cap diário do número atingido (${effectiveCap}/dia, limite do CRM${nota}); ` +
           `agende para ${formatInTz(nextAllowedAt, knobs.timezone)} (próxima abertura + jitter)`,
     };
   }
 
-  let waitMs = 0;
-  if (state.lastSentAt) {
-    const requiredGapMs = knobs.throttleMs + jitterOf(rng, knobs);
-    waitMs = Math.max(0, requiredGapMs - (now.getTime() - state.lastSentAt.getTime()));
-  }
-  return { allow: true, waitMs };
+  return { allow: true, waitMs: throttleWaitMs(now, state, knobs, rng) };
+}
+
+/** Espera restante do espaçamento (throttle + jitter) desde o último envio do número. */
+function throttleWaitMs(
+  now: Date,
+  state: PacingState,
+  knobs: PacingKnobs,
+  rng: () => number,
+): number {
+  if (!state.lastSentAt) return 0;
+  const requiredGapMs = knobs.throttleMs + jitterOf(rng, knobs);
+  return Math.max(0, requiredGapMs - (now.getTime() - state.lastSentAt.getTime()));
 }
 
 /**
@@ -151,56 +300,8 @@ function addMs(d: Date, ms: number): Date {
 }
 
 // ---------------------------------------------------------------------------
-// Relógio de parede na tz do tenant — Intl puro, sem dependência nova.
-
-interface Wall {
-  y: number;
-  mo: number;
-  d: number;
-  h: number;
-  mi: number;
-  s: number;
-  weekday: string; // 'Sun'..'Sat'
-}
-
-function wallClock(instant: Date, timezone: string): Wall {
-  const parts = new Intl.DateTimeFormat('en-US', {
-    timeZone: timezone,
-    hour12: false,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    weekday: 'short',
-  }).formatToParts(instant);
-  const get = (type: string): string => parts.find((p) => p.type === type)?.value ?? '';
-  return {
-    y: Number(get('year')),
-    mo: Number(get('month')),
-    d: Number(get('day')),
-    h: Number(get('hour')) % 24, // algumas ICU rendem '24' à meia-noite
-    mi: Number(get('minute')),
-    s: Number(get('second')),
-    weekday: get('weekday'),
-  };
-}
-
-/**
- * Instante UTC cuja hora de parede na tz é (y, mo, d, h):00 — técnica clássica
- * de duas passadas pelo offset (correta inclusive sob DST).
- */
-function instantFromWall(y: number, mo: number, d: number, h: number, timezone: string): Date {
-  const targetAsUtc = Date.UTC(y, mo - 1, d, h);
-  let guess = targetAsUtc;
-  for (let i = 0; i < 2; i += 1) {
-    const w = wallClock(new Date(guess), timezone);
-    const guessAsUtc = Date.UTC(w.y, w.mo - 1, w.d, w.h, w.mi, w.s);
-    guess += targetAsUtc - guessAsUtc;
-  }
-  return new Date(guess);
-}
+// Relógio de parede na tz do tenant — `relogio-de-parede.ts`, compartilhado com
+// a janela da CAMPANHA de prospecção (#4830).
 
 /** Meia-noite LOCAL do tenant contendo `instant` — o corte do "hoje" dos caps diários. */
 export function dayStartInTz(instant: Date, timezone: string): Date {
@@ -217,7 +318,8 @@ export function dayStartInTz(instant: Date, timezone: string): Date {
  *
  * `resposta` separa as janelas: o turno inbound é RESPOSTA (lê `resposta*`) e
  * o disparo/retomada é `false` (lê `window*`). Omitir = disparo, que é o
- * comportamento de todo chamador anterior a 0495.
+ * comportamento de todo chamador anterior a 0495. A prospecção NÃO passa por
+ * aqui: ela tem os dias próprios (`janelaDeProspeccaoAberta`, 0642).
  */
 export function janelaDeEnvioAberta(
   now: Date,
@@ -249,11 +351,48 @@ function janelaDoPacing(
   return { start: knobs.respostaStartHour, end: knobs.respostaEndHour };
 }
 
+/** Dia da semana na convenção JS (`getDay`): 0=domingo … 6=sábado. */
+const DIA_POR_NOME: Record<string, number> = {
+  Sun: 0,
+  Mon: 1,
+  Tue: 2,
+  Wed: 3,
+  Thu: 4,
+  Fri: 5,
+  Sat: 6,
+};
+
+const NOME_CURTO_DO_DIA = ['dom', 'seg', 'ter', 'qua', 'qui', 'sex', 'sáb'] as const;
+
+/** Lista de dias para a `reason` do veto — display apenas, nunca regra. */
+function diasParaTexto(dias: number[]): string {
+  return dias.map((d) => NOME_CURTO_DO_DIA[d] ?? String(d)).join(',');
+}
+
+/**
+ * Normaliza o filtro de dias da prospecção. Vazio ou ausente = regra antiga
+ * (`allowSunday`): um array vazio significaria "nenhum dia envia", que é fila
+ * parada em silêncio — e `nextWindowOpen` sem dia válido seria um laço sem fim.
+ * O `loadChannelKnobs` já garante não-vazio do banco; isto cobre knobs
+ * montados à mão (testes, chamadores futuros).
+ */
+function diasValidos(dias?: number[] | null): number[] | null {
+  return dias && dias.length > 0 ? dias : null;
+}
+
 function insideWindow(
   wall: Wall,
   knobs: PacingKnobs,
   janela: { start: number; end: number },
+  diasProspeccao?: number[] | null,
 ): boolean {
+  const dias = diasValidos(diasProspeccao);
+  if (dias) {
+    // Dias próprios (0642): o domingo compartilhado não entra — é o que permite
+    // responder domingo sem prospectar domingo.
+    if (!dias.includes(DIA_POR_NOME[wall.weekday] ?? -1)) return false;
+    return wall.h >= janela.start && wall.h < janela.end;
+  }
   if (!knobs.allowSunday && wall.weekday === 'Sun') return false;
   return wall.h >= janela.start && wall.h < janela.end;
 }
@@ -263,13 +402,18 @@ function nextWindowOpen(
   now: Date,
   knobs: PacingKnobs,
   janela: { start: number; end: number } = { start: knobs.windowStartHour, end: knobs.windowEndHour },
+  diasProspeccao?: number[] | null,
 ): Date {
+  const dias = diasValidos(diasProspeccao);
   const w = wallClock(now, knobs.timezone);
   for (let add = 0; ; add += 1) {
     // Date.UTC normaliza overflow de dia/mês em instantFromWall.
     const candidate = instantFromWall(w.y, w.mo, w.d + add, janela.start, knobs.timezone);
     if (candidate.getTime() <= now.getTime()) continue;
-    if (!knobs.allowSunday && wallClock(candidate, knobs.timezone).weekday === 'Sun') continue;
+    const weekday = wallClock(candidate, knobs.timezone).weekday;
+    if (dias) {
+      if (!dias.includes(DIA_POR_NOME[weekday] ?? -1)) continue;
+    } else if (!knobs.allowSunday && weekday === 'Sun') continue;
     return candidate;
   }
 }
@@ -283,13 +427,50 @@ function nextWindowOpen(
  * reaparecimento do número às 7h, e isso é a única coisa que faz sentido
  * dizer a quem pagou.
  */
-function nextDayOpen(now: Date, knobs: PacingKnobs): Date {
+function nextDayOpen(now: Date, knobs: PacingKnobs, diasProspeccao?: number[] | null): Date {
+  const dias = diasValidos(diasProspeccao);
   const w = wallClock(now, knobs.timezone);
   for (let add = 1; ; add += 1) {
     const candidate = instantFromWall(w.y, w.mo, w.d + add, knobs.windowStartHour, knobs.timezone);
-    if (!knobs.allowSunday && wallClock(candidate, knobs.timezone).weekday === 'Sun') continue;
+    const weekday = wallClock(candidate, knobs.timezone).weekday;
+    if (dias) {
+      if (!dias.includes(DIA_POR_NOME[weekday] ?? -1)) continue;
+    } else if (!knobs.allowSunday && weekday === 'Sun') continue;
     return candidate;
   }
+}
+
+/**
+ * A PROSPECÇÃO pode abordar agora? Dias próprios (`prospeccaoDias`) + horas de
+ * disparo (`window*`) — o domingo compartilhado (`allowSunday`) não entra.
+ * Atalho barato para o worker, como `janelaDeEnvioAberta` é para o turno
+ * inbound: o gate de verdade continua sendo o `decidePacing` com
+ * `prospeccao: true` logo abaixo.
+ */
+export function janelaDeProspeccaoAberta(now: Date, knobs: PacingKnobs): boolean {
+  return insideWindow(
+    wallClock(now, knobs.timezone),
+    knobs,
+    { start: knobs.windowStartHour, end: knobs.windowEndHour },
+    knobs.prospeccaoDias,
+  );
+}
+
+/** Próxima abertura da prospecção + jitter — o instante para o qual se adia. */
+export function proximaAberturaDaProspeccao(
+  now: Date,
+  knobs: PacingKnobs,
+  rng: () => number = Math.random,
+): Date {
+  return addMs(
+    nextWindowOpen(
+      now,
+      knobs,
+      { start: knobs.windowStartHour, end: knobs.windowEndHour },
+      knobs.prospeccaoDias,
+    ),
+    jitterOf(rng, knobs),
+  );
 }
 
 /** Render local legível para a mensagem de veto (pt-br vê hora do SEU fuso). */

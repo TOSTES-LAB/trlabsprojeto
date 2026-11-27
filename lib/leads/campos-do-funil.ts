@@ -13,6 +13,111 @@ export function camposDoFunil(settings: Record<string, unknown> | null | undefin
   return out;
 }
 
+/** A que pertence o campo (issue #2791): ao negócio ou ao contato. */
+export type EscopoDoCampo = "negocio" | "contato";
+
+/**
+ * O escopo do campo, com a ausência valendo `negocio`.
+ *
+ * A chave é opcional no `settings` de propósito: toda definição que já existe
+ * não a tem, e a leitura dela é `negocio` — sem isto, funil antigo mudaria de
+ * comportamento no dia em que a propriedade nasceu.
+ */
+export function escopoDoCampo(campo: Pick<CustomFieldDef, "escopo">): EscopoDoCampo {
+  return campo.escopo === "contato" ? "contato" : "negocio";
+}
+
+/** Os campos de UM escopo, na ordem em que o funil os declara. */
+export function camposPorEscopo(
+  campos: CustomFieldDef[],
+  escopo: EscopoDoCampo,
+): CustomFieldDef[] {
+  return campos.filter((campo) => escopoDoCampo(campo) === escopo);
+}
+
+/**
+ * Os campos de um escopo em TODOS os funis, unidos por CHAVE (#4929).
+ *
+ * O CONTATO não tem funil próprio: a ficha lê o funil padrão (`useDefaultPipeline`)
+ * e o lapis da lista não tem funil nenhum para ler. O servidor já resolve isso
+ * perguntando a todos os funis (`defsDoPadraoDaOrg`, que é o que o PATCH usa para
+ * julgar o `custom_fields`), então a tela precisa do MESMO conjunto — senão o
+ * diálogo esconde um campo que a gravação conhece.
+ *
+ * A união é por CHAVE, nunca por rótulo: dois funis podem ter o mesmo rótulo em
+ * campos diferentes (dois "Código"), e juntá-los por rótulo apagaria um deles. A
+ * PRIMEIRA definição de cada chave vence, na ordem em que os funis chegam — a
+ * mesma ordem de `defsDoPadraoDaOrg` (`created_at`), para que a definição exibida
+ * seja a primeira que o servidor julga quando a chave aparece em dois funis.
+ */
+export function camposPorEscopoDosFunis(
+  settingsDosFunis: readonly unknown[],
+  escopo: EscopoDoCampo,
+): CustomFieldDef[] {
+  const vistos = new Set<string>();
+  const out: CustomFieldDef[] = [];
+  for (const settings of settingsDosFunis) {
+    // `settings` de funil é jsonb livre: lixo vira lista vazia, nunca exceção.
+    if (!settings || typeof settings !== "object" || Array.isArray(settings)) continue;
+    for (const campo of camposPorEscopo(camposDoFunil(settings as Record<string, unknown>), escopo)) {
+      if (vistos.has(campo.key)) continue;
+      vistos.add(campo.key);
+      out.push(campo);
+    }
+  }
+  return out;
+}
+
+/**
+ * O campo está liberado para o MODELO? (issue #4669)
+ *
+ * Só o `true` EXPLÍCITO libera. A ausência da marca — toda definição que já
+ * existe, e o que a tela grava quando a caixa está desmarcada — é DESMARCADO:
+ * o valor fica no card e não vai ao modelo. A régua mora aqui, e não em cada
+ * caminho, porque são vários (`negocio-do-followup.ts` e toda resposta de
+ * negócio no turno, em `lib/mcp/tools/leads.ts`) e cópias divergiriam no dia em
+ * que uma delas mudasse.
+ */
+export function campoLiberadoParaIa(
+  campo: Pick<CustomFieldDef, "ia_pode_ler">,
+): boolean {
+  return campo.ia_pode_ler === true;
+}
+
+/** Os campos de um escopo que a IA pode ler — a lista que o prompt recebe. */
+export function camposLiberadosParaIa(
+  campos: CustomFieldDef[],
+  escopo: EscopoDoCampo = "negocio",
+): CustomFieldDef[] {
+  return camposPorEscopo(campos, escopo).filter(campoLiberadoParaIa);
+}
+
+/**
+ * O recorte de `custom_fields` que a IA pode ler (issue #4669) — o que as
+ * ferramentas de negócio devolvem DENTRO de um turno de agente.
+ *
+ * Chave que o funil não declara não tem marca, e sem marca não há autorização:
+ * fica de fora, igual à leitura do bloco do follow-up ("sem rótulo não há como
+ * o modelo saber o que o valor significa"). `custom_fields` que não é objeto
+ * volta como veio — o filtro não inventa nem apaga a forma da ficha.
+ */
+export function filtrarCamposLegiveisPelaIa(
+  settings: Record<string, unknown> | null | undefined,
+  custom: unknown,
+): Record<string, unknown> | null {
+  if (!custom || typeof custom !== "object" || Array.isArray(custom)) {
+    return (custom as Record<string, unknown> | null | undefined) ?? null;
+  }
+  const liberadas = new Set(
+    camposLiberadosParaIa(camposDoFunil(settings)).map((campo) => campo.key),
+  );
+  const out: Record<string, unknown> = {};
+  for (const [chave, valor] of Object.entries(custom as Record<string, unknown>)) {
+    if (liberadas.has(chave)) out[chave] = valor;
+  }
+  return out;
+}
+
 /**
  * O embed `crm_pipelines(settings)` do PostgREST vem objeto (FK to-one) ou,
  * se a relação vacilar, array. Os dois caem aqui — lixo vira `null`.
@@ -25,3 +130,50 @@ export function settingsDoEmbed(embed: unknown): Record<string, unknown> | null 
   return settings as Record<string, unknown>;
 }
 
+
+/**
+ * Os campos que o gatilho "N dias até uma data do funil" pode usar: DATA e do
+ * NEGÓCIO.
+ *
+ * A varredura (`app/api/v1/cron/lead-date-field-due`) lê `crm_leads.custom_fields`,
+ * e o valor de um campo do CONTATO (#2791) mora em `contacts.custom_fields` — uma
+ * regra apontada para ele é salva, o dia chega, e nada dispara. É a lista que
+ * os seletores (editor de regras, Designer, calendário do funil) oferecem.
+ */
+export function camposDeDataDoNegocio(
+  settings: Record<string, unknown> | null | undefined,
+): CustomFieldDef[] {
+  return camposPorEscopo(camposDoFunil(settings), "negocio").filter((campo) => campo.type === "date");
+}
+
+/**
+ * Os campos do NEGÓCIO que guardam ARQUIVO (#2829) — o `type: "file"` do funil.
+ *
+ * O anexo NÃO mora em `crm_leads.custom_fields`: mora em `crm_lead_attachments`,
+ * uma linha por arquivo, presa a `lead_id` + `field_key`. Quem lê o card precisa
+ * da DEFINIÇÃO (chave e rótulo) para saber quais campos desenhar — inclusive os
+ * VAZIOS, que aparecem como tal —, e é por isso que esta lista sai do funil e
+ * não da tabela de anexos.
+ *
+ * Só o escopo do negócio: arquivo de CONTATO não tem onde ser pendurado (a
+ * tabela exige `lead_id`), e `CustomFieldsEditor` já diz isso na ficha do
+ * contato em vez de oferecer um uploader que não salvaria.
+ */
+export function camposDeArquivoDoNegocio(
+  settings: Record<string, unknown> | null | undefined,
+): CustomFieldDef[] {
+  return camposPorEscopo(camposDoFunil(settings), "negocio").filter((campo) => campo.type === "file");
+}
+
+/**
+ * A chave está declarada neste funil como campo do CONTATO? É a recusa do
+ * servidor para o gatilho por data — a mesma regra do seletor, pela porta da API.
+ * Chave não declarada não é recusada: o `custom_fields` do negócio aceita chave
+ * livre, e a varredura a lê.
+ */
+export function campoEhDoContato(
+  settings: Record<string, unknown> | null | undefined,
+  chave: string,
+): boolean {
+  return camposDoFunil(settings).some((campo) => campo.key === chave && escopoDoCampo(campo) === "contato");
+}

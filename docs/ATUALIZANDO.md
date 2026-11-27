@@ -4,6 +4,17 @@ Saiu uma versão nova? Atualizar é **um comando só**. Você não precisa saber
 novidade é no código, no banco de dados ou nos dois — o comando cuida de tudo, na
 ordem certa e com backup automático antes de mexer em qualquer coisa.
 
+## Pela tela (sem SSH)
+
+Quando existe versão nova, o rodapé do menu lateral acende **"Nova versão"** — só para o
+dono do servidor — e **Configurações › Atualização** mostra o que muda, faz backup do banco e
+acompanha cada fase até o CRM voltar. A tela só **registra o pedido**; quem executa é o agente
+que o instalador deixou no servidor. E se o `.env` da instalação (o mesmo arquivo da instalação,
+na raiz do projeto) tiver uma janela de manutenção — `SYSTEM_UPDATE_WINDOW`, por exemplo
+`*/5 2-5 * * *`, lida no fuso `SYSTEM_UPDATE_WINDOW_TZ` —, o pedido feito fora dela **espera**:
+a tela avisa **"Atualização agendada para 02h00"**, o pedido fica pendente e roda sozinho quando
+a janela abrir. Ele não se perde, e não precisa ser pedido de novo.
+
 ## O que fazer
 
 Entre no seu servidor (o mesmo acesso SSH que você usou pra instalar), vá até a pasta
@@ -45,8 +56,9 @@ recente**, é porque não havia nada novo pra baixar; está tudo certo.
   - **permissão** (`must be owner`, `permission denied`): repetir não resolve — a conexão do
     `.env` não é a dona do banco. Declare `SUPABASE_DB_ADMIN_URL` e repita;
   - **qualquer outra coisa:** guarde a mensagem e peça ajuda.
-  Só em último caso volte ao estado anterior com o backup: `bash hostgator-setup-kit/restore.sh`
-  (ele desfaz também o que o CRM gravou depois dele).
+  O backup feito antes da atualização **não** volta por cima do banco em uso: o `restore.sh` só
+  restaura num banco vazio (ver `hostgator-setup-kit/README.md`). Se precisar voltar o banco ao
+  estado anterior, peça ajuda.
 
 ## Dicas
 

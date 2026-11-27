@@ -39,7 +39,7 @@ import {
   type EventoDeEnrollment,
   type NoDoDossie,
 } from "@/lib/followup/eventos-legiveis";
-import { DESFECHOS } from "@/lib/followup/vocabulario";
+import { DESFECHOS, statusCancelavel } from "@/lib/followup/vocabulario";
 import { useFollowupEnrollment, useIntervirNoFollowup } from "@/hooks/followup/useFollowupEnrollment";
 import { useCancelFollowupEnrollment } from "@/hooks/followup/useFollowupQueue";
 import { useT } from "@/hooks/i18n/useT";
@@ -52,8 +52,9 @@ interface Props {
 }
 
 const PAUSAVEL = new Set(["active", "waiting_reply"]);
-/** Pausado por uma pessoa também se cancela — sem ter de retomar antes só para encerrar. */
-const CANCELAVEL = new Set(["active", "waiting_reply", "paused_handoff", "paused_manual"]);
+// Pausado por uma pessoa também se cancela — sem ter de retomar antes só para
+// encerrar. A lista (e `dormente`/`coletando`, que a fila e a rota já aceitavam)
+// mora em `STATUS_CANCELAVEIS`: era aqui que a terceira cópia ficava para trás.
 
 function absoluta(iso: string | null, locale: Locale): string {
   if (!iso) return "—";
@@ -109,7 +110,16 @@ function LinhaDoTempo({
   const localeDaData = useLocaleDeData();
   const porId = useMemo(() => Object.fromEntries(nos.map((n) => [n.id, n])), [nos]);
 
-  if (eventos.length === 0) {
+  // Com recibos por mensagem, o evento genérico que avança o passo não
+  // deve virar uma segunda confirmação nem encobrir o envio parcial.
+  const jobsComRecibo = new Set(
+    eventos.filter((e) => e.event_type === "followup_message_sent").map((e) => e.payload.job_id),
+  );
+  const visiveis = eventos.filter((e) =>
+    e.event_type !== "action_sent" || !e.payload.job_id || !jobsComRecibo.has(e.payload.job_id),
+  );
+
+  if (visiveis.length === 0) {
     return (
       <p className="py-4 text-sm text-text-muted" data-testid="dossie-timeline-vazia">
         {t("Este follow-up ainda não deu nenhum passo.")}
@@ -121,11 +131,11 @@ function LinhaDoTempo({
     <>
       {truncado && (
         <p className="pb-2 text-xs text-warning-fg">
-          {t("Mostrando os primeiros passos — este follow-up tem histórico maior que o desta tela.")}
+          {t("Mostrando os eventos mais recentes deste follow-up.")}
         </p>
       )}
       <ul className="border-l border-border pl-3" data-testid="dossie-timeline">
-        {eventos.map((evento) => {
+        {visiveis.map((evento) => {
           const lido = descreveEvento(evento, porId, tagDoIdioma);
           const autorId = (evento.payload as { actor_user_id?: unknown } | null)?.actor_user_id;
           const nome = typeof autorId === "string" ? autores[autorId] : undefined;
@@ -192,7 +202,7 @@ export function DossieDoFollowup({ id, canWrite }: Props) {
   const podePausar = canWrite && PAUSAVEL.has(data.status);
   const podeRetomar = canWrite && data.status === "paused_manual";
   const podeMexerNoRelogio = canWrite && PAUSAVEL.has(data.status);
-  const podeCancelar = canWrite && CANCELAVEL.has(data.status);
+  const podeCancelar = canWrite && statusCancelavel(data.status);
 
   const pular = (edgeId?: string) => {
     intervir.mutate({ id, acao: "skip", body: edgeId ? { edge_id: edgeId } : {} });
@@ -258,7 +268,10 @@ export function DossieDoFollowup({ id, canWrite }: Props) {
           )}
           {data.cancel_reason && (
             <p className="text-sm text-text-muted">
-              {t("Motivo")}: {data.cancel_reason}
+              {/* `t()` devolve o próprio texto quando não há tradução: motivo gravado
+                  como código cru continua aparecendo como antes, e o que tem entrada no
+                  dicionário (ex.: MOTIVO_DA_VAGA_OCUPADA_DEMAIS) sai no idioma da tela. */}
+              {t("Motivo")}: {t(data.cancel_reason)}
             </p>
           )}
           {data.last_error && (

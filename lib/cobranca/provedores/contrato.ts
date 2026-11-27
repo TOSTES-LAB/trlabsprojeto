@@ -1,0 +1,195 @@
+/**
+ * O CONTRATO DE PROVEDOR DE COBRANÇA (spec cobrança do revendedor §6).
+ *
+ * O provedor é INSUMO, não fonte de regra: teste grátis, régua e limites moram
+ * no nosso banco. O que o provedor responde é a `Situacao`, sempre RELIDA na
+ * API; o webhook só acorda a leitura (`SinalDoWebhook`). Stripe (PR 3a) e Asaas
+ * (PR 3b) cabem no mesmo encaixe; Mercado Pago, depois.
+ *
+ * Sem SDK: cada adaptador recebe `fetch` e a chave por injeção, lida a cada
+ * uso. Toda falha de transporte, de HTTP ou de forma da resposta sai do
+ * adaptador como `ErroDoProvedor` — nunca `TypeError`, `ZodError` ou o corpo do
+ * provedor —, porque é a classe dele que decide o `ultimo_erro` da assinatura e
+ * o 503/502 das rotas, e porque URL, cabeçalho e corpo vão parar em log e Sentry.
+ */
+import {
+  PROVEDORES_DE_COBRANCA,
+  type ErroDeLeitura,
+  type Intervalo,
+  type Moeda,
+  type Modo,
+  type ProvedorDeCobranca,
+} from "@/lib/cobranca/vocabulario";
+
+export { PROVEDORES_DE_COBRANCA };
+export type { Modo, ProvedorDeCobranca };
+
+export interface PlanoParaProvedor {
+  readonly id: string;
+  readonly nome: string;
+  readonly precoCents: number;
+  /** A moeda do plano (CHECK de `cobranca_planos.moeda`, migration 9332). */
+  readonly moeda: Moeda;
+  readonly intervalo: Intervalo;
+}
+
+/** O que o webhook AUTORIZA: acordar a leitura. Nunca é fonte de estado. */
+export interface SinalDoWebhook {
+  readonly eventoId: string;
+  readonly tipo: string;
+  readonly clienteRef: string | null;
+}
+
+/** A única verdade que o provedor nos dá — relida na API. Tradução: `lib/cobranca/estado.ts`. */
+export interface Situacao {
+  /** Principal: a mais recente NÃO terminal; senão a mais recente. */
+  readonly assinaturaRef: string | null;
+  /** Principal não terminal E com o 1º pagamento confirmado. */
+  readonly existe: boolean;
+  /** Não terminais, inclusive as à espera do 1º pagamento (>1 = cobrança dupla). */
+  readonly assinaturasVivas: number;
+  /** Nenhuma não terminal e a mais recente é terminal. */
+  readonly cancelada: boolean;
+  readonly cancelaNoFim: boolean;
+  /** O provedor diz que a principal está devendo. */
+  readonly emAtraso: boolean;
+  /** Só quando o provedor sabe a data (Asaas); Stripe: null. */
+  readonly vencidaDesde: Date | null;
+  /** Fim do período pago. */
+  readonly proximoVencimento: Date | null;
+  /** Início do período efetivamente pago, usado para calcular um upgrade proporcional. */
+  readonly periodoPagoDesde?: Date | null;
+  /** Houve pagamento confirmado (> 0) em qualquer assinatura do cliente. */
+  readonly jaPagou: boolean;
+  /** Principal em teste no provedor (Stripe `trialing`): fim do teste lá. Asaas: sempre null. */
+  readonly emTesteNoProvedorAte: Date | null;
+  /** Pagou fatura de assinatura já terminal. */
+  readonly pagamentoSemAssinaturaViva: boolean;
+  /** Só de cobrança da principal NÃO terminal. */
+  readonly linkDePagamento: string | null;
+  /**
+   * Preço da assinatura principal NO PROVEDOR, em centavos (`Situacao` é o que
+   * a sincronização confere contra `cobranca_planos.preco_cents`, issue #2609).
+   * `null` = não há assinatura, ou o provedor não diz o valor — aí não há o que
+   * conferir.
+   */
+  readonly precoCents: number | null;
+  /** Diagnóstico: vai para o audit `cobranca.estado_mudou`. */
+  readonly statusBruto: string;
+}
+
+/** Só status HTTP e código do provedor. Nunca URL, header ou corpo (vão para log/Sentry). */
+export class ErroDoProvedor extends Error {
+  override readonly name = "ErroDoProvedor";
+
+  constructor(
+    readonly status: number | null,
+    readonly codigo: string,
+    readonly transitorio: boolean,
+    readonly credencialInvalida = false,
+  ) {
+    super(`provedor ${status ?? "sem_resposta"} ${codigo}`);
+  }
+}
+
+/**
+ * O `ultimo_erro` que uma leitura falha grava na assinatura. O estado fica
+ * intacto em todos os casos. Chave que não serve → `credencial_invalida`;
+ * transitório (rede, 429, 5xx) → `provedor_fora`; o resto — inclusive o cliente
+ * que não existe na conta da chave nova — → `leitura_invalida`, que a Visão
+ * geral mostra ao dono.
+ */
+export function paraErroDeLeitura(erro: unknown): ErroDeLeitura {
+  if (!(erro instanceof ErroDoProvedor)) return "leitura_invalida";
+  if (erro.credencialInvalida) return "credencial_invalida";
+  return erro.transitorio ? "provedor_fora" : "leitura_invalida";
+}
+
+/**
+ * `modoExigido` recusa a chave do OUTRO modo antes de enviá-la ao provedor:
+ * chave real nunca sai só para confirmar que é real.
+ */
+export type ResultadoDoTesteDaChave =
+  | { ok: true; modo: Modo }
+  | { ok: false; motivo: "chave_invalida" | "sem_permissao" | "provedor_fora" }
+  | { ok: false; motivo: "modo_divergente"; modo: Modo };
+
+/**
+ * O endpoint novo já existe no provedor; os antigos só saem em `confirmar()`,
+ * que quem chama roda DEPOIS de gravar o segredo. `desfazer()` apaga o novo
+ * quando a gravação falha — o antigo, com o segredo que está no banco, segue valendo.
+ */
+export interface WebhookPreparado {
+  readonly segredo: string;
+  confirmar(): Promise<void>;
+  desfazer(): Promise<void>;
+}
+
+export interface AdaptadorDeCobranca {
+  readonly id: ProvedorDeCobranca;
+  testarChave(opcoes?: { modoExigido?: Modo }): Promise<ResultadoDoTesteDaChave>;
+  prepararWebhook(
+    url: string,
+    emailDoDono: string,
+  ): Promise<WebhookPreparado | { manual: { url: string; segredo: string; eventos: string[] } }>;
+  /** Apaga os endpoints DESTA instalação (mesma URL ou mesma marca), menos `exceto`. Devolve quantos. */
+  removerWebhooks(url: string, exceto?: string): Promise<number>;
+  /**
+   * O cliente existe na conta DESTA chave? 404 → false; o resto sobe como
+   * `ErroDoProvedor`. É a guarda da troca de chave: chave de OUTRA conta com
+   * empresas pagando pararia a leitura de todas (Stripe `GET /customers/{id}`,
+   * Asaas `GET /customers/{id}`).
+   */
+  clienteExiste(clienteRef: string): Promise<boolean>;
+  /**
+   * null = inválido. Corpo CRU. Tempo constante. Nunca lança.
+   *
+   * `url` é a URL do aviso COMO CHEGOU. Stripe e Asaas autenticam no cabeçalho e
+   * a ignoram; o Efi não assina o callback (manda só `notification=<token>`), e
+   * a única coisa que ele ecoa é a URL que registramos na cobrança — é dela que
+   * saem o token e a empresa dona. Sem ela, um aviso do Efi é recusado.
+   */
+  verificarWebhook(corpoCru: string, headers: Headers, segredo: string, agora: Date, url?: URL): SinalDoWebhook | null;
+  garantirCliente(org: { id: string; nome: string; email: string; documento: string | null }): Promise<string>;
+  iniciarAssinatura(p: {
+    clienteRef: string;
+    orgId: string;
+    plano: PlanoParaProvedor;
+    trialAte: Date | null;
+    urlDeVolta: string;
+    chaveIdempotencia: string;
+  }): Promise<{ url: string; expiraEm: Date | null; assinaturaRef: string | null; sessaoId: string | null }>;
+  iniciarAjusteProporcional(p: { clienteRef: string; orgId: string; plano: PlanoParaProvedor; valorCents: number; chaveIdempotencia: string; urlDeVolta: string }): Promise<{ pagamentoRef: string; url: string }>;
+  lerPagamentoProporcional(pagamentoRef: string): Promise<"pendente" | "pago" | "encerrado">;
+  /**
+   * A situação DA ORGANIZAÇÃO no cliente (#4862). `organizacao` não é decoração: o
+   * cliente pode ser ADOTADO do painel (a #4768) e carregar assinaturas e cobranças
+   * de OUTRA integração. O Asaas devolve tudo que está vinculado à organização —
+   * assinatura, cobrança, `assinaturaRef`, `jaPagou` e `proximoVencimento`; nada de
+   * fora entra. A Stripe amarra o vínculo no `metadata.organization_id` desde a
+   * criação (não existe assinatura de fora no cliente dela) e ignora o parâmetro.
+   *
+   * `assinaturaRef` é a assinatura que quem chama JÁ tem na linha (#4056). O Efi não
+   * tem cliente nem lista assinaturas por cliente: com a referência, a leitura é a
+   * dela (`GET /v1/subscription/:id`); sem ela, o adaptador cai na lista de
+   * cobranças da empresa. Stripe e Asaas ignoram o campo.
+   *
+   * Os dois campos convivem: o `organizacao` é o recorte da leitura no Asaas, o
+   * `assinaturaRef` é o atalho do Efi. Nenhum deles afrouxa o outro.
+   */
+  lerSituacao(p: { clienteRef: string; organizacao: string; assinaturaRef?: string | null }): Promise<Situacao>;
+  /** Atualiza o preço recorrente sem mudar a data de renovação. Pode recusar com ErroDoProvedor não transitório. */
+  trocarPlano(p: { assinaturaRef: string; plano: PlanoParaProvedor }): Promise<void>;
+  /**
+   * Mata NO PROVEDOR a sessão de pagamento aberta (issue #2609), para a troca de
+   * plano acontecer na hora sem deixar um link vivo com o preço antigo. `sessaoId`
+   * é o `sessaoId` que `iniciarAssinatura` devolveu, gravado em
+   * `cobranca_assinaturas.checkout_sessao_id` — id de OUTRO provedor não expira
+   * nada, e recusa (`ErroDoProvedor` não transitório) em vez de fingir sucesso.
+   * Já expirada/apagada (404) é o efeito desejado: não é falha.
+   */
+  expirarSessao(sessaoId: string): Promise<void>;
+  cancelarNoFim(assinaturaRef: string): Promise<void>;
+  /** No Asaas é a leitura filtrada pela organização (#4862): `organizacao` é obrigatória. A Stripe não a usa. */
+  urlDeGerenciar(p: { clienteRef: string; urlDeVolta: string; organizacao: string }): Promise<string | null>;
+}

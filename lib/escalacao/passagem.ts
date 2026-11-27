@@ -62,6 +62,8 @@ export const ORIGENS_DA_PASSAGEM = [
   "opt_out_provavel",
   "ferramenta_do_modelo",
   "teto_de_gasto",
+  // O teto de respostas da IA para visitante anônimo do chat no site (Spec 36, F4).
+  "teto_do_anonimo",
   "caso_escalado",
   "sentimento",
   "legado_pedido",
@@ -84,12 +86,22 @@ export const MOTIVOS_DA_PASSAGEM = [
   "requested_human",
   "suspected_optout",
   "orcamento_de_ia",
+  "teto_do_visitante_anonimo",
   "low_sentiment",
   "low_confidence",
   "critical_stage",
   "legal_mention",
   "refund_mention",
   "caso_escalado",
+  // Um fluxo DETERMINÍSTICO coletou dados (campo a campo) e passou para
+  // verificação humana. Distinto de `requested_human` porque o cliente NÃO
+  // pediu uma pessoa — mentir no rótulo faria quem assume abrir com um
+  // agradecimento que ninguém pediu. Par da migration 0693.
+  "verificacao_manual",
+  // A trava de valores e negociação barrou a resposta da IA (Spec 34). Distinto de
+  // `low_confidence` porque o assistente não "teve pouca confiança": foi uma regra
+  // da organização que o impediu de falar — e quem assume precisa ler isso.
+  "restricao_comercial",
 ] as const;
 export type MotivoDaPassagem = (typeof MOTIVOS_DA_PASSAGEM)[number];
 
@@ -128,12 +140,15 @@ export const FRASE_DO_MOTIVO = {
   requested_human: "O cliente pediu para falar com uma pessoa",
   suspected_optout: "O cliente parece ter pedido para não receber mais mensagens",
   orcamento_de_ia: "O limite de gasto com IA foi atingido — o cliente não pediu uma pessoa",
+  teto_do_visitante_anonimo: "A IA chegou ao limite de respostas para visitante sem contato — o cliente não pediu uma pessoa",
   low_sentiment: "O cliente demonstrou irritação na conversa",
   low_confidence: "O assistente não teve confiança suficiente para responder",
   critical_stage: "O negócio chegou a uma etapa que pede uma pessoa",
   legal_mention: "A conversa tocou em assunto jurídico",
   refund_mention: "A conversa tocou em reembolso",
   caso_escalado: "Uma pessoa da equipe escalou um atendimento",
+  verificacao_manual: "Um fluxo automático coletou dados e passou a conversa para verificação humana",
+  restricao_comercial: "A trava de valores e negociação barrou a resposta",
 } satisfies Record<MotivoDaPassagem, string>;
 
 /**
@@ -469,16 +484,32 @@ export function linhaDoAvisoAoCliente(
 
 /**
  * O texto livre que um agente externo mandou como `reason` vira um código do
- * nosso vocabulário quando corresponde a um; senão, `requested_human`.
+ * nosso vocabulário quando corresponde a um; senão, `low_confidence`.
  *
  * O texto NÃO se perde: ele vai para `content`, que é redigível pela cascata de
  * LGPD. Antes desta entrega ele ia para `api_audit_log.metadata`, tabela sem
  * `UPDATE`/`DELETE` para papel nenhum — texto livre de fora, gravado onde
  * ninguém consegue apagar.
+ *
+ * ⚠️ **O fallback mudou de `requested_human` para `low_confidence` (#3310), e a
+ * razão é a que a issue mediu:** texto livre é, por definição, uma escalação do
+ * PRÓPRIO agente (não achou o card da viagem, não tem a informação, a regra do
+ * prompt manda passar). Traduzi-lo para `requested_human` fazia o cartão dizer
+ * "O cliente pediu para falar com uma pessoa" — e o lead recebia a abertura da
+ * variante `pediu_humano` — para um cliente que só perguntou do check-in.
+ * `low_confidence` é o motivo do vocabulário fechado que descreve o que houve
+ * ("o assistente não resolveu sozinho") SEM afirmar nada sobre o cliente; quem
+ * de fato pediu uma pessoa continua vindo com o código explícito
+ * (`requested_human`), e é ele que recebe a frase certa.
+ *
+ * Por que não um código novo: `passagens_de_atendimento.motivo_codigo` é
+ * vocabulário FECHADO por CHECK, e um valor novo sem a migration do par
+ * (`tests/invariants/vocabulario-banco-x-typescript.test.ts`) viraria `23514`
+ * no caminho que existe justamente para o caso raro.
  */
 export function motivoCodigoDoTexto(texto: string | null | undefined): MotivoDaPassagem {
   const bruto = (texto ?? "").trim();
   return (MOTIVOS_DA_PASSAGEM as readonly string[]).includes(bruto)
     ? (bruto as MotivoDaPassagem)
-    : "requested_human";
+    : "low_confidence";
 }

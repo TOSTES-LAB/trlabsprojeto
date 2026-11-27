@@ -3,6 +3,8 @@ import path from "node:path";
 
 import { describe, expect, it } from "vitest";
 
+import { CHAVES_DE_TOKEN_DO_TEMA } from "@/lib/extensions/tema";
+
 /**
  * Guardas da migração para o Tailwind 4 (config em CSS).
  *
@@ -176,6 +178,93 @@ describe("Tailwind 4 — a ponte token → utilitário", () => {
 
     const faltando = raizesComClasse.filter((n) => !declarados.includes(n));
     expect(faltando, "pasta com className fora do @source de app/globals.css").toEqual([]);
+  });
+});
+
+/**
+ * Toda classe de cor precisa de um token que a gere — a lição da #5184.
+ *
+ * A família `danger` — em classe de texto, de fundo e de borda — estava em 11
+ * arquivos e NÃO pintava nada: o Tailwind 4 gera utilitário a partir das
+ * CHAVES do `@theme inline`, e não existe `--color-danger` em lugar nenhum do
+ * `app/globals.css` (o token da mesma cor se chama `--color-destructive`). Nem
+ * erro, nem aviso: o texto herdava a cor da página, o fundo ficava
+ * transparente.
+ *
+ * A guarda acima (`…sem ponte`) não pega este caso, e a razão é estrutural: ela
+ * deriva os nomes proibidos dos tokens do `:root` que não ganharam ponte. Um
+ * nome que não existe em LUGAR NENHUM — nem no `:root`, nem no `@theme` — não
+ * está em nenhum dos dois lados, então escapa. Lista manual também não resolve:
+ * na primeira vez que alguém inventar `text-alerta`, ela envelhece.
+ *
+ * Por isso esta guarda é a mão que faltava: para cada utilitário de cor que o
+ * código escreve, exige uma FAMÍLIA que exista. Família = primeiro segmento de
+ * um token publicado no `@theme inline` (`accent-500` → `accent`) ou de um
+ * token da paleta PADRÃO do Tailwind, lida do `theme.css` do pacote. Nome
+ * inventado não fala com família nenhuma e reprova sozinho.
+ *
+ * O que fica fora, dito para ninguém supor que está coberto: um erro de
+ * digitação DENTRO de família conhecida (`text-accent-strng`) passa — a família
+ * existe. Medido na árvore desta issue, esse furo tem dois moradores antigos e
+ * alheios ao recorte (`text-accent-strong`, `border-warning-border`), registrados
+ * no PR e NÃO tocados aqui.
+ */
+describe("Tailwind 4 — toda classe de cor precisa de família de token (issue #5184)", () => {
+  /** Tokens que o `@theme inline` publica — é deles que o Tailwind gera utilitário. */
+  const PUBLICADOS = new Set(
+    propsDe(bloco("@theme inline"))
+      .filter((p) => p.startsWith("--color-"))
+      .map((p) => p.slice("--color-".length)),
+  );
+
+  /**
+   * Famílias válidas. Nenhuma digitada aqui: saem do `@theme inline` do produto
+   * e do `theme.css` do próprio pacote (a paleta padrão continua valendo —
+   * `text-red-500` pinta porque existe no Tailwind, não porque existe no
+   * produto). `current`, `transparent` e `inherit` são palavras do CSS, aceitas
+   * sem token declarado.
+   */
+  const FAMILIAS = new Set<string>(["current", "transparent", "inherit"]);
+  for (const token of PUBLICADOS) FAMILIAS.add(token.split("-")[0]!);
+  const PALETA_PADRAO = fs.readFileSync(
+    path.join(RAIZ, "node_modules/tailwindcss/theme.css"),
+    "utf8",
+  );
+  for (const d of PALETA_PADRAO.matchAll(/^\s*--color-([a-z][a-z0-9-]*)\s*:/gim)) {
+    FAMILIAS.add(d[1]!.split("-")[0]!);
+  }
+
+  it("nenhuma classe de cor cita família inexistente", () => {
+    const achados = ocorrenciasDeClasse(
+      listarFontes(["app", "components", "lib", "hooks"]),
+      // A variante (`hover:`, `dark:`, `md:`, `data-[…]:`) entra pelo separador
+      // `:` do prefixo; o `/` e o `!` do lookahead são o alpha e o `important`.
+      /(?:^|[\s"'`:])(text|bg|border|ring|fill|stroke)-([a-z][a-z0-9-]*)(?=[\s"'`/!]|$)/g,
+    );
+
+    // Piso de vacuidade: a árvore escreve centenas destas classes. Se a
+    // varredura zerar (extrator quebrado, `node_modules` fora do lugar), o
+    // verde seria cego — e cego é indistinguível de guarda morta.
+    expect(achados.length, "guarda cega: nenhuma classe de cor varrida").toBeGreaterThan(200);
+
+    const mudas = [
+      ...new Set(
+        achados
+          .filter(({ nome }) => {
+            if (SINTAXE_NAO_COR.some((rx) => rx.test(nome))) return false;
+            // `ring-offset-<cor>` fala do token do offset, não de uma família
+            // chamada `offset`.
+            const segmentos = nome.replace(/^offset-/, "").split("-");
+            return !segmentos.some((s) => FAMILIAS.has(s));
+          })
+          .map(({ onde, prefixo, nome }) => `${onde}  ${prefixo}-${nome}`),
+      ),
+    ].sort();
+
+    expect(
+      mudas,
+      "classe de cor sem token que a gere não emite CSS: o texto herda a cor da página e o fundo fica transparente, com build verde",
+    ).toEqual([]);
   });
 });
 
@@ -380,6 +469,126 @@ function ocorrencias(arquivos: string[], rx: RegExp): string[] {
         achados.push(`${path.relative(RAIZ, f)}:${i + 1}`);
       }
     });
+  }
+  return achados;
+}
+
+/**
+ * O que NÃO é cor: os cinco prefixos têm sufixos que não nomeiam token nenhum —
+ * lado de borda, largura de anel, tamanho de texto, alinhamento, direção de
+ * gradiente. Esta lista é de SINTAXE do Tailwind; nome de COR não entra aqui, e
+ * é por isso que um nome inventado (`danger`) não tem onde se esconder.
+ */
+const SINTAXE_NAO_COR: RegExp[] = [
+  /^\d+(\.\d+)?$/, // escala numérica: border-2, ring-4, stroke-1.5
+  /^[tblrxyse](-\d+(\.\d+)?)?$/, // lado/aresta: border-b, border-x-2, ring-y
+  /^offset-\d+(\.\d+)?$/, // ring-offset-2
+  /^(2xs|xs|sm|base|lg|xl|[2-9]xl)$/, // corpo de texto
+  /^(left|center|right|justify|start|end)$/, // alinhamento
+  /^(wrap|nowrap|balance|pretty|ellipsis|clip)$/, // quebra e transbordo
+  /^(uppercase|lowercase|capitalize|underline|overline|line-through|no-underline)$/,
+  /^underline-offset-\d+$/,
+  /^(none|solid|dashed|dotted|double|hidden|collapse|separate|inset)$/, // estilo de borda/anél
+  /^(gradient|linear|radial|conic)(-|$)/, // forma e direção de gradiente
+  /^(top|bottom|left|right|center)(-|$)/, // posição de background
+  /^(auto|cover|contain|repeat|no-repeat|repeat-x|repeat-y|fixed|local|scroll)$/,
+  /^(clip|origin|blend)-(|.*)$/, // background-clip/origin/blend
+  /^(round|butt|square)$/, // linecap do stroke
+  /^(shadow|spacing)(-|$)/, // text-shadow-*, border-spacing-*
+];
+
+/**
+ * Literais de string que de fato carregam classe: `className=…`, chaves que
+ * terminam em `…Class…` (`borderClassName:`) e as chamadas de
+ * `cn`/`cva`/`clsx`/`twMerge`.
+ *
+ * Varrer o arquivo cru traria a allowlist de propriedades CSS de
+ * `lib/branding/css-personalizado.ts` (`"border-color"`, `"border-radius"`,
+ * `"text-transform"`) como se fossem utilitários — e guarda que acusa prosa é
+ * guarda que a próxima pessoa desliga.
+ */
+function literaisDeClasse(fonte: string): { texto: string; indice: number }[] {
+  const saida: { texto: string; indice: number }[] = [];
+  const MARCAS = /\b(?:className\s*=|[\w$]*Class[\w$]*\s*[:=]|(?:cn|cva|clsx|twMerge)\s*\()/g;
+
+  /** Anda uma string literal e devolve o índice logo depois da aspa de fecho. */
+  const pulaString = (i: number): number => {
+    const aspa = fonte[i]!;
+    let j = i + 1;
+    while (j < fonte.length) {
+      const c = fonte[j]!;
+      if (c === "\\") {
+        j += 2;
+        continue;
+      }
+      if (c === aspa) return j + 1;
+      j++;
+    }
+    return j;
+  };
+
+  /** Do abre em `i`, devolve o índice logo depois do fecha correspondente. */
+  const pulaExpressao = (i: number): number => {
+    let profundidade = 0;
+    for (let j = i; j < fonte.length; j++) {
+      const c = fonte[j]!;
+      if (c === '"' || c === "'" || c === "`") {
+        j = pulaString(j) - 1;
+        continue;
+      }
+      if (c === "(" || c === "{" || c === "[") profundidade++;
+      else if (c === ")" || c === "}" || c === "]") {
+        profundidade--;
+        if (profundidade === 0) return j + 1;
+      }
+    }
+    return fonte.length;
+  };
+
+  for (const m of fonte.matchAll(MARCAS)) {
+    let i = (m.index ?? 0) + m[0].length;
+    while (i < fonte.length && /\s/.test(fonte[i]!)) i++;
+    const c = fonte[i];
+    if (!c) break;
+    const fim =
+      c === '"' || c === "'" || c === "`"
+        ? pulaString(i)
+        : c === "{" || c === "("
+          ? pulaExpressao(i)
+          : i;
+    if (fim <= i) continue;
+    // Dentro da expressão, todo literal é candidato — inclusive o que mora na
+    // interpolação de um template (`${ativo ? "…" : ""}`).
+    for (const lit of fonte
+      .slice(i, fim)
+      .matchAll(/"([^"\\\n]*)"|'([^'\\\n]*)'|`([^`\\]*)`/g)) {
+      saida.push({
+        texto: lit[1] ?? lit[2] ?? lit[3] ?? "",
+        indice: i + (lit.index ?? 0),
+      });
+    }
+  }
+  return saida;
+}
+
+/** Utilitários que casam `rx` nos literais de classe, com arquivo:linha. */
+function ocorrenciasDeClasse(
+  arquivos: string[],
+  rx: RegExp,
+): { onde: string; prefixo: string; nome: string }[] {
+  const achados: { onde: string; prefixo: string; nome: string }[] = [];
+  for (const f of arquivos) {
+    const fonte = fs.readFileSync(f, "utf8");
+    for (const { texto, indice } of literaisDeClasse(fonte)) {
+      const linha = fonte.slice(0, indice).split("\n").length;
+      for (const m of texto.matchAll(rx)) {
+        achados.push({
+          onde: `${path.relative(RAIZ, f)}:${linha}`,
+          prefixo: m[1]!,
+          nome: m[2]!,
+        });
+      }
+    }
   }
   return achados;
 }
@@ -591,5 +800,165 @@ describe("Tailwind 4 — alpha em cor de texto agora PINTA, então precisa passa
       [...new Set(reprovados)].sort(),
       "o alpha PINTA no v4: ou tire o `/NN` (restaura o que a produção já mostra) ou use um alpha que passe",
     ).toEqual([]);
+  });
+});
+
+/**
+ * A família `surface-*` — classe que nomeia token INEXISTENTE é classe MUDA.
+ *
+ * Medido na `main` a9a99abc86, quando o funil da issue #3791 ganhou esta guarda:
+ * `app/globals.css` declara, de superfície, exatamente DOIS tokens —
+ * `--color-surface` (#ffffff/#1d1c17) e `--color-surface-elevated`
+ * (#f5f3ee/#272620) — e o `@theme inline` faz ponte para esses dois e só para
+ * esses dois. A árvore usava TRÊS nomes: 89 chamadas de `bg-surface-elevated`
+ * (pintavam), 6 de `bg-surface-muted` (o quadro do funil: coluna da etapa,
+ * cabeçalho preso, esqueleto do quadro, aviso de funil arquivado e o hover de
+ * "Ignorar"/"Encerrar" da próxima ação e da reativação) e 2 de
+ * `bg-surface-sunken` (dois painéis da agenda). As oito NÃO pintavam: o
+ * Tailwind 4 gera utilitário a partir das CHAVES do `@theme inline`, então
+ * `bg-surface-muted` não é erro nem aviso — é ausência de regra. Coluna
+ * transparente sobre o fundo da página, e hover que não acende no cursor.
+ *
+ * ── Por que o token NÃO foi criado, e sim trocado ───────────────────────────
+ *
+ * Porque `lib/extensions/tema.ts` ENUMERA os tokens que uma extensão pode
+ * sobrescrever (`CHAVES_DE_TOKEN_DO_TEMA`, allowlist fechada — o `z.object`
+ * dela é `.strict()`), e as cinco paletas de `app/design/lib/tokens.ts`
+ * declaram superfície como registro FECHADO por tema (`bg`, `surface`,
+ * `surfaceElevated`, `text`, `textMuted`, `border`) nos dois modos. Criar
+ * `--color-surface-muted` exigiria: uma chave na allowlist do tema de extensão,
+ * um campo em CADA uma das 5 paletas × 2 temas, a ponte no `@theme inline` e a
+ * linha no espelho `[data-theme="light"]`. Faltando qualquer uma, a instalação
+ * que escolheu um tema de extensão fica sem o token e a coluna volta a não
+ * pintar — só que agora num cliente, não no CI. `--color-surface-elevated` já é
+ * a superfície suave, já está em todas as paletas e já tem par nos dois temas,
+ * então é ela que o quadro passa a usar.
+ *
+ * ── Por que a guarda olha a FAMÍLIA, e não os dois nomes ────────────────────
+ *
+ * Porque o furo não é `muted` nem `sunken`: é usar `bg-surface-<qualquer>` sem
+ * conferir se `<qualquer>` existe. Prender os dois nomes de hoje deixaria o
+ * terceiro nascer igual — e nesta mesma árvore esse padrão já custou três
+ * rodadas (ver o comentário do lookahead acima). O conjunto proibido é derivado
+ * do próprio CSS: o nome tem de estar no `:root` E no `@theme inline`. Nenhuma
+ * lista digitada aqui envelhece.
+ */
+describe("Tailwind 4 — `bg-surface-*` sem token é classe muda", () => {
+  const PONTE = new Set(propsDe(bloco("@theme inline")));
+  const DECLARADOS = new Set(propsDe(bloco(":root")));
+  const FONTES_DE_UI = listarFontes(["app", "components", "lib", "hooks"]);
+
+  /**
+   * `bg-surface-<nome>` escrito em className, com arquivo:linha.
+   *
+   * A regex é a MESMA forma das guardas de `rounded`/`shadow`: o lookbehind com
+   * `:` pega `hover:bg-surface-…` e `data-[…]:bg-surface-…` (o hover morto da
+   * issue é exatamente essa forma), e o lookahead com `/` e `!` pega o
+   * modificador de alpha (`bg-surface-elevated/40`, que é o da coluna) e o
+   * `important` do v4.
+   */
+  function superficies(arquivos: string[]): { onde: string; nome: string }[] {
+    const achados: { onde: string; nome: string }[] = [];
+    const rx = /(?<=[\s"'`:])bg-(surface-[a-z0-9-]+)(?=[\s"'`/!]|$)/g;
+    for (const f of arquivos) {
+      const linhas = fs.readFileSync(f, "utf8").split("\n");
+      linhas.forEach((linha, i) => {
+        const cru = linha.trimStart();
+        if (cru.startsWith("*") || cru.startsWith("//") || cru.startsWith("/*")) return;
+        for (const m of linha.matchAll(rx)) {
+          achados.push({ onde: `${path.relative(RAIZ, f)}:${i + 1}`, nome: m[1]! });
+        }
+      });
+    }
+    return achados;
+  }
+
+  const resolve = (nome: string) =>
+    DECLARADOS.has(`--color-${nome}`) && PONTE.has(`--color-${nome}`);
+
+  it("nenhuma classe `bg-surface-*` nomeia token que o CSS não declara e o `@theme` não faz ponte", () => {
+    const achadas = superficies(FONTES_DE_UI);
+
+    // Piso de vacuidade: a família é usada de verdade na árvore (97 chamadas
+    // medidas em 31/10/2026). Guarda que varre zero arquivo — `@source`
+    // mudando, `listarFontes` quebrado — passa verde sem provar nada.
+    expect(achadas.length).toBeGreaterThan(50);
+
+    const mudas = achadas
+      .filter(({ nome }) => !resolve(nome))
+      .map(({ onde, nome }) => `${onde}  bg-${nome}`);
+    expect(
+      mudas,
+      "`bg-surface-*` sem `--color-surface-*` no `:root` + ponte no `@theme inline` não gera regra nenhuma: o elemento fica transparente, com build verde",
+    ).toEqual([]);
+  });
+
+  it("as seis superfícies do quadro do funil resolvem (issue #3791)", () => {
+    // Os seis usos medidos na `main` a9a99abc86, arquivo por arquivo — a lista
+    // é o escopo da issue, e falhar aqui é falhar no defeito que o autor viu.
+    const SITES = [
+      "app/app/pipelines/[id]/_client.tsx", // aviso de funil arquivado
+      "components/kanban/NextActionSlot.tsx", // hover de "Ignorar"
+      "components/kanban/ReactivationSlot.tsx", // hover de "Encerrar"
+      "components/kanban/KanbanBoard.tsx", // esqueleto do quadro
+      "components/kanban/StageColumn.tsx", // coluna (2: corpo e cabeçalho)
+    ];
+    const achadas = superficies(SITES.map((p) => path.join(RAIZ, p)));
+
+    // `StageColumn.tsx` contribui com dois; o piso é 6, e não igualdade, para
+    // que uma coluna nova legítima não reprove por ser a sétima.
+    expect(
+      achadas.length,
+      `esperava ao menos 6 usos de bg-surface-* no quadro do funil, achei ${achadas.length}`,
+    ).toBeGreaterThanOrEqual(6);
+
+    expect(
+      achadas.filter(({ nome }) => !resolve(nome)).map(({ onde, nome }) => `${onde}  bg-${nome}`),
+      "superfície do quadro sem fundo: nenhuma destas classes pinta hoje",
+    ).toEqual([]);
+  });
+
+  it("`surface-elevated` resolve para cor nos dois temas e se distingue da página e do card", () => {
+    /** Declarações `--x: valor` de um bloco, como mapa. */
+    const declaracoes = (seletor: string) => {
+      const mapa = new Map<string, string>();
+      for (const d of bloco(seletor).matchAll(/^\s*(--[a-z0-9-]+)\s*:\s*([^;]+);/gim)) {
+        if (d[1] && d[2]) mapa.set(d[1], d[2].trim());
+      }
+      return mapa;
+    };
+
+    // Os três blocos que o produto realmente aplica: o `:root` (claro), o
+    // atributo escuro, e o espelho de subárvore clara — este último existe para
+    // que um `<div data-theme="light">` dentro de página escura receba token.
+    const BLOCOS = {
+      ":root": declaracoes(":root"),
+      '[data-theme="dark"]': declaracoes('[data-theme="dark"]'),
+      '[data-theme="light"]': declaracoes('[data-theme="light"]'),
+    } as const;
+
+    for (const [nome, mapa] of Object.entries(BLOCOS)) {
+      const elevada = mapa.get("--color-surface-elevated");
+      expect(elevada, `--color-surface-elevated ausente em ${nome}`).toMatch(/^#[0-9a-f]{6}$/i);
+
+      // "Resolver para cor" não basta: um token que devolvesse o MESMO valor do
+      // fundo da página ou do card seria invisível — o defeito da issue com
+      // outro nome. A asserção é a diferença, medida nos dois valores reais.
+      for (const vizinho of ["--color-surface", "--color-bg"]) {
+        expect(mapa.get(vizinho), `${vizinho} ausente em ${nome}`).toMatch(/^#[0-9a-f]{6}$/i);
+        expect(
+          elevada,
+          `em ${nome} a superfície elevada repete ${vizinho}: a coluna e o hover continuariam invisíveis`,
+        ).not.toBe(mapa.get(vizinho));
+      }
+    }
+
+    // E a ponte: sem ela a classe existe no código e não no CSS.
+    expect(PONTE.has("--color-surface-elevated")).toBe(true);
+
+    // O token escolhido está na allowlist do tema de extensão. É a MEDIDA que
+    // decidiu entre criar `surface-muted` e reusar `surface-elevated`: um nome
+    // fora desta lista não é sobrescrevível por paleta de extensão.
+    expect(CHAVES_DE_TOKEN_DO_TEMA as readonly string[]).toContain("--color-surface-elevated");
   });
 });

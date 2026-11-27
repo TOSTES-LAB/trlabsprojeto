@@ -15,6 +15,13 @@ export interface FollowupFlowPointerRow {
   active_version_id: string | null;
   handoff_policy: string;
   updated_at: string;
+  /**
+   * `trigger_config->>kind`, que a busca da lista lê (#4593). `null` = a
+   * configuração não tem `kind` (o editor mostra «Manual»). Ausente = a linha
+   * veio de uma escrita (criar, duplicar, instalar) e a lista ainda não foi
+   * relida.
+   */
+  trigger_kind?: string | null;
 }
 
 interface ListResponse {
@@ -93,10 +100,80 @@ export function useDuplicateFollowupFlow() {
       qc.setQueryData<FollowupFlowPointerRow[]>(followupFlowsListQueryKey, (prev) =>
         prev ? [created, ...prev] : [created],
       );
+      // A linha devolvida não traz `trigger_kind`: reler a lista devolve o
+      // gatilho à busca (#4593), senão a cópia some de um termo como «silencio».
+      void qc.invalidateQueries({ queryKey: followupFlowsListQueryKey });
       toast.success(t("Fluxo duplicado."));
     },
     onError: (err) => {
       showApiError(err);
+    },
+  });
+}
+
+// ─── Exportar / importar (lib/followup/portabilidade.ts) ────────────────────
+
+interface ExportResponse {
+  data: { file_name: string; file: unknown };
+}
+
+/** Baixa o fluxo como arquivo `.fluxo.json`. Sem estado de cache: é uma leitura pontual. */
+export function useExportFollowupFlow() {
+  const t = useT();
+  return useMutation({
+    mutationKey: ["followup", "flows", "export"],
+    mutationFn: async (id: string) => {
+      const res = await apiClient.get<ExportResponse>(`/api/v1/ai/followup-flows/${id}/export`);
+      return res.data;
+    },
+    onSuccess: ({ file_name, file }) => {
+      const blob = new Blob([JSON.stringify(file, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file_name;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+      toast.success(t("Fluxo exportado."));
+    },
+    onError: (err) => {
+      showApiError(err);
+    },
+  });
+}
+
+export interface PendenciaDaImportacao {
+  codigo: string;
+  bloqueia: boolean;
+  no?: { id: string; label: string };
+  referencia?: string;
+}
+
+interface ImportResponse {
+  data: { flow: FollowupFlowPointerRow; pendencias: PendenciaDaImportacao[] };
+}
+
+/**
+ * Importa um arquivo exportado. Erro não vira toast aqui: o diálogo mostra a
+ * lista de problemas do arquivo (`details.problemas`) onde a pessoa está olhando.
+ */
+export function useImportFollowupFlow() {
+  const t = useT();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationKey: ["followup", "flows", "import"],
+    mutationFn: async (input: { file: unknown; name?: string }) => {
+      const res = await apiClient.post<ImportResponse>("/api/v1/ai/followup-flows/import", {
+        file: input.file,
+        ...(input.name ? { name: input.name } : {}),
+      });
+      return res.data;
+    },
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: followupFlowsListQueryKey });
+      toast.success(t("Fluxo importado como rascunho."));
     },
   });
 }

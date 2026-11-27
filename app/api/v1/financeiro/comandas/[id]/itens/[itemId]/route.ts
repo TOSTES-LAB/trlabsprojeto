@@ -17,6 +17,8 @@ import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { requireSupportWrite } from "@/lib/impersonate/support";
+import { moduloLigado } from "@/lib/instalacao/modulos";
+import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 
 export const dynamic = "force-dynamic";
@@ -25,6 +27,11 @@ type Ctx = { params: Promise<{ id: string; itemId: string }> };
 
 export async function DELETE(_req: NextRequest, ctx: Ctx): Promise<Response> {
   const requestId = randomUUID();
+  // #1907 item 4 — comanda é MÓDULO DE TABELA: sem `modulos_instalados` a
+  // linha ativa as cinco tabelas não existem e a rota não existe. 404,
+  // mesmo molde da cobrança desligada (falha fechada, dois lados).
+  const admin = createAdminClient();
+  if (!(await moduloLigado(admin, "financeiro"))) return fail("not_found", "Not found", 404, { requestId });
   const supportDenied = await requireSupportWrite();
   if (supportDenied) return supportDenied;
 
@@ -38,6 +45,10 @@ export async function DELETE(_req: NextRequest, ctx: Ctx): Promise<Response> {
     .from("sales")
     .select("id, status, number")
     .eq("id", id)
+    // #4845 — a comanda tem de ser desta empresa antes de qualquer escrita: o id
+    // chega de uma lista que vazou, e a RLS libera as empresas todas de quem é
+    // membro das duas.
+    .eq("organization_id", authz.org.orgId)
     .maybeSingle();
   if (!comanda) return fail("not_found", "Comanda não encontrada.", 404, { requestId });
   if (comanda.status !== "open") {
@@ -59,6 +70,7 @@ export async function DELETE(_req: NextRequest, ctx: Ctx): Promise<Response> {
     .delete()
     .eq("id", itemId)
     .eq("sale_id", id)
+    .eq("organization_id", authz.org.orgId)
     .select("id")
     .maybeSingle();
 
@@ -67,6 +79,8 @@ export async function DELETE(_req: NextRequest, ctx: Ctx): Promise<Response> {
 
   await audit({
     action: "comanda.item_removido",
+    actorUserId: authz.user.id,
+    organizationId: authz.org.orgId,
     resourceType: "sale",
     resourceId: id,
     requestId,

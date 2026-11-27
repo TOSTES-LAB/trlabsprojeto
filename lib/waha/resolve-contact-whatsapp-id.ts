@@ -8,6 +8,8 @@
  * WAHA documenta `GET /api/contacts/check-exists` para isso; tentamos todas as
  * variantes de busca (phoneLookupVariants) antes de cair no número bruto.
  */
+import { FalhaDeEnvioDoCanal } from "@/lib/channels/falha-de-envio";
+import { FRASES_DE_FALHA } from "@/lib/channels/frases-de-falha";
 import { phoneLookupVariants } from "@/lib/channels/phone-variants";
 
 import type { WahaClient } from "./client";
@@ -42,26 +44,75 @@ export function sendChatIdFromCheckResult(r: WahaCheckExistsResult): string | nu
   return id ? `${id}@c.us` : null;
 }
 
-async function firstExistingOnWhatsapp(
+/**
+ * Memo do check-exists POSITIVO, por (sessão, dígitos).
+ *
+ * Sem ele, toda bolha a um celular BR faz 1–2 GET ao WAHA antes do envio — uma
+ * resposta do agente em 3 bolhas pergunta 3 vezes a mesma coisa em segundos.
+ *
+ * - Só o positivo entra: negativo ou falha exige consulta fresca na próxima tentativa;
+ *   a conta pode ter sido criada depois da última consulta.
+ * - A sessão na chave isola os tenants: `waha_session_name` é UNIQUE e cada
+ *   `channel_sessions` pertence a uma organização.
+ * - 10 min limita o quanto um `@lid` trocado no WhatsApp fica velho aqui.
+ * - Nada disto vai para `source_metadata.waha_lid` — ver `lib/waha/send.ts`.
+ */
+export const TTL_DO_MEMO_CHECK_EXISTS_MS = 10 * 60_000;
+export const TETO_DO_MEMO_CHECK_EXISTS = 5000;
+
+const _memoCheckExists = new Map<string, { at: number; r: WahaCheckExistsResult }>();
+
+/** Esvazia o memo. Usado pelos testes. */
+export function limparMemoCheckExists(): void {
+  _memoCheckExists.clear();
+}
+
+type ConsultaDeConta = {
+  existe: boolean | null;
+  conta: WahaCheckExistsResult | null;
+};
+
+async function consultarContaNoWhatsapp(
   client: WahaClient,
   session: string,
   phone: string,
-): Promise<WahaCheckExistsResult | null> {
+): Promise<ConsultaDeConta> {
+  const chave = `${session}\u0000${phone.replace(/\D/g, "")}`;
+  const memo = _memoCheckExists.get(chave);
+  if (memo && Date.now() - memo.at < TTL_DO_MEMO_CHECK_EXISTS_MS)
+    return { existe: true, conta: memo.r };
+
   const tried = new Set<string>();
+  let falhou = false;
   for (const variant of phoneLookupVariants(phone)) {
     const digits = variant.replace(/\D/g, "");
     if (!digits || tried.has(digits)) continue;
     tried.add(digits);
     try {
       const r = await client.checkContactExists(session, digits);
-      if (r.numberExists && (sendChatIdFromCheckResult(r) || whatsappIdFromCheckResult(r))) {
-        return r;
+      if (r.numberExists === true) {
+        _memoCheckExists.delete(chave);
+        if (_memoCheckExists.size >= TETO_DO_MEMO_CHECK_EXISTS)
+          _memoCheckExists.delete(_memoCheckExists.keys().next().value!);
+        _memoCheckExists.set(chave, { at: Date.now(), r });
+        return { existe: true, conta: r };
       }
+      // Resposta incompleta também é desconhecido, nunca um negativo definitivo.
+      if (r.numberExists !== false) falhou = true;
     } catch {
-      // ponytail: falha na consulta não bloqueia envio — adapter cai no wa_id bruto
+      falhou = true;
     }
   }
-  return null;
+  _memoCheckExists.delete(chave);
+  return { existe: falhou || tried.size === 0 ? null : false, conta: null };
+}
+
+async function firstExistingOnWhatsapp(
+  client: WahaClient,
+  session: string,
+  phone: string,
+): Promise<WahaCheckExistsResult | null> {
+  return (await consultarContaNoWhatsapp(client, session, phone)).conta;
 }
 
 /**
@@ -102,6 +153,22 @@ export async function resolvePhoneJidDigitsForCall(
   return r ? phoneJidDigitsFromCheckResult(r) : null;
 }
 
+/**
+ * O número tem conta no WhatsApp? Basta UMA grafia existir (o nono dígito no
+ * Brasil). Diferente das funções acima, aqui FALHA não é "não": `false` só sai
+ * quando TODAS as grafias foram respondidas e nenhuma existe; se alguma
+ * consulta lançou e nenhuma existiu, a resposta é `null` ("não deu para
+ * saber"). Compartilha o memo positivo com o envio: consultar antes de abrir
+ * a conversa não duplica o check no envio. Negativos e falhas não são memorizados.
+ */
+export async function numeroTemContaNoWhatsapp(
+  client: WahaClient,
+  session: string,
+  phone: string,
+): Promise<boolean | null> {
+  return (await consultarContaNoWhatsapp(client, session, phone)).existe;
+}
+
 /** Consulta WAHA; null = não achou ou falhou (caller usa fallback). */
 export async function resolveWhatsappIdForContactCard(
   client: WahaClient,
@@ -126,10 +193,14 @@ export async function resolveCanonicalCusChatId(
 ): Promise<string> {
   if (!chatId.endsWith("@c.us")) return chatId;
   const digits = chatId.slice(0, -"@c.us".length).replace(/\D/g, "");
-  const variants = phoneLookupVariants(digits).length;
-  if (variants < 2) {
-    return chatId;
+  const resposta = await consultarContaNoWhatsapp(client, session, digits);
+  if (resposta.existe === false) {
+    throw new FalhaDeEnvioDoCanal(
+      FRASES_DE_FALHA.numero_sem_whatsapp!,
+      "permanente",
+      undefined,
+      "numero_sem_whatsapp",
+    );
   }
-  const r = await firstExistingOnWhatsapp(client, session, digits);
-  return (r && sendChatIdFromCheckResult(r)) || chatId;
+  return (resposta.conta && sendChatIdFromCheckResult(resposta.conta)) || chatId;
 }

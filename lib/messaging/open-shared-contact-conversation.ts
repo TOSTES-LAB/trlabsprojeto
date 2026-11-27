@@ -2,12 +2,22 @@
  * Abre (ou reabre) a conversa 1:1 com um contato compartilhado no cartão do inbox.
  * Usa a mesma sessão de canal da mensagem onde o cartão apareceu.
  */
+import {
+  getAdapter,
+  provedoresQueConferemNumero,
+  resolveSessionRef,
+  CHANNEL_SESSION_REF_COLUMNS,
+  type ChannelSessionRef,
+} from "@/lib/channels";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
-import { ensureConversation, sessaoProntaParaEnvio } from "@/lib/automation/start-conversation";
+import { ensureConversation, escolherSessaoParaEnvio } from "@/lib/automation/start-conversation";
 import { encontrarContatoPorTelefone } from "@/lib/channels/contato-por-telefone";
-import { phoneLookupVariants, canonicalPhoneBR } from "@/lib/channels/phone-variants";
+import { canalDesativado } from "@/lib/channels/desativado";
+import { lerEstadoDoCanal } from "@/lib/channels/estado";
+import { canonicalPhoneBR } from "@/lib/channels/phone-variants";
 import { parseDialablePhone } from "@/lib/messaging/contact-card";
+import type { TelefoneWhatsapp } from "@/lib/schemas/contacts";
 
 type Admin = SupabaseClient;
 
@@ -16,6 +26,8 @@ export interface OpenSharedContactInput {
   contact_id?: string;
   phone_number?: string;
   name?: string;
+  /** Só para a ficha que ESTA chamada cria; ficha existente não é tocada. Ausente = `nao_sei`. */
+  phone_whatsapp?: TelefoneWhatsapp;
 }
 
 export interface OpenSharedContactResult {
@@ -59,22 +71,38 @@ async function resolveContactId(
   const existente = await findContactByPhoneVariants(admin, orgId, canonico);
   if (existente) return existente.id;
 
-  const waid = canonico.replace(/\D/g, "");
-  const { data: contactId, error: upsertErr } = await admin.rpc(
-    "fn_upsert_wa_contact" as never,
-    {
-      p_org: orgId,
-      p_kind: "phone",
-      p_phone: canonico,
-      p_lid: null,
-      p_chat_id: waid,
-      p_notify: input.name?.trim() || null,
-    } as never,
-  );
-  if (upsertErr || !contactId) {
-    throw new Error(upsertErr?.message ?? "contact_upsert_failed");
+  // A ficha nova NÃO nasce pela RPC do webhook (`fn_upsert_wa_contact`): o
+  // INSERT de lá grava `phone_whatsapp = 'sim'`, que é verdade para quem acabou
+  // de escrever pelo WhatsApp e mentira para quem é aberto por token (uma
+  // ligação do DeskVoice, um cadastro). Aqui ninguém sabe ainda: `nao_sei`, ou
+  // o que quem chama informou. A mensagem RECEBIDA depois marca `sim` pela
+  // regra de sempre (a RPC do webhook atualiza a ficha que já existe).
+  // Mesmo padrão de `lib/voip/resolve-caller.ts`. Sem `source_metadata`: o
+  // identificador de conversa do canal só existe quando o número escreve, e
+  // quem o grava é a RPC do webhook (o `nome` vai para `display_name`).
+  const nome = input.name?.trim() || null;
+  const { data: criado, error: insertErr } = await admin
+    .from("contacts")
+    .insert({
+      organization_id: orgId,
+      phone_number: canonico,
+      phone_whatsapp: input.phone_whatsapp ?? "nao_sei",
+      source: "whatsapp",
+      display_name: nome,
+    })
+    .select("id")
+    .single();
+  if (!insertErr && criado) return (criado as { id: string }).id;
+
+  // Corrida: outra porta (o webhook, outro clique) gravou a ficha do mesmo
+  // número entre a busca e o INSERT. `uniq_contacts_org_phone` ou a regra "um
+  // número, uma ficha" recusam com 23505; quem venceu é a ficha, e o WhatsApp
+  // dela não é desta chamada.
+  if (insertErr?.code === "23505") {
+    const vencedor = await findContactByPhoneVariants(admin, orgId, canonico);
+    if (vencedor) return vencedor.id;
   }
-  return contactId as string;
+  throw new Error(insertErr?.message ?? "contact_upsert_failed");
 }
 
 /** Garante contato + conversa na sessão indicada; reabre conversa fechada se existir. */
@@ -83,23 +111,112 @@ export async function openSharedContactConversation(
   organizationId: string,
   input: OpenSharedContactInput,
 ): Promise<OpenSharedContactResult> {
-  const sessionId = input.channel_session_id ?? (await sessaoProntaParaEnvio(admin, organizationId));
-  if (!sessionId) throw new Error("session_not_found");
+  /**
+   * QUEM ESCOLHEU O CANAL RESPONDE POR ELE (#3483).
+   *
+   * `channel_session_id` no corpo é a tela dizendo "por ESTE número". A tela só
+   * oferece canal conectado e não desligado (`candidatosParaConversaNova` /
+   * `elegiveisParaConversaNova`), mas filtro de tela não é defesa: o mesmo POST
+   * atende MCP e uma aba aberta desde antes de o canal cair. Até aqui a rota só
+   * perguntava se a sessão existia na organização — e criava a conversa num
+   * canal DESLIGADO (`metadata.disabled`, #2318: o produto promete que ele não
+   * entra na inbox) ou fora do ar (`STOPPED`/`FAILED`/`SCAN_QR_CODE`: não há por
+   * onde a primeira mensagem sair). Era a conversa vazia que a issue #3483
+   * manda não criar, num canal que ninguém consegue usar.
+   *
+   * Sem canal escolhido a régua é outra, e continua a de sempre: a sessão vem
+   * de `sessaoProntaParaEnvio`, que degrada para "qualquer uma não arquivada"
+   * de propósito — travar a abertura por causa da saúde do transporte trocaria
+   * um defeito por outro. Ali só o DESLIGADO recusa, porque desligar é vontade
+   * declarada do dono do número, não saúde passageira.
+   */
+  const escolhidaPeloChamador = Boolean(input.channel_session_id);
+  const semCanalEscolhido = escolhidaPeloChamador
+    ? null
+    : await escolherSessaoParaEnvio(admin, organizationId, {
+        // O pedido traz TELEFONE: a abertura é por telefone, e a sessão mais
+        // antiga da organização pode ser a social (Instagram/Facebook), que não
+        // disca número nenhum. Sem a preferência, a conversa de um contato com
+        // telefone nascia no canal errado e a primeira mensagem era recusada —
+        // a mesma pendência que o #3358 fechou na criação de contato
+        // (`lib/contacts/conversa-ao-criar.ts`) e que faltava nesta porta.
+        preferirTelefone: Boolean(input.phone_number),
+      });
+  const sessionId = input.channel_session_id ?? semCanalEscolhido?.id ?? null;
+  if (!sessionId) {
+    // Nenhum canal pode enviar. "Todos desligados" é a recusa de antes —
+    // `session_unavailable`, 409 —, e não "sessão não encontrada": o operador
+    // desligou os canais e precisa ler isso (`route.ts:154`). 404 só quando a
+    // organização não tem canal de mensagem nenhum.
+    throw new Error(
+      semCanalEscolhido?.todosDesligados ? "session_unavailable" : "session_not_found",
+    );
+  }
   const { data: session, error: sessErr } = await admin
     .from("channel_sessions")
-    .select("id")
+    .select(`id, status, metadata, ${CHANNEL_SESSION_REF_COLUMNS}`)
     .eq("organization_id", organizationId)
     .eq("id", sessionId)
     .maybeSingle();
   if (sessErr) throw new Error(sessErr.message);
   if (!session) throw new Error("session_not_found");
 
+  const sessao = session as ChannelSessionRef & {
+    id: string;
+    provider: string | null;
+    status: string | null;
+    metadata: unknown;
+  };
+  if (canalDesativado(sessao.metadata)) throw new Error("session_unavailable");
+  if (escolhidaPeloChamador && !lerEstadoDoCanal(sessao.status).utilizavel) {
+    throw new Error("session_unavailable");
+  }
+
   const contactId = await resolveContactId(admin, organizationId, input);
-  const conversationId = await ensureConversation(
-    admin,
-    organizationId,
-    contactId,
-    sessionId,
-  );
+  // Abrir conversa com pessoal é escrita para fora da operação (spec 21, etapa
+  // 12): o ponto único recusa — vale para a rota `open-with-contact` e para a
+  // tool MCP, que passam por aqui. O `send` recusaria depois, mas a conversa
+  // vazia já teria nascido.
+  const { data: alvo, error: alvoErr } = await admin
+    .from("contacts")
+    .select("is_personal, phone_number")
+    .eq("organization_id", organizationId)
+    .eq("id", contactId)
+    .maybeSingle();
+  if (alvoErr) throw new Error(alvoErr.message);
+  if ((alvo as { is_personal?: boolean } | null)?.is_personal === true) {
+    throw new Error("contact_personal");
+  }
+  const telefone = (alvo as { phone_number?: string | null } | null)?.phone_number;
+  if (telefone && provedoresQueConferemNumero().some((p) => p === sessao.provider)) {
+    const adapter = getAdapter(sessao.provider);
+    const { data: anterior, error: erroAnterior } = await admin
+      .from("conversations")
+      .select("id")
+      .eq("organization_id", organizationId)
+      .eq("contact_id", contactId)
+      .eq("channel_session_id", sessionId)
+      .limit(1)
+      .maybeSingle();
+    let recebeu = false;
+    if (!erroAnterior && anterior) {
+      const { data: mensagem, error: erroMensagem } = await admin
+        .from("messages")
+        .select("id")
+        .eq("organization_id", organizationId)
+        .eq("conversation_id", anterior.id)
+        .eq("direction", "inbound")
+        .limit(1)
+        .maybeSingle();
+      recebeu = !erroMensagem && Boolean(mensagem);
+    }
+    if (!recebeu && typeof adapter.numeroTemConta === "function") {
+      const existe = await adapter
+        .numeroTemConta({ organizationId, sessionRef: resolveSessionRef(sessao), phone: telefone })
+        .catch(() => null);
+      if (existe === false) throw new Error("numero_sem_whatsapp");
+    }
+  }
+  const conversationId = await ensureConversation(admin, organizationId, contactId, sessionId);
   return { conversation_id: conversationId, contact_id: contactId };
 }

@@ -8,8 +8,20 @@ import { createClient } from "@/lib/supabase/server";
 vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
 vi.mock("@/lib/impersonate/support", () => ({ requireSupportWrite: vi.fn(async () => null) }));
+// Os testes de rota controlam a resposta da transação; as policies, bloqueios
+// e o rollback são exercitados em clone-no-funil-sem-duplicata.test.ts.
 vi.mock("@/lib/supabase/admin", () => ({
-  createAdminClient: () => ({ rpc: async () => ({ error: null }) }),
+  createAdminClient: () => ({
+    rpc: async (fn: string, args: Row) => fn === "fn_levar_negocio_para_funil"
+      ? gravaClone(args)
+      : { error: null },
+    from: (tabela: string) => db.from(tabela),
+    storage: {
+      from: () => ({
+        copy: async (de: string) => (storageRecusa.has(de) ? { error: { message: "storage fora" } } : { error: null }),
+      }),
+    },
+  }),
 }));
 vi.mock("@/lib/atendimento/origem", () => ({
   observeServiceOrigin: vi.fn(async () => "api"),
@@ -52,7 +64,13 @@ function fakeDb(seed: Record<string, Row[]>) {
     let pending: Row | null = null;
 
     const rows = (): Row[] => (tables[table] ??= []);
-    const matches = () => rows().filter((row) => filters.every(([c, v]) => row[c] === v));
+    const inFilters: [string, unknown[]][] = [];
+    const matches = () =>
+      rows().filter(
+        (row) =>
+          filters.every(([c, v]) => row[c] === v) &&
+          inFilters.every(([c, vs]) => vs.includes(row[c])),
+      );
 
     function selectRows(): Row[] {
       return matches()
@@ -101,6 +119,10 @@ function fakeDb(seed: Record<string, Row[]>) {
         filters.push([column, value]);
         return builder;
       },
+      in: (column: string, values: unknown[]) => {
+        inFilters.push([column, values]);
+        return builder;
+      },
       order: (column: string, options?: { ascending?: boolean }) => {
         orders.push([column, options?.ascending ?? true]);
         return builder;
@@ -132,7 +154,14 @@ function fakeDb(seed: Record<string, Row[]>) {
     return builder;
   }
 
-  return { client: { from } as never, tables };
+  return {
+    client: {
+      from,
+      auth: { getClaims: async () => ({ data: { claims: { sub: USER_ID, aal: "aal1", role: "authenticated" } }, error: null }) },
+    } as never,
+    from,
+    tables,
+  };
 }
 
 function seed() {
@@ -179,9 +208,64 @@ function seed() {
 }
 
 let db: ReturnType<typeof fakeDb>;
+let recusaNaGravacao: { message: string; code?: string } | null;
+/** Um escritor de fora da transação grava a cópia antes do INSERT desta (#5281). */
+let corridaNaGravacao: (() => void) | null;
+let sessaoDoInsert: unknown;
+let storageRecusa = new Set<string>();
+
+async function gravaClone(args: Row) {
+  const leads = db.tables.crm_leads!;
+  const origem = leads.find((lead) => lead.id === args.p_origem)!;
+  let clone = leads.find((lead) => lead.pipeline_id === args.p_destino && lead.status === "open"
+    && ((lead.source_metadata as Row | undefined)?.clonado_de as Row | undefined)?.lead_id === origem.id);
+  const linha = args.p_linha as Row | null;
+  const fechamento = args.p_fechamento as Row | null;
+
+  if (!clone && !linha) return { data: null, error: null };
+  if (linha || fechamento) {
+    sessaoDoInsert = args.p_sessao;
+    if (recusaNaGravacao) return { data: null, error: recusaNaGravacao };
+  }
+  if (!clone && linha && corridaNaGravacao) {
+    corridaNaGravacao();
+    corridaNaGravacao = null;
+    return {
+      data: null,
+      error: { code: "23505", message: 'duplicate key value violates unique constraint "crm_leads_clone_aberto_no_funil_uidx"' },
+    };
+  }
+  const criou = !clone && Boolean(linha);
+  const fechou = origem.status === "open" && Boolean(fechamento);
+  if (criou) {
+    clone = {
+      ...linha,
+      id: `novo-${leads.length + 1}`,
+      source_metadata: {
+        ...(linha?.source_metadata as Row),
+        clonado_de: { lead_id: origem.id, pipeline_id: origem.pipeline_id },
+      },
+    };
+    leads.push(clone);
+  }
+  if (fechou) {
+    await db.from("crm_leads").update(fechamento!).eq("id", origem.id);
+  }
+  if ((criou || fechou) && clone) {
+    origem.source_metadata = {
+      ...(origem.source_metadata as Row),
+      movido_para: { lead_id: clone.id, pipeline_id: clone.pipeline_id, stage_id: clone.stage_id },
+    };
+  }
+  return { data: { clone, origem, criou, fechou }, error: null };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
+  recusaNaGravacao = null;
+  corridaNaGravacao = null;
+  sessaoDoInsert = undefined;
+  storageRecusa = new Set<string>();
   db = fakeDb(seed());
   vi.mocked(requireRole).mockResolvedValue({
     ok: true,
@@ -223,10 +307,21 @@ describe("GET /api/v1/leads/[id]/clone", () => {
     const body = await response.json();
 
     expect(response.status).toBe(200);
-    expect(body.data.pipelines).toEqual([{ id: P2, name: "Suporte" }]);
+    // As etapas NÃO arquivadas do destino vêm junto (#3643), na ordem do quadro.
+    expect(body.data.pipelines).toEqual([
+      {
+        id: P2,
+        name: "Suporte",
+        stages: [
+          { id: S2_A, name: "Triagem", position: 1000, is_won: false, is_lost: false },
+          { id: S2_B, name: "Em análise", position: 2000, is_won: false, is_lost: false },
+          { id: S2_LOST, name: "Perdido", position: 9000, is_won: false, is_lost: true },
+        ],
+      },
+    ]);
   });
 
-  it("payload mínimo: nunca settings/description, só id e name", async () => {
+  it("payload mínimo: nunca settings/description, só id, name e as etapas enxutas", async () => {
     const base = seed();
     db = fakeDb({
       ...base,
@@ -242,7 +337,14 @@ describe("GET /api/v1/leads/[id]/clone", () => {
     const response = await GET(getRequest(), params);
     const body = await response.json();
 
-    expect(Object.keys(body.data.pipelines[0])).toEqual(["id", "name"]);
+    expect(Object.keys(body.data.pipelines[0])).toEqual(["id", "name", "stages"]);
+    expect(Object.keys(body.data.pipelines[0].stages[0])).toEqual([
+      "id",
+      "name",
+      "position",
+      "is_won",
+      "is_lost",
+    ]);
   });
 
   it("recusa lead inexistente na organização", async () => {
@@ -259,6 +361,24 @@ describe("GET /api/v1/leads/[id]/clone", () => {
 });
 
 describe("POST /api/v1/leads/[id]/clone", () => {
+  it("não copia a prova causal ao transferir e não a expõe na resposta", async () => {
+    const origem = seed();
+    origem.crm_leads![0]!.source_metadata = {
+      canal: "whatsapp",
+      meta_capi_lead_birth_v1: { platform: "meta_ads", ctwa_clid: "clique-antigo" },
+    };
+    db = fakeDb(origem);
+    vi.mocked(createClient).mockResolvedValue(db.client);
+    const { POST } = await import("./route");
+    const response = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    const body = await response.json();
+    expect(response.status).toBe(201);
+    expect(body.data.lead.source_metadata).not.toHaveProperty("meta_capi_lead_birth_v1");
+    expect(body.data.origem.source_metadata).not.toHaveProperty("meta_capi_lead_birth_v1");
+    const gravada = (db.tables.crm_leads ?? []).find((lead) => lead.id === LEAD_ID);
+    expect(gravada?.source_metadata).toHaveProperty("meta_capi_lead_birth_v1");
+  });
+
   it("cria o negócio no funil destino e fecha a origem como perdida", async () => {
     const { POST } = await import("./route");
 
@@ -291,6 +411,97 @@ describe("POST /api/v1/leads/[id]/clone", () => {
       stage_id: S2_A,
     });
     expect((origem.source_metadata as Row).canal).toBe("whatsapp");
+  });
+
+  it("devolve a mesma cópia da primeira transferência, mesmo com a origem já fechada", async () => {
+    const { POST } = await import("./route");
+
+    const primeira = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    const segunda = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    const criado = await primeira.json();
+    const reutilizado = await segunda.json();
+
+    expect(primeira.status).toBe(201);
+    expect(segunda.status).toBe(200);
+    expect(reutilizado.data.lead.id).toBe(criado.data.lead.id);
+    expect(db.tables.crm_leads?.filter((lead) => lead.pipeline_id === P2)).toHaveLength(1);
+  });
+
+  it("a cópia gravada fora da transação no meio do caminho é reaproveitada, não vira 500 (#5281)", async () => {
+    corridaNaGravacao = () => {
+      db.tables.crm_leads!.push({
+        id: "copia-da-automacao", organization_id: ORG_ID, pipeline_id: P2, stage_id: S2_A,
+        status: "open", title: "Cópia da automação",
+        source_metadata: { clonado_de: { lead_id: LEAD_ID, pipeline_id: P1 } },
+      });
+    };
+    const { POST } = await import("./route");
+
+    const response = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.data.lead.id).toBe("copia-da-automacao");
+    expect(db.tables.crm_leads?.filter((lead) => lead.pipeline_id === P2)).toHaveLength(1);
+    expect(db.tables.crm_leads?.find((lead) => lead.id === LEAD_ID)?.status).toBe("lost");
+  });
+
+  it("a cópia reaproveitada completa os anexos que a primeira transferência não levou", async () => {
+    const caminho = (id: string) => `${ORG_ID}/leads/${LEAD_ID}/voucher/${id}.pdf`;
+    const anexo = (id: string) => ({
+      id, organization_id: ORG_ID, lead_id: LEAD_ID, field_key: "voucher", file_name: `${id}.pdf`,
+      file_size: 10, mime_type: "application/pdf", storage_path: caminho(id), created_by: USER_ID,
+    });
+    db.tables.crm_lead_attachments = [anexo("anexo-a"), anexo("anexo-b")];
+    storageRecusa.add(caminho("anexo-b"));
+    const { POST } = await import("./route");
+
+    const primeira = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    storageRecusa.clear();
+    const segunda = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    const criado = await primeira.json();
+    const reutilizado = await segunda.json();
+
+    expect(criado.data.anexos).toBe(1);
+    expect(segunda.status).toBe(200);
+    expect(reutilizado.data.anexos).toBe(1);
+    const noClone = (db.tables.crm_lead_attachments ?? []).filter((linha) => linha.lead_id === criado.data.lead.id);
+    expect(noClone.map((linha) => linha.clonado_do_attachment_id).sort()).toEqual(["anexo-a", "anexo-b"]);
+  });
+
+  it("entrega o contexto de sessão verificado ao escritor e devolve ambos os vínculos", async () => {
+    const { POST } = await import("./route");
+    const response = await POST(cloneRequest({ pipeline_id: P2 }), params);
+    const body = await response.json();
+
+    expect(response.status).toBe(201);
+    expect(sessaoDoInsert).toMatchObject({ sub: USER_ID, role: "authenticated", aal: "aal1" });
+    expect(body.data.lead.source_metadata).toMatchObject({
+      canal: "whatsapp", clonado_de: { lead_id: LEAD_ID, pipeline_id: P1 },
+    });
+    expect(body.data.origem.source_metadata.movido_para).toMatchObject({ lead_id: body.data.lead.id });
+  });
+
+  it("a recusa da policy é 403 e a origem segue aberta", async () => {
+    recusaNaGravacao = { code: "42501", message: 'new row violates row-level security policy for table "crm_leads"' };
+    const { POST } = await import("./route");
+    const response = await POST(cloneRequest({ pipeline_id: P2 }), params);
+
+    expect(response.status).toBe(403);
+    expect((await response.json()).error.code).toBe("forbidden");
+    expect(db.tables.crm_leads).toHaveLength(1);
+    expect(db.tables.crm_leads?.[0]).toMatchObject({ status: "open", source_metadata: { canal: "whatsapp" } });
+  });
+
+  it("informa a falha da transação sem apontar um clone que não foi criado", async () => {
+    recusaNaGravacao = { message: "falha simulada no vínculo" };
+    const { POST } = await import("./route");
+    const response = await POST(cloneRequest({ pipeline_id: P2 }), params);
+
+    expect(response.status).toBe(500);
+    expect((await response.json()).error.details).toBeUndefined();
+    expect(db.tables.crm_leads).toHaveLength(1);
+    expect(db.tables.crm_leads?.[0]).toMatchObject({ status: "open", source_metadata: { canal: "whatsapp" } });
   });
 
   it("cada lado conta a troca na LINHA DO TEMPO — e a origem não diz 'Perdido — other'", async () => {
@@ -551,6 +762,45 @@ describe("POST /api/v1/leads/[id]/clone", () => {
     const origemIntocada = (db.tables.crm_leads ?? [])[0] as Row;
     expect(origemIntocada.status).toBe("open");
     expect(origemIntocada.pipeline_id).toBe(P1);
+  });
+
+  it("o campo de ARQUIVO exigido no destino não trava o clone (#2829)", async () => {
+    // O clone CRIA o negócio no destino, e o anexo mora em
+    // `crm_lead_attachments.lead_id` — só pode ser enviado DEPOIS que o negócio
+    // existe. Cobrar o arquivo na pré-checagem recusava a troca de funil para
+    // sempre (422 sem caminho de saída), e a #3433 já tinha fixado a regra: a
+    // criação não cobra documento, a primeira entrada é que cobra.
+    const base = seed();
+    db = fakeDb({
+      ...base,
+      crm_pipelines: (base.crm_pipelines ?? []).map((funil) =>
+        funil.id === P2
+          ? {
+              ...funil,
+              settings: {
+                fields: [
+                  {
+                    key: "voucher",
+                    label: "Voucher da emissão",
+                    type: "file",
+                    obrigatorio_em: { etapas: [S2_B] },
+                  },
+                ],
+              },
+            }
+          : funil,
+      ),
+    });
+    vi.mocked(createClient).mockResolvedValue(db.client);
+    const { POST } = await import("./route");
+
+    const response = await POST(cloneRequest({ pipeline_id: P2, stage_id: S2_B }), params);
+
+    expect(response.status).toBe(201);
+    // O negócio nasceu no destino — e sem anexo nenhum, que é o único estado
+    // possível neste instante.
+    const clone = (db.tables.crm_leads ?? []).find((linha) => linha.pipeline_id === P2) as Row;
+    expect(clone?.stage_id).toBe(S2_B);
   });
 
   it("o clone passa quando o campo exigido já vem preenchido da origem", async () => {
